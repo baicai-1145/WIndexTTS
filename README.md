@@ -52,6 +52,10 @@ BigVGAN       86ms
 
 ## 运行
 
+需要：模型权重（`/root/IndexTTS-2.5/`）、任意参考音频 wav。
+
+> **注**：仓库不含权重和测试音频（见 `.gitignore`）。参考音频用任意 5-15s 干净人声 wav。
+
 ```bash
 # 用官方 venv（有 torch/torchaudio/tiktoken/safetensors）
 /root/index-tts/.venv/bin/python -c "
@@ -60,7 +64,7 @@ tts = WIndexTTS(device='cuda')
 sr, wav = tts.infer('/path/to/ref.wav', '你好世界', 'ZH')
 "
 
-# benchmark
+# benchmark（需准备 REF_AUDIO 指向的参考音频）
 /root/index-tts/.venv/bin/python scripts/benchmark_e2e.py all
 ```
 
