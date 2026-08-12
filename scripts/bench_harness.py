@@ -72,7 +72,8 @@ def profile_stages(tts) -> dict:
         est.enable_teacache(thresh=0.15)
     e["s2mel"] = bench(lambda: tts.s2mel.inference(spk, s, refmel, style))
     mel = tts.s2mel.inference(spk, s, refmel, style)
-    e["bigvgan"] = bench(lambda: tts.bigvgan(mel))
+    mel_voc = mel.to(next(tts.bigvgan.parameters()).dtype)
+    e["bigvgan"] = bench(lambda: tts.bigvgan(mel_voc))
     return e
 
 

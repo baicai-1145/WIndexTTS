@@ -150,7 +150,8 @@ class WIndexTTS:
         # S2Mel/BigVGAN stay fp32 (bf16/fp16 degrade quality or weren't validated).
         if self.dtype == torch.float16:
             self.gpt.to(torch.float16)
-            print(">> GPT-AR cast to fp16 (mixed precision)")
+            self.bigvgan.to(torch.float16)
+            print(">> GPT-AR + BigVGAN cast to fp16 (mixed precision)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
@@ -327,7 +328,10 @@ class WIndexTTS:
         )  # [1, 80, T_target]
 
         # --- BigVGAN → audio ---
-        audio_out = self.bigvgan(mel)  # [1, 1, T_audio]
+        # cast mel to BigVGAN's compute dtype (weight_norm makes .weight report
+        # fp32 even when params are fp16; use conv_pre.bias which reflects truth)
+        bg_dtype = next(self.bigvgan.parameters()).dtype
+        audio_out = self.bigvgan(mel.to(bg_dtype))  # [1, 1, T_audio]
         audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
         return OUTPUT_SR, audio_out
 
