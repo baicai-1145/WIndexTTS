@@ -157,6 +157,41 @@ class WIndexTTS:
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
         self._ref_cache: dict = {}
 
+    def warmup(self) -> None:
+        """Pre-capture CUDA Graphs + prime cuDNN autotune with dummy data.
+
+        Shifts the ~1s cold-start cost (graph capture + autotune) from the
+        first infer() call to model-load time. Call once after __init__ if
+        you care about first-request latency.
+        """
+        import torchaudio
+        dev = self.device
+        # dummy ref audio (1s silence) to populate caches + capture graphs
+        dummy = torch.zeros(1, 16000, device=dev)
+        a16 = dummy
+        a22 = torch.zeros(1, 22050, device=dev, dtype=torch.float32)
+        with torch.no_grad():
+            spk = self.extract_spk_cond(a16)
+            style = self.extract_style(a16)
+            refmel = self.mel_fn(a22)
+            emo = self.build_emo_vec(style)
+            conds = self.gpt.build_conds_latent(style, emo)
+        tt = torch.tensor([[1, 2, 3, 1]], device=dev, dtype=torch.int)
+        from windextts.frontend.tokenizer import lang_to_token
+        lang = torch.LongTensor([lang_to_token("ZH")]).to(dev)
+        with torch.no_grad():
+            use_cg = dev != "cpu"
+            codes = self.gpt.generate(
+                conds, tt, lang, max_new_tokens=10, do_sample=False,
+                stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
+            )
+            s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
+            self.s2mel.cfm.estimator.enable_teacache(thresh=0.15)
+            mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=15)
+            bg_dtype = next(self.bigvgan.parameters()).dtype
+            _ = self.bigvgan(mel.to(bg_dtype))
+        torch.cuda.synchronize()
+
     # ------------------------------------------------------------------
     # frontend (lazy)
     # ------------------------------------------------------------------
