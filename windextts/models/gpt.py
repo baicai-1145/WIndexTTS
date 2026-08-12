@@ -463,15 +463,10 @@ class UnifiedVoice(nn.Module):
             emo_vec: [1,1280] (already through emo_layer etc.), or [1,8] raw weights
                 (then emo_matrix_lookup must have been applied upstream).
         """
-        spk_latent = self.spk_emb_proj(campplus_emb)  # [1,1280]
-        if emo_vec.shape[-1] == 8:
-            raise ValueError(
-                "emo_vec must be [1,1280]; apply emo_matrix_lookup upstream "
-                "(user-supplied 8-dim vector is not enough without spk_matrix)"
-            )
-        emo_3d = emo_vec.unsqueeze(1)  # [1,1,1280]
+        spk_latent = self.spk_emb_proj(campplus_emb.to(self.spk_emb_proj.weight.dtype))  # [1,1280]
+        emo_3d = emo_vec.to(spk_latent.dtype).unsqueeze(1)  # [1,1,1280]
         conds = torch.cat(
-            (spk_latent + emo_3d, torch.zeros(1, 2, self.model_dim, device=emo_vec.device)),
+            (spk_latent + emo_3d, torch.zeros(1, 2, self.model_dim, device=emo_vec.device, dtype=spk_latent.dtype)),
             dim=1,
         )
         return conds
@@ -688,6 +683,10 @@ class UnifiedVoice(nn.Module):
                 "is also single-sequence; batch is a later task)"
             )
         stop_token = self.stop_mel_token if stop_token is None else stop_token
+        # match input dtype to model (supports fp16/bf16 mixed-precision decode)
+        mdtype = next(self.parameters()).dtype
+        if conditional_latents.dtype != mdtype:
+            conditional_latents = conditional_latents.to(mdtype)
         if use_cuda_graph:
             return self._generate_cuda_graph(
                 conditional_latents, text_inputs, langs, max_new_tokens,
@@ -786,7 +785,7 @@ class UnifiedVoice(nn.Module):
         graph writes into them. KV content is copied in per-call before replay.
         """
         device = next(self.parameters()).device
-        dtype = torch.float32
+        dtype = next(self.parameters()).dtype
         H, D = self.heads, self.model_dim // self.heads
 
         kv_bufs: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -856,7 +855,7 @@ class UnifiedVoice(nn.Module):
         S = mel_len + 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
         max_seq = S + max_new_tokens + 8  # margin for buffer slack
-        cache_key = (max_seq, torch.float32)
+        cache_key = (max_seq, next(self.parameters()).dtype)
         cache = self._graph_cache.get(cache_key)
         if cache is None:
             cache = self._capture_graph(1, max_seq)
@@ -868,7 +867,7 @@ class UnifiedVoice(nn.Module):
             k_buf[:, :, :S, :].copy_(k)
             v_buf[:, :, :S, :].copy_(v)
 
-        min_dt = torch.finfo(torch.float32).min
+        min_dt = torch.finfo(mask_buf.dtype).min
         codes: list[torch.Tensor] = []
         cur_logits = logits[:, -1, :]  # [B,V] predicts first mel code
         for step in range(max_new_tokens):
@@ -884,7 +883,7 @@ class UnifiedVoice(nn.Module):
             mask_buf.fill_(min_dt)                    # mask future + pad positions
             mask_buf[:, :, :, pad_len:kv_pos + 1].fill_(0.0)
             g.replay()
-            cur_logits = logits_buf  # [B,V] written by the graph
+            cur_logits = logits_buf.float()  # [B,V] fp32 for stable sampling
 
         return torch.stack(codes, dim=1)  # [B, T_gen]
 

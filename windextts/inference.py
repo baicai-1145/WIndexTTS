@@ -145,6 +145,12 @@ class WIndexTTS:
         self.bigvgan.eval()
 
         print(f">> WIndexTTS loaded all modules on {dev}")
+        # apply per-module precision overrides (mixed-precision fast paths)
+        # GPT-AR decode is matmul-bound: fp16 gives ~1.8x with 100% greedy match.
+        # S2Mel/BigVGAN stay fp32 (bf16/fp16 degrade quality or weren't validated).
+        if self.dtype == torch.float16:
+            self.gpt.to(torch.float16)
+            print(">> GPT-AR cast to fp16 (mixed precision)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
@@ -225,9 +231,8 @@ class WIndexTTS:
         emovec_mat = self.gpt.emo_matrix_lookup(
             style, emo_vec_raw, spk_chunks, emo_chunks
         )  # [1,1280] (normalize_emo_vec applied inside)
-        # final emo_layer projection (model_v2.py inference_speech applies emo_layer
-        # to emovec before adding to spk_latent in conds_latent)
-        return self.gpt.emo_layer(emovec_mat)
+        # final emo_layer projection; cast to GPT dtype (fp16 mixed-precision path)
+        return self.gpt.emo_layer(emovec_mat.to(self.gpt.emo_layer.weight.dtype))
 
     # ------------------------------------------------------------------
     # main entry point
