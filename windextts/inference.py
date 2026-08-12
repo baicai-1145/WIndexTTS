@@ -53,14 +53,15 @@ class WIndexTTS:
     def __init__(
         self,
         cfg: Config | None = None,
-        weights_dir: str | Path = WeightLoader.DEFAULT_WEIGHTS_DIR,
+        weights_dir: str | Path = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ) -> None:
         self.cfg = cfg or load_default_config()
         self.device = device
         self.dtype = dtype
-        self.weights = WeightLoader(weights_dir)
+        from windextts.weights import DEFAULT_WEIGHTS_DIR
+        self.weights = WeightLoader(weights_dir or DEFAULT_WEIGHTS_DIR)
 
         # lazy-built frontend caches (built on first use if missing)
         self._featurizer = None
