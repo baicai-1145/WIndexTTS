@@ -14,20 +14,21 @@ Windows-priority, zero-JIT-compile, pure-torch accelerated inference engine for
 
 | 引擎 | 均值 | 最快 | RTF | 说明 |
 |---|---|---|---|---|
-| **WIndexTTS** | **0.76s** | **0.65s** | **5.23x** | fp16 GPT+BigVGAN, 15步CFM+TeaCache |
+| **WIndexTTS** | **0.67s** | **0.59s** | **5.75x** | fp16 GPT+BigVGAN, 15步CFM+TeaCache, 紧凑KV buffer |
 | 官方 bf16 | 1.81s | 1.75s | — | transformers + HF generate |
 | 官方 fp32 | 2.06s | 1.91s | — | 默认精度 |
 
-**WIndexTTS 在零编译依赖下比官方 bf16 快 2.4x、比官方 fp32 快 2.7x。**
+**WIndexTTS 在零编译依赖下比官方 bf16 快 2.7x、比官方 fp32 快 3.1x。**
 
 ### 各阶段拆解（优化后）
 
 ```
-GPT-AR(fp16+graph)   245ms  51%  ← 内存带宽上限（1.6GB权重/600GB/s≈2.7ms/tok，实测3.1）
-S2Mel-CFM(15步+tc)   175ms  37%  ← TeaCache 跳过冗余步骤 + 减少欧拉步数
-BigVGAN(fp16)         58ms  12%  ← cosine 0.9998
-─────────────────────────────────
-总计                  478ms      E2E 0.76s (含 Python/设置开销)
+GPT-AR(fp16+graph+紧凑buffer)  ~150ms  ~40%  ← 内存带宽受限（纯torch fp16 上限）
+S2Mel-CFM(15步+tc)            ~175ms  ~37%  ← TeaCache 跳过冗余步骤 + 减少欧拉步数
+BigVGAN(fp16)                  ~58ms  ~15%  ← cosine 0.9998
+codec+前端+设置                ~50ms  ~8%
+──────────────────────────────────────────
+E2E 稳态                       ~0.67s       median 0.66s, min 0.59s
 ```
 
 ### 加速轮次
@@ -38,6 +39,7 @@ BigVGAN(fp16)         58ms  12%  ← cosine 0.9998
 | R2 | fp16 GPT-AR（混合精度） | GPT 430→245ms (1.77x) | greedy 78/78 精确 |
 | R3 | fp16 BigVGAN | 89→58ms (1.53x) | cosine 0.9998 |
 | R4 | CFM 欧拉步 25→15 | S2Mel 251→177ms | cosine 0.998 |
+| R5 | 紧凑 KV buffer（max_mel_tokens 1000→300） | GPT 184→124ms (1.48x) | 无截断（实测 68-110 codes） |
 
 ### 未采用的方案及原因
 
