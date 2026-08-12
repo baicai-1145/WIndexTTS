@@ -91,6 +91,8 @@ class GPT2Attention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_bufs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Causal attention with optional KV cache.
 
@@ -102,9 +104,15 @@ class GPT2Attention(nn.Module):
                   all valid past keys.
             past_key_value: (past_k, past_v) each [B, H, T_past, head_dim]; the
                 new K/V is concatenated on the time axis.
+            kv_bufs: (k_buf, v_buf) each [B, H, MAX_SEQ, head_dim] pre-allocated
+                static KV buffers (CUDA Graph path). The new K/V is written in
+                place at column ``kv_pos`` via index_copy_, and attention runs
+                over the FULL buffers with a mask hiding positions > kv_pos
+                (static shapes → graph-capturable).
+            kv_pos: [1] long tensor — absolute buffer column for this step's K/V.
         Returns:
-            (c_proj(output), (key, value)) — key/value AFTER the concat, i.e. the
-            full per-layer cache [B, H, T_total, head_dim] for this step.
+            (c_proj(output), (key, value)) — key/value AFTER the concat/update,
+            i.e. the full per-layer cache [B, H, T_total, head_dim].
         """
         qkv = self.c_attn(hidden_states)
         query, key, value = qkv.split(self.embed_dim, dim=2)
@@ -113,23 +121,31 @@ class GPT2Attention(nn.Module):
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            key = torch.cat([past_k, key], dim=2)  # [B,H,T_past+1,D]
-            value = torch.cat([past_v, value], dim=2)
+        if kv_bufs is not None:
+            # CUDA Graph path: static buffers, in-place KV write at column kv_pos.
+            k_buf, v_buf = kv_bufs
+            k_buf.index_copy_(2, kv_pos, key)    # key [B,H,1,D] -> buffer col kv_pos
+            v_buf.index_copy_(2, kv_pos, value)
+            attn_key, attn_value = k_buf, v_buf
+        else:
+            if past_key_value is not None:
+                past_k, past_v = past_key_value
+                key = torch.cat([past_k, key], dim=2)  # [B,H,T_past+1,D]
+                value = torch.cat([past_v, value], dim=2)
+            attn_key, attn_value = key, value
 
         # HF GPT2 path: SDPA with prebuilt 4D additive mask, is_causal=False.
         # mem_eff is the only CUDA kernel accepting fp32 + non-null mask
         # (flash rejects non-null mask; cudnn rejects fp32+mask; verified torch 2.8).
         with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
             attn_output = F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask, is_causal=False,
+                query, attn_key, attn_value, attn_mask=attention_mask, is_causal=False,
                 scale=1.0 / (self.head_dim ** 0.5),
             )
 
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # (B, T, heads, head_dim)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), self.embed_dim)
-        return self.c_proj(attn_output), (key, value)
+        return self.c_proj(attn_output), (attn_key, attn_value)
 
 
 class GPT2MLP(nn.Module):
@@ -160,11 +176,14 @@ class GPT2Block(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_bufs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_out, kv = self.attn(
-            hidden_states, attention_mask=attention_mask, past_key_value=past_key_value
+            hidden_states, attention_mask=attention_mask, past_key_value=past_key_value,
+            kv_bufs=kv_bufs, kv_pos=kv_pos,
         )
         hidden_states = attn_out + residual
 
@@ -195,6 +214,8 @@ class GPT2Transformer(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        kv_bufs: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        kv_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """GPT-2 body with optional per-layer KV cache.
 
@@ -207,13 +228,26 @@ class GPT2Transformer(nn.Module):
             past_key_values: per-layer (past_k, past_v) caches [B,H,T_past,D];
                 None → full (prefill) forward. Both paths return the updated
                 per-layer caches so a caller can chain prefill → decode steps.
+            kv_bufs: per-layer (k_buf, v_buf) [B,H,MAX_SEQ,D] static buffers
+                (CUDA Graph path); K/V written in place at column kv_pos, attention
+                over the full buffers with a mask hiding positions > kv_pos.
+            kv_pos: [1] long — absolute buffer column for this step's K/V write.
         Returns:
             (final_norm(hidden), updated_kvs). For prefill, updated_kvs holds the
             KV of all T tokens (used as the past for the first decode step).
         """
         hidden_states = inputs_embeds
         new_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
-        if past_key_values is None:
+        if kv_bufs is not None:
+            # CUDA Graph decode: static per-layer buffers, in-place KV writes.
+            assert kv_pos is not None and len(kv_bufs) == len(self.h)
+            for i, block in enumerate(self.h):
+                hidden_states, kv = block(
+                    hidden_states, attention_mask=attention_mask,
+                    kv_bufs=kv_bufs[i], kv_pos=kv_pos,
+                )
+                new_kvs.append(kv)
+        elif past_key_values is None:
             extended_mask = self._build_4d_causal_mask(hidden_states, attention_mask)
             for block in self.h:
                 hidden_states, kv = block(hidden_states, attention_mask=extended_mask)
@@ -353,6 +387,9 @@ class UnifiedVoice(nn.Module):
         # object.__setattr__ (avoids registering it as a submodule — gpt.pth has
         # no wte key, so registering would create a spurious gpt.wte.weight).
         object.__setattr__(self.gpt, "_wte_ref", self.mel_embedding)
+
+        # CUDA Graph decode cache: key (max_seq, dtype) -> captured resources.
+        self._graph_cache: dict = {}
 
     # ------------------------------------------------------------------
     # weight loading
@@ -614,6 +651,7 @@ class UnifiedVoice(nn.Module):
         top_p: float = 0.8,
         temperature: float = 0.8,
         stop_token: Optional[int] = None,
+        use_cuda_graph: bool = False,
     ) -> torch.Tensor:
         """Autoregressive mel-code generation (batch=1), pure torch.
 
@@ -636,6 +674,10 @@ class UnifiedVoice(nn.Module):
             max_new_tokens: cap on generated codes (not counting the stop token).
             do_sample/top_k/top_p/temperature: sampling (HF warper semantics).
             stop_token: default self.stop_mel_token (8193).
+            use_cuda_graph: if True, run the decode loop through a captured CUDA
+                Graph (batch=1, CUDA only). Output is bit-identical to the eager
+                path (same math; KV buffers + attention mask only). The graph is
+                captured once per (max_seq, dtype) and replayed on later calls.
         Returns:
             codes [B, T_gen] (T_gen includes the stop token when produced;
             may be shorter than max_new_tokens if stop was hit).
@@ -646,6 +688,11 @@ class UnifiedVoice(nn.Module):
                 "is also single-sequence; batch is a later task)"
             )
         stop_token = self.stop_mel_token if stop_token is None else stop_token
+        if use_cuda_graph:
+            return self._generate_cuda_graph(
+                conditional_latents, text_inputs, langs, max_new_tokens,
+                do_sample, top_k, top_p, temperature, stop_token,
+            )
         device = conditional_latents.device
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
             conditional_latents, text_inputs, langs
@@ -692,6 +739,152 @@ class UnifiedVoice(nn.Module):
                 past_key_values=kvs,
             )
             cur_logits = self.mel_head(self.final_norm(hidden))[:, -1, :]
+
+        return torch.stack(codes, dim=1)  # [B, T_gen]
+
+    # ------------------------------------------------------------------
+    # CUDA Graph AR decode (stage 3b)
+    # ------------------------------------------------------------------
+
+    def _graph_decode_step(
+        self,
+        input_id_buf: torch.Tensor,
+        pos_buf: torch.Tensor,
+        kv_pos_buf: torch.Tensor,
+        mask_buf: torch.Tensor,
+        logits_buf: torch.Tensor,
+        kv_bufs: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Single AR decode step — straight-line, static shapes (CUDA Graph body).
+
+        All tensors are pre-allocated static buffers (or views of them): the
+        graph writes this step's K/V into kv_bufs at column kv_pos, runs the
+        transformer over the full buffers with the attention mask hiding
+        positions > kv_pos, and copies the next-token logits into logits_buf.
+        Replayed via torch.cuda.CUDAGraph.replay() with the buffers updated
+        between replays (input id, mel pos, kv pos, mask).
+        """
+        emb = self.mel_embedding(input_id_buf)                        # [B,1,dim]
+        emb = emb + self.mel_pos_embedding.emb(pos_buf).unsqueeze(1)   # [1,1,dim]
+        hidden, _ = self.gpt(
+            inputs_embeds=emb,
+            attention_mask=mask_buf,          # [B,1,1,max_seq]
+            kv_bufs=kv_bufs,
+            kv_pos=kv_pos_buf,
+        )
+        logits = self.mel_head(self.final_norm(hidden))[:, 0, :]      # [B,V]
+        logits_buf.copy_(logits)
+
+    def _capture_graph(
+        self, B: int, max_seq: int
+    ) -> tuple[torch.cuda.CUDAGraph, list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Warm up + capture the decode-step graph for a fixed max_seq.
+
+        Returns (graph, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf,
+        logits_buf). The buffers are all pre-allocated (static addresses); the
+        graph writes into them. KV content is copied in per-call before replay.
+        """
+        device = next(self.parameters()).device
+        dtype = torch.float32
+        H, D = self.heads, self.model_dim // self.heads
+
+        kv_bufs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for _ in range(self.layers):
+            k_buf = torch.zeros(B, H, max_seq, D, dtype=dtype, device=device)
+            v_buf = torch.zeros(B, H, max_seq, D, dtype=dtype, device=device)
+            kv_bufs.append((k_buf, v_buf))
+        input_id_buf = torch.zeros(B, 1, dtype=torch.long, device=device)
+        pos_buf = torch.zeros(1, dtype=torch.long, device=device)
+        kv_pos_buf = torch.zeros(1, dtype=torch.long, device=device)
+        logits_buf = torch.empty(B, self.number_mel_codes, dtype=dtype, device=device)
+        mask_buf = torch.zeros(B, 1, 1, max_seq, dtype=dtype, device=device)
+
+        # Warmup: run the same op path eagerly (primes cuDNN/cuBLAS autotune and
+        # workspace allocations; capture must not observe fresh allocations).
+        for _ in range(3):
+            self._graph_decode_step(
+                input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf, kv_bufs
+            )
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._graph_decode_step(
+                input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf, kv_bufs
+            )
+        return g, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf
+
+    def _generate_cuda_graph(
+        self,
+        conditional_latents: torch.Tensor,
+        text_inputs: torch.Tensor,
+        langs: Optional[torch.Tensor],
+        max_new_tokens: int,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        stop_token: int,
+    ) -> torch.Tensor:
+        """CUDA-Graph AR decode — bit-identical to the eager generate() path.
+
+        Prefill runs eagerly (identical math), then the decode loop replays a
+        captured graph per step. Per-step variable state (sampled id, mel pos,
+        KV buffer column, attention mask) lives in static buffers updated
+        between replays; sampling + stop check stay in Python (multinomial /
+        argmax are not graph-captured).
+        """
+        device = conditional_latents.device
+        if device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError(
+                "use_cuda_graph=True requires CUDA; pass use_cuda_graph=False on CPU"
+            )
+        input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
+            conditional_latents, text_inputs, langs
+        )
+        mel_len = inputs_embeds.shape[1]  # S (conds+text, BEFORE start_mel)
+
+        # --- prefill (same math as the eager path) ---
+        last_ids = input_ids[:, mel_len:]  # [B,1] start_mel token
+        last_emb = self.mel_embedding(last_ids)
+        last_emb = last_emb + self.mel_pos_embedding(last_emb)  # mel pos 0
+        emb = torch.cat([inputs_embeds, last_emb], dim=1)  # [B, S+1, dim]
+        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        logits = self.mel_head(self.final_norm(hidden))  # [B, S+1, V]
+
+        S = mel_len + 1  # prefill token count (KV buffer positions 0..S-1)
+        pad_len = int((attention_mask[0] == 0).sum().item())
+        max_seq = S + max_new_tokens + 8  # margin for buffer slack
+        cache_key = (max_seq, torch.float32)
+        cache = self._graph_cache.get(cache_key)
+        if cache is None:
+            cache = self._capture_graph(1, max_seq)
+            self._graph_cache[cache_key] = cache
+        g, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf = cache
+
+        # copy prefill KVs into the front of the static buffers
+        for (k, v), (k_buf, v_buf) in zip(kvs, kv_bufs):
+            k_buf[:, :, :S, :].copy_(k)
+            v_buf[:, :, :S, :].copy_(v)
+
+        min_dt = torch.finfo(torch.float32).min
+        codes: list[torch.Tensor] = []
+        cur_logits = logits[:, -1, :]  # [B,V] predicts first mel code
+        for step in range(max_new_tokens):
+            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature)
+            codes.append(next_id)
+            if next_id.item() == stop_token:
+                break
+            kv_pos = S + step  # absolute KV buffer column for this token
+            # update static buffers (eager, outside the graph)
+            input_id_buf.copy_(next_id.unsqueeze(1))  # [B,1]
+            pos_buf.fill_(step + 2)                   # mel pos (matches eager)
+            kv_pos_buf.fill_(kv_pos)
+            mask_buf.fill_(min_dt)                    # mask future + pad positions
+            mask_buf[:, :, :, pad_len:kv_pos + 1].fill_(0.0)
+            g.replay()
+            cur_logits = logits_buf  # [B,V] written by the graph
 
         return torch.stack(codes, dim=1)  # [B, T_gen]
 
