@@ -252,7 +252,7 @@ class WIndexTTS:
         top_k: int = 30,
         temperature: float = 0.8,
         max_mel_tokens: int = 1000,
-        cfm_steps: int = 25,
+        cfm_steps: int = 15,
         cfg_rate: float = 0.7,
         teacache_thresh: float = 0.15,
     ) -> tuple[int, torch.Tensor]:

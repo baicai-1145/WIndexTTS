@@ -70,7 +70,7 @@ def profile_stages(tts) -> dict:
     est = tts.s2mel.cfm.estimator
     if not getattr(est, "teacache_enabled", False):
         est.enable_teacache(thresh=0.15)
-    e["s2mel"] = bench(lambda: tts.s2mel.inference(spk, s, refmel, style))
+    e["s2mel"] = bench(lambda: tts.s2mel.inference(spk, s, refmel, style, n_timesteps=15))
     mel = tts.s2mel.inference(spk, s, refmel, style)
     mel_voc = mel.to(next(tts.bigvgan.parameters()).dtype)
     e["bigvgan"] = bench(lambda: tts.bigvgan(mel_voc))
