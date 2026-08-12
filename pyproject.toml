@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windextts"
+version = "0.1.0"
+description = "Windows-priority, zero-JIT-compile, pure-torch accelerated inference for IndexTTS-2.5"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+
+# 极简依赖：核心推理零 JIT 编译依赖。
+# transformers / modelscope / librosa 禁止引入；flash_attn 不进核心推理路径。
+dependencies = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "safetensors>=0.4",
+    "tiktoken>=0.7",
+    "jieba>=0.42",
+    "cn2an>=0.5",
+    "wetext>=0.1.2",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "scipy>=1.10",   # BigVGAN 滤波器组可能需要；非神经路径
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-xdist"]
+
+[tool.setuptools.packages.find]
+include = ["windextts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_align.py"]

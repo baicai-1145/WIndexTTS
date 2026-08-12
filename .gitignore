@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+*.pt
+*.pth
+*.safetensors
+*.wav
+# never commit temp test tensors / dumps
+/dumps/
+/out/
