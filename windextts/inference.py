@@ -251,7 +251,7 @@ class WIndexTTS:
         top_p: float = 0.8,
         top_k: int = 30,
         temperature: float = 0.8,
-        max_mel_tokens: int = 1000,
+        max_mel_tokens: int = 300,
         cfm_steps: int = 15,
         cfg_rate: float = 0.7,
         teacache_thresh: float = 0.15,
