@@ -174,20 +174,38 @@ prefix conditioning tokens (not cross-attn). 290 keys under `gpt.` prefix.
 
 ## ⑤ S2Mel-CFM (DiT + length_regulator)
 
-`infer_v2_5.py:849-855`, module `s2mel/`. Weights `s2mel.pth` → `ckpt['net']` =
-`{cfm, length_regulator, gpt_layer}`.
+`infer_v2_5.py:640-868`, module `s2mel/modules/` (flow_matching.py + diffusion_transformer.py + length_regulator.py). Weights `s2mel.pth` → `ckpt['net']` = `{cfm, length_regulator, gpt_layer}`.
 
-- `length_regulator` (n_quantizers=3): maps `S_infer [1,304,1024]` → content tokens
-  `[1, T_content]` for DiT. Also has `mask_token`, `embedding`, `content_in_proj`.
-- `gpt_layer`: 3-layer Sequential (norm+linear each), processes prompt.
-- DiT estimator (`cfm.estimator`, 256 keys): hidden 512, depth 13, 8 heads,
-  in_channels=80 (mel), content_dim=512, **uvit_skip_connection=True**,
-  long_skip_connection=True, final_layer=wavenet (8 layers).
-- **CFM**: 25 Euler steps, `inference_cfg_rate=0.7`.
-- **Duration**: `1.72 * duration_factor` scaling (infer_v2_5.py:855).
-- **style_encoder** uses CAMPPlus `[1,192]` as style condition.
+### Inputs (all verified on test.wav)
+- `S_infer = EnhancedCodec.decode(codes)` → `[1, 304, 1024]`
+- `ref_mel = mel_fn(audio_22k)` → `[1, 80, 523]` (the prompt mel, also BigVGAN-style 80-bin log-mel at 22kHz)
+- `style = CAMPPlus(fbank_16k_cm)` → `[1, 192]`
+- `spk_cond` = normalized w2v-bert feat → `[1, 303, 1024]` (for prompt_condition)
 
-Output: mel `[1, 80, T_mel]` at 22050 Hz (hop 256).
+### length_regulator(x, ylens, n_quantizers=3, f0=None)[0]
+Two calls (length_regulator.py):
+- `prompt_condition = lr(spk_cond_w2v[1,303,1024], ylens=ref_mel.size(2)=523, n_quantizers=3)[0]` → `[1, 523, 512]`
+- `cond = lr(S_infer[1,304,1024], ylens=target_lengths, n_quantizers=3)[0]` → `[1, 522, 512]`
+- `target_lengths = int(S_infer.shape[1] * 1.72 * duration_factor)` = 522 (dur=1.0)
+- 22 keys: content_in_proj(1024→512), embedding(2048×512 codebook), mask_token, model.0..12 (HifiGAN-style conv1d/LayerNorm blocks)
+
+### CFM inference
+```python
+cat_condition = cat([prompt_condition[1,523,512], cond[1,522,512]], dim=1)  # [1, 1045, 512]
+vc_target = cfm.inference(cat_condition, x_lens=[1045], prompt=ref_mel[1,80,523],
+                          style[1,192], f0=None, n_timesteps=25, inference_cfg_rate=0.7)
+vc_target = vc_target[:, :, ref_mel.size(-1):]   # strip prompt -> [1, 80, 522]
+```
+`cfm.inference(mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5)`
+- estimator = DiT (256 keys): x_embedder(conv80→512), cond_embedder(1024→512), t_embedder/t_embedder2,
+  transformer(172 keys, 13 blocks), wavenet(51 keys, 8 layers), final_layer(adaLN),
+  res_projection, skip_linear, cond_x_merge_linear(864→512), content_mask_embedder, conv1/conv2.
+- **CFM**: 25 Euler steps, `inference_cfg_rate=0.7` (classifier-free guidance: v = (1-cfg)*v_uncond + cfg*v_cond, or similar).
+- Output: mel `[1, 80, T_mel]` at 22050 Hz (hop 256). Verified output `[1, 80, 522]`.
+
+### gpt_layer (only if use_gpt_latent; default off)
+`latent = gpt_layer(latent)` then `S_infer = S_infer + latent`. 3 Linear: 1280→256→128→1024.
+Default config does NOT use this (use_gpt_latent path), so skip for v1.
 
 ---
 
