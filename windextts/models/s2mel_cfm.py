@@ -139,6 +139,100 @@ class S2MelCFM(nn.Module):
 
         return x
 
+    # ------------------------------------------------------------------
+    # CUDA Graph accelerated path (stage 4)
+    # ------------------------------------------------------------------
+
+    def solve_euler_graph(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        prompt: torch.Tensor,
+        mu: torch.Tensor,
+        style: torch.Tensor,
+        f0: torch.Tensor | None,
+        t_span: torch.Tensor,
+        inference_cfg_rate: float = 0.7,
+    ) -> torch.Tensor:
+        """CUDA-Graph-captured Euler solver (same math as solve_euler).
+
+        The 25-step loop body has fully static shapes (x/prompt/mu/style don't
+        change shape, only values), so we capture one step into a CUDAGraph and
+        replay it ``len(t_span)-1`` times. Sampling RNG (multinomial) is absent
+        here (CFM is deterministic given x0 noise), so the whole loop is
+        graph-capturable.
+
+        Per-step buffers (stacked cond/uncond, t) are pre-allocated once and
+        updated in-place via copy_; the graph reads/writes only static tensors.
+        """
+        prompt_len = prompt.size(-1)
+        device = x.device
+        dtype = x.dtype
+        n_steps = len(t_span) - 1
+        dt_val = (t_span[1] - t_span[0]).item()  # constant (linspace)
+
+        # set up prompt_x + zero x's prompt region (same as solve_euler)
+        prompt_x = torch.zeros_like(x)
+        prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+        x[..., :prompt_len] = 0
+
+        # pre-allocate static stacked buffers (cond + uncond batched on dim 0)
+        zero_prompt_x = torch.zeros_like(prompt_x)
+        zero_style = torch.zeros_like(style)
+        zero_mu = torch.zeros_like(mu)
+        s_prompt_x = torch.cat([prompt_x, zero_prompt_x], dim=0)
+        s_style = torch.cat([style, zero_style], dim=0)
+        s_mu = torch.cat([mu, zero_mu], dim=0)
+        s_x = torch.cat([x, x], dim=0)
+        # static scalar tensors the graph mutates in-place
+        t_buf = t_span[0].clone()
+        dt_buf = torch.tensor(dt_val, device=device, dtype=dtype)
+        cfg = float(inference_cfg_rate)
+
+        # x_lens is passed to estimator but is constant across steps; replicate as-is.
+        x_lens_s = torch.cat([x_lens, x_lens], dim=0) if x_lens is not None else None
+
+        # ---- warmup (required before capture: primes cudnn autotune, allocs) ----
+        s_t = torch.cat([t_buf.unsqueeze(0), t_buf.unsqueeze(0)], dim=0)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            sd = self.estimator(s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
+            dphi, cfg_dphi = sd.chunk(2, dim=0)
+            dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
+            new_x = x + dt_buf * dphi
+            new_x[..., :prompt_len] = 0
+        torch.cuda.synchronize()
+
+        # ---- capture the step body ----
+        graph = torch.cuda.CUDAGraph()
+        # static inputs the replay will update via copy_
+        s_x_buf = s_x.clone()
+        s_t_buf = s_t.clone()
+        x_buf = x.clone()
+        t_cur = t_buf.clone()
+
+        with torch.cuda.graph(graph):
+            sd = self.estimator(s_x_buf, s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
+            dphi, cfg_dphi = sd.chunk(2, dim=0)
+            dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
+            x_buf.copy_(x_buf + dt_buf * dphi)
+            x_buf[..., :prompt_len] = 0
+            t_cur.copy_(t_cur + dt_buf)
+
+        # ---- replay loop ----
+        for step in range(1, n_steps + 1):
+            # refresh stacked x (cond uses current x; uncond uses same x with
+            # prompt region zeroed — already the case for x)
+            cond = x
+            s_x_buf.copy_(torch.cat([cond, cond], dim=0))
+            t_val = t_span[step - 1]
+            s_t_buf.copy_(torch.cat([t_val.unsqueeze(0), t_val.unsqueeze(0)], dim=0))
+            graph.replay()
+            x.copy_(x_buf)
+            t_buf.copy_(t_cur)
+        torch.cuda.synchronize()
+        return x
+
 
 class S2Mel(nn.Module):
     """Full S2Mel module: length_regulator + CFM(DiT).
