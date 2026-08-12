@@ -10,7 +10,8 @@ codec.pth                     torch.load               ckpt['model']  (drop iter
 s2mel.pth                     torch.load               ckpt['net'] = {cfm, length_reg,
                                                         gpt_layer}  (each a submodule dict)
 hf_cache/w2v-bert-2.0/
-    conformer_shaw.pt         torch.load               flat state_dict (HF naming)
+    conformer_shaw.pt         torch.load               {'model': sd} (modelscope naming) — NOT used by inference
+    model.safetensors         safetensors             flat HF Wav2Vec2BertModel naming — THIS is what we read
 bigvgan/bigvgan_generator.pt  torch.load               flat state_dict
 campplus_cn_common.bin        torch.load               flat state_dict (ECAPA-TDNN)
 feat1.pt / feat2.pt           torch.load               tensors ([73,192] / [73,1280])
@@ -90,20 +91,22 @@ class WeightLoader:
         return net
 
     def load_w2v_bert(self) -> dict[str, torch.Tensor]:
-        """w2v-bert-2.0 conformer. File conformer_shaw.pt holds ``{'model': sd}``
-        with 781 keys using modelscope/Seamless-style naming
-        (``encoder_frontend.model_dim_proj``, ``encoder.layers.{i}.*``).
+        """w2v-bert-2.0 conformer (24 layers, hidden 1024, heads 16).
 
-        We strip the outer ``model`` container; any HF-key remapping needed to
-        feed our hand-written conformer happens in the model adapter, not here.
+        Reads ``hf_cache/w2v-bert-2.0/model.safetensors`` with the standard
+        HF ``Wav2Vec2BertModel`` naming — this is what index-tts uses
+        (``Wav2Vec2BertModel.from_pretrained(dir)`` at infer_v2_5.py:174).
+        Keys: ``feature_projection.*``, ``encoder.layers.{i}.*`` (each layer has
+        ``self_attn`` + ``conv_module`` + ``ffn1`` + ``feed_forward`` + layer norms),
+        ``masked_spec_embed``.
+
+        Note: ``conformer_shaw.pt`` (modelscope/fairseq naming) also exists in
+        the dir but is NOT read by inference — do not use it.
         """
-        d = self._load_torch(self.hf_path("w2v-bert-2.0", "conformer_shaw.pt"))
-        assert isinstance(d, dict) and "model" in d, (
-            f"conformer_shaw.pt missing 'model' key; got keys={list(d.keys()) if isinstance(d, dict) else type(d)}"
-        )
-        inner = d["model"]
-        assert isinstance(inner, dict), "conformer_shaw.pt['model'] is not a state_dict"
-        return inner
+        from safetensors.torch import load_file
+
+        path = self.hf_path("w2v-bert-2.0", "model.safetensors")
+        return load_file(str(path))
 
     def load_bigvgan(self) -> dict[str, torch.Tensor]:
         """BigVGAN generator. File holds ``{'generator': {'model': sd}}``;
