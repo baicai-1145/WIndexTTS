@@ -854,7 +854,10 @@ class UnifiedVoice(nn.Module):
 
         S = mel_len + 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
-        max_seq = S + max_new_tokens + 8  # margin for buffer slack
+        # round max_seq up to a bucket so similar text lengths reuse the graph
+        # (avoid re-capture per request; bucket=64 covers typical variation)
+        raw_seq = S + max_new_tokens + 8
+        max_seq = ((raw_seq + 63) // 64) * 64
         cache_key = (max_seq, next(self.parameters()).dtype)
         cache = self._graph_cache.get(cache_key)
         if cache is None:
