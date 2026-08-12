@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "ba140926-6bf3-4c59-8c13-307a85d31d85",
+  "title": "const r = await runs.run('dataflow', {",
+  "objective": "const r = await runs.run('dataflow', {",
+  "status": "failed",
+  "createdAt": "2026-08-12T16:16:55.441Z",
+  "updatedAt": "2026-08-12T16:16:55.556Z",
+  "runs": [
+    {
+      "runId": "c3779ee6-b9fa-4644-b5ae-19b61280de8f",
+      "mode": "workflow",
+      "asyncDir": "/tmp/pi-subagents-uid-0/async-subagent-runs/c3779ee6-b9fa-4644-b5ae-19b61280de8f",
+      "status": "failed",
+      "startedAt": "2026-08-12T16:16:55.446Z",
+      "completedAt": "2026-08-12T16:16:55.556Z"
+    }
+  ],
+  "workflowChildren": [],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "status",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/c3779ee6-b9fa-4644-b5ae-19b61280de8f/status.json"
+    },
+    {
+      "kind": "other",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/c3779ee6-b9fa-4644-b5ae-19b61280de8f/events.jsonl",
+      "description": "Lifecycle events"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/root/WIndexTTS",
+  "ownerSessionId": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-12T16-07-13-393Z_019ff6ba-50f0-7ab4-b3dd-4b011ab6a5ff.jsonl",
+  "summary": "workflowScript must be valid JavaScript.\nIf task text contains Markdown fences or backticks, use an array joined with \"\\n\" or escaped strings instead of a raw backtick template literal.\n\nOriginal SyntaxError:\nworkflow-script.js:54\n})()\n    \n\nSyntaxError: Unexpected end of input\n    at new Script (node:vm:118:7)\n    at MessagePort.<anonymous> ([worker eval]:298:18)\n    at [nodejs.internal.kHybridDispatch] (node:internal/event_target:856:20)\n    at MessagePort.<anonymous> (node:internal/per_context/messageport:23:28)"
+}
