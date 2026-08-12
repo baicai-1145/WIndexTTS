@@ -56,6 +56,7 @@ class S2MelCFM(nn.Module):
         self.estimator = estimator
         self.in_channels = in_channels
         self.sigma_min = sigma_min
+        self._graph_cache: dict = {}  # keyed by (x.shape, prompt_len, dtype, cfg, n_steps)
 
     @torch.no_grad()
     def inference(
@@ -170,67 +171,70 @@ class S2MelCFM(nn.Module):
         dtype = x.dtype
         n_steps = len(t_span) - 1
         dt_val = (t_span[1] - t_span[0]).item()  # constant (linspace)
+        cfg = float(inference_cfg_rate)
+
+        # cache lookup (capture cost paid only on first call per shape)
+        key = (tuple(x.shape), prompt_len, dtype, cfg, n_steps)
+        cache = self._graph_cache.get(key)
 
         # set up prompt_x + zero x's prompt region (same as solve_euler)
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
-
-        # pre-allocate static stacked buffers (cond + uncond batched on dim 0)
-        zero_prompt_x = torch.zeros_like(prompt_x)
-        zero_style = torch.zeros_like(style)
-        zero_mu = torch.zeros_like(mu)
-        s_prompt_x = torch.cat([prompt_x, zero_prompt_x], dim=0)
-        s_style = torch.cat([style, zero_style], dim=0)
-        s_mu = torch.cat([mu, zero_mu], dim=0)
-        s_x = torch.cat([x, x], dim=0)
-        # static scalar tensors the graph mutates in-place
-        t_buf = t_span[0].clone()
-        dt_buf = torch.tensor(dt_val, device=device, dtype=dtype)
-        cfg = float(inference_cfg_rate)
-
-        # x_lens is passed to estimator but is constant across steps; replicate as-is.
         x_lens_s = torch.cat([x_lens, x_lens], dim=0) if x_lens is not None else None
 
-        # ---- warmup (required before capture: primes cudnn autotune, allocs) ----
-        s_t = torch.cat([t_buf.unsqueeze(0), t_buf.unsqueeze(0)], dim=0)
-        torch.cuda.synchronize()
-        for _ in range(3):
-            sd = self.estimator(s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
-            dphi, cfg_dphi = sd.chunk(2, dim=0)
-            dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
-            new_x = x + dt_buf * dphi
-            new_x[..., :prompt_len] = 0
-        torch.cuda.synchronize()
+        if cache is None:
+            # ---- first call: pre-allocate buffers + warmup + capture ----
+            zero_prompt_x = torch.zeros_like(prompt_x)
+            zero_style = torch.zeros_like(style)
+            zero_mu = torch.zeros_like(mu)
+            s_prompt_x = torch.cat([prompt_x, zero_prompt_x], dim=0)
+            s_style = torch.cat([style, zero_style], dim=0)
+            s_mu = torch.cat([mu, zero_mu], dim=0)
+            s_x = torch.cat([x, x], dim=0)
+            t_buf = t_span[0].clone()
+            dt_buf = torch.tensor(dt_val, device=device, dtype=dtype)
+            s_t = torch.cat([t_buf.unsqueeze(0), t_buf.unsqueeze(0)], dim=0)
+            torch.cuda.synchronize()
+            for _ in range(3):  # warmup (primes cudnn autotune, allocs)
+                sd = self.estimator(s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
+                dphi, cfg_dphi = sd.chunk(2, dim=0)
+                dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
+            torch.cuda.synchronize()
+            # static buffers the graph reads/writes
+            s_x_buf = s_x.clone()
+            s_t_buf = s_t.clone()
+            x_buf = x.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                sd = self.estimator(s_x_buf, s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
+                dphi, cfg_dphi = sd.chunk(2, dim=0)
+                dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
+                x_buf.copy_(x_buf + dt_buf * dphi)
+                x_buf[..., :prompt_len] = 0
+            cache = dict(
+                graph=graph, s_x_buf=s_x_buf, s_t_buf=s_t_buf, x_buf=x_buf,
+                s_prompt_x=s_prompt_x, s_style=s_style, s_mu=s_mu, x_lens_s=x_lens_s,
+            )
+            self._graph_cache[key] = cache
+        else:
+            # refresh per-request values into static buffers (shapes match)
+            cache["s_prompt_x"][: x.size(0)].copy_(prompt_x)
+            cache["s_style"][: style.size(0)].copy_(style)
+            cache["s_mu"][: mu.size(0)].copy_(mu)
 
-        # ---- capture the step body ----
-        graph = torch.cuda.CUDAGraph()
-        # static inputs the replay will update via copy_
-        s_x_buf = s_x.clone()
-        s_t_buf = s_t.clone()
-        x_buf = x.clone()
-        t_cur = t_buf.clone()
-
-        with torch.cuda.graph(graph):
-            sd = self.estimator(s_x_buf, s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
-            dphi, cfg_dphi = sd.chunk(2, dim=0)
-            dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
-            x_buf.copy_(x_buf + dt_buf * dphi)
-            x_buf[..., :prompt_len] = 0
-            t_cur.copy_(t_cur + dt_buf)
-
-        # ---- replay loop ----
+        # ---- replay loop (capture-free after first call) ----
+        g = cache["graph"]
+        s_x_buf = cache["s_x_buf"]
+        s_t_buf = cache["s_t_buf"]
+        x_buf = cache["x_buf"]
+        x_buf.copy_(x)  # init accumulator from current x
         for step in range(1, n_steps + 1):
-            # refresh stacked x (cond uses current x; uncond uses same x with
-            # prompt region zeroed — already the case for x)
-            cond = x
-            s_x_buf.copy_(torch.cat([cond, cond], dim=0))
+            s_x_buf.copy_(torch.cat([x, x], dim=0))
             t_val = t_span[step - 1]
             s_t_buf.copy_(torch.cat([t_val.unsqueeze(0), t_val.unsqueeze(0)], dim=0))
-            graph.replay()
+            g.replay()
             x.copy_(x_buf)
-            t_buf.copy_(t_cur)
-        torch.cuda.synchronize()
         return x
 
 

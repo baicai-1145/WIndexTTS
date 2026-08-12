@@ -280,11 +280,13 @@ class WIndexTTS:
 
         # --- GPT conditioning + AR decode ---
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]
+        use_cg = self.device != "cpu"
         codes = self.gpt.generate(
             conds_latent, text_tokens, lang_id,
             max_new_tokens=max_mel_tokens, do_sample=do_sample,
             top_k=top_k, top_p=top_p, temperature=temperature,
             stop_token=self.cfg.gpt.stop_mel_token,
+            use_cuda_graph=use_cg,
         )  # [1, T_codes]
 
         # strip stop token if present
