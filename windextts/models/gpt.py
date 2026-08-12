@@ -90,14 +90,33 @@ class GPT2Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """attention_mask: prebuilt 4D additive [B,1,T,T] (None=no mask, all attend)."""
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Causal attention with optional KV cache.
+
+        Args:
+            hidden_states: [B, T, dim] (prefill T>1) or [B, 1, dim] (decode step).
+            attention_mask: prebuilt 4D additive [B,1,Tq,Tk] (None=no mask).
+                - prefill: [B,1,T,T] full causal mask (built by GPT2Transformer).
+                - decode:  [B,1,1,T_total] (pad keys masked) — single query attends
+                  all valid past keys.
+            past_key_value: (past_k, past_v) each [B, H, T_past, head_dim]; the
+                new K/V is concatenated on the time axis.
+        Returns:
+            (c_proj(output), (key, value)) — key/value AFTER the concat, i.e. the
+            full per-layer cache [B, H, T_total, head_dim] for this step.
+        """
         qkv = self.c_attn(hidden_states)
         query, key, value = qkv.split(self.embed_dim, dim=2)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
+
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            key = torch.cat([past_k, key], dim=2)  # [B,H,T_past+1,D]
+            value = torch.cat([past_v, value], dim=2)
 
         # HF GPT2 path: SDPA with prebuilt 4D additive mask, is_causal=False.
         # mem_eff is the only CUDA kernel accepting fp32 + non-null mask
@@ -110,7 +129,7 @@ class GPT2Attention(nn.Module):
 
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # (B, T, heads, head_dim)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), self.embed_dim)
-        return self.c_proj(attn_output)
+        return self.c_proj(attn_output), (key, value)
 
 
 class GPT2MLP(nn.Module):
@@ -139,18 +158,21 @@ class GPT2Block(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_out = self.attn(hidden_states, attention_mask=attention_mask)
+        attn_out, kv = self.attn(
+            hidden_states, attention_mask=attention_mask, past_key_value=past_key_value
+        )
         hidden_states = attn_out + residual
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
         mlp_out = self.mlp(hidden_states)
         hidden_states = mlp_out + residual
-        return hidden_states
+        return hidden_states, kv
 
 
 class GPT2Transformer(nn.Module):
@@ -172,12 +194,40 @@ class GPT2Transformer(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """GPT-2 body with optional per-layer KV cache.
+
+        Args:
+            inputs_embeds: [B, T, dim] (prefill T>1) or [B, 1, dim] (decode step).
+            attention_mask:
+                - prefill: [B, T] int mask (0=pad) — converted to the 4D causal
+                  additive mask internally (HF semantics incl. _unmask_unattended).
+                - decode:  already-built [B,1,1,T_total] additive mask.
+            past_key_values: per-layer (past_k, past_v) caches [B,H,T_past,D];
+                None → full (prefill) forward. Both paths return the updated
+                per-layer caches so a caller can chain prefill → decode steps.
+        Returns:
+            (final_norm(hidden), updated_kvs). For prefill, updated_kvs holds the
+            KV of all T tokens (used as the past for the first decode step).
+        """
         hidden_states = inputs_embeds
-        extended_mask = self._build_4d_causal_mask(hidden_states, attention_mask)
-        for block in self.h:
-            hidden_states = block(hidden_states, attention_mask=extended_mask)
-        return self.ln_f(hidden_states)
+        new_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        if past_key_values is None:
+            extended_mask = self._build_4d_causal_mask(hidden_states, attention_mask)
+            for block in self.h:
+                hidden_states, kv = block(hidden_states, attention_mask=extended_mask)
+                new_kvs.append(kv)
+        else:
+            assert len(past_key_values) == len(self.h)
+            for i, block in enumerate(self.h):
+                hidden_states, kv = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    past_key_value=past_key_values[i],
+                )
+                new_kvs.append(kv)
+        return self.ln_f(hidden_states), new_kvs
 
     @staticmethod
     def _build_4d_causal_mask(
@@ -464,7 +514,7 @@ class UnifiedVoice(nn.Module):
         input_ids last position is the start_mel placeholder, which for prefill
         alignment we run on the full embeds).
         """
-        hidden = self.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        hidden, _ = self.gpt(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         logits = self.mel_head(self.final_norm(hidden))
         return logits
 
@@ -492,14 +542,163 @@ class UnifiedVoice(nn.Module):
         last_emb = self.mel_embedding(last_ids)                # [B, 1, dim]
         last_emb = last_emb + self.mel_pos_embedding(last_emb)  # mel pos (LearnedPos)
         emb = torch.cat([inputs_embeds, last_emb], dim=1)      # [B, S+1, dim]
-        hidden = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        hidden, _ = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
         logits = self.mel_head(self.final_norm(hidden))        # [B, S+1, 8194]
         return logits
+
+    # ------------------------------------------------------------------
+    # AR decode loop (replaces HF generate / accel_engine)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_decode_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+        """Additive [B,1,1,T_total] mask for a single decode query.
+
+        The query is the newest token (last position), so causal masking is
+        vacuous — the only thing to block are left-padded key positions
+        (attention_mask == 0). Matches HF GPT2Model decode behavior (pad keys
+        stay masked; -inf == torch.finfo(dtype).min, same as prefill mask).
+        """
+        min_dt = torch.finfo(torch.float32).min
+        pad = attention_mask == 0  # [B,T]
+        mask = torch.zeros(
+            (attention_mask.shape[0], 1, 1, attention_mask.shape[1]),
+            dtype=torch.float32, device=attention_mask.device,
+        )
+        return mask.masked_fill(pad[:, None, None, :], min_dt)
+
+    @staticmethod
+    def _sample(
+        logits: torch.Tensor,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Sample next token ids from [B, V] logits (HF warper semantics).
+
+        Matches HF generate: temperature → top_k → top_p (only when
+        do_sample=True; greedy is a plain argmax, exactly like HF).
+        """
+        if do_sample:
+            if temperature != 1.0:
+                logits = logits / temperature
+            if top_k and top_k > 0:
+                k = min(top_k, logits.size(-1))
+                topk = torch.topk(logits, k, dim=-1)
+                logits = logits.masked_fill(
+                    logits < topk.values[..., -1:], float("-inf")
+                )
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # keep at least the top token (HF TopPLogitsWarper shift-right)
+                sorted_remove = cum_probs > top_p
+                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                sorted_remove[..., 0] = False
+                remove = torch.zeros_like(logits, dtype=torch.bool)
+                remove = remove.scatter(-1, sorted_idx, sorted_remove)
+                logits = logits.masked_fill(remove, float("-inf"))
+            probs = F.softmax(logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)[:, 0]
+        return torch.argmax(logits, dim=-1)
+
+    def generate(
+        self,
+        conditional_latents: torch.Tensor,
+        text_inputs: torch.Tensor,
+        langs: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 500,
+        do_sample: bool = False,
+        top_k: int = 30,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        stop_token: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Autoregressive mel-code generation (batch=1), pure torch.
+
+        Mirrors official inference_speech → GPT2InferenceModel.generate
+        (kv_cache=True path, model_v2.py:760-830):
+          - prefill: conds+text+start_mel embeddings → transformer → logits;
+            last position predicts the first mel code; per-layer KV caches kept.
+          - decode step i (i=0,1,...): embed the sampled token with
+            mel_pos_embedding.get_fixed_embedding(i + 2) — official uses
+            attention_mask.shape[1] - mel_len which, with mel_len = S (conds+
+            text, before start_mel) and attention_mask grown to S+2+i, equals
+            i + 2 (position 1 is skipped by the official flow — replicated).
+          - single query attends all valid past keys (pad keys masked);
+            K/V appended to the per-layer cache.
+
+        Args:
+            conditional_latents: [1,3,dim] conds_latent (spk+emo) or [B,3,dim].
+            text_inputs: [B,L] text token ids (stop token already appended).
+            langs: [B] language token ids (None → no lang embedding).
+            max_new_tokens: cap on generated codes (not counting the stop token).
+            do_sample/top_k/top_p/temperature: sampling (HF warper semantics).
+            stop_token: default self.stop_mel_token (8193).
+        Returns:
+            codes [B, T_gen] (T_gen includes the stop token when produced;
+            may be shorter than max_new_tokens if stop was hit).
+        """
+        if conditional_latents.shape[0] != 1:
+            raise NotImplementedError(
+                "AR generate currently supports batch=1 (the official accel path "
+                "is also single-sequence; batch is a later task)"
+            )
+        stop_token = self.stop_mel_token if stop_token is None else stop_token
+        device = conditional_latents.device
+        input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
+            conditional_latents, text_inputs, langs
+        )
+        mel_len = inputs_embeds.shape[1]  # S (conds+text, BEFORE start_mel)
+
+        # --- prefill (same math as prefill_logits_from_inputs) ---
+        last_ids = input_ids[:, mel_len:]  # [B,1] start_mel token
+        last_emb = self.mel_embedding(last_ids)
+        last_emb = last_emb + self.mel_pos_embedding(last_emb)  # mel pos 0
+        emb = torch.cat([inputs_embeds, last_emb], dim=1)  # [B, S+1, dim]
+        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        logits = self.mel_head(self.final_norm(hidden))  # [B, S+1, V]
+
+        # --- decode loop ---
+        codes: list[torch.Tensor] = []
+        cur_logits = logits[:, -1, :]  # [B,V] predicts first mel code
+        for step in range(max_new_tokens):
+            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature)
+            codes.append(next_id)
+            if next_id.item() == stop_token:
+                break
+            # official decode emb: mel_embedding(token) + mel_pos at
+            # attention_mask.shape[1] - mel_len. attention_mask after appending
+            # this token is [B, S+2+step] → pos = step + 2 (t_1 → pos 2).
+            pos = step + 2
+            emb_dec = self.mel_embedding(next_id.unsqueeze(-1))  # [B,1,dim]
+            emb_dec = emb_dec + self.mel_pos_embedding.get_fixed_embedding(
+                pos, device
+            )
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype, device=attention_mask.device,
+                    ),
+                ],
+                dim=-1,
+            )  # [B, T_total+1]
+            dec_mask = self._build_decode_mask(attention_mask)  # [B,1,1,T_total+1]
+            hidden, kvs = self.gpt(
+                inputs_embeds=emb_dec, attention_mask=dec_mask,
+                past_key_values=kvs,
+            )
+            cur_logits = self.mel_head(self.final_norm(hidden))[:, -1, :]
+
+        return torch.stack(codes, dim=1)  # [B, T_gen]
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
             "UnifiedVoice.forward is not the inference entry point; use "
-            "prefill_logits_from_inputs / prefill_forward (AR loop is a later task)."
+            "prefill_logits_from_inputs / prefill_forward / generate."
         )
 
 

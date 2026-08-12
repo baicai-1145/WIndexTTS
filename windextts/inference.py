@@ -205,32 +205,24 @@ class WIndexTTS:
     # ------------------------------------------------------------------
 
     def build_emo_vec(self, style: torch.Tensor, emo_vector: list[float] | None = None) -> torch.Tensor:
-        """Build the emo_vec [1,1280] for GPT conditioning.
+        """Build the emo_vec [1,1280] for GPT conditioning via emo_matrix_lookup.
 
-        If emo_vector is None → neutral calm. Returns the post-emo_layer vector
-        (the final 1280-d conditioning token).
+        Uses the matrix path (emovec_mat only). The (1-sum)*emovec(audio) correction
+        term from infer_v2_5.py:764 requires the merge_emovec conformer (not yet
+        ported); omitted here as a first-version simplification (dominant term is
+        emovec_mat when weights are concentrated).
         """
         if emo_vector is None:
             emo_vector = [0, 0, 0, 0, 0, 0, 0, 1.0]  # calm default
-        # normalize_emo_vec (bias + scale)
-        bias = torch.tensor([0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
-                            device=self.device, dtype=torch.float32)
-        wv = torch.tensor(emo_vector, device=self.device, dtype=torch.float32) * bias
-        s = wv.sum()
-        if s > 0.8:
-            wv = wv * (0.8 / s)
-        # cosine-similarity index lookup in spk_matrix chunks
-        spk_t = torch.split(self.spk_matrix, self.emo_num)
-        em_t = torch.split(self.emo_matrix, self.emo_num)
-        indices = [int(torch.argmax(F.cosine_similarity(style.float(), c.float(), dim=1)))
-                   for c in spk_t]
-        em_rows = torch.cat([em_t[i][indices[i]].unsqueeze(0) for i in range(8)], 0)  # [8,1280]
-        emovec_mat = (wv.unsqueeze(1) * em_rows).sum(0)  # [1280]
-        self._last_wv_sum = float(wv.sum().item())
-        # add (1 - sum(wv)) * emovec(audio) term (infer_v2_5.py:764)
-        # NB: emovec(audio) requires merge_emovec on spk_cond; caller passes spk_cond
-        # separately when needed. Here return emovec_mat; full assembly in infer().
-        return emovec_mat
+        emo_vec_raw = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        spk_chunks = tuple(torch.split(self.spk_matrix, self.emo_num))
+        emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
+        emovec_mat = self.gpt.emo_matrix_lookup(
+            style, emo_vec_raw, spk_chunks, emo_chunks
+        )  # [1,1280] (normalize_emo_vec applied inside)
+        # final emo_layer projection (model_v2.py inference_speech applies emo_layer
+        # to emovec before adding to spk_latent in conds_latent)
+        return self.gpt.emo_layer(emovec_mat)
 
     # ------------------------------------------------------------------
     # main entry point
@@ -282,16 +274,8 @@ class WIndexTTS:
         from windextts.frontend.tokenizer import lang_to_token
         lang_id = torch.LongTensor([lang_to_token(lang)]).to(dev)
 
-        # --- emo vec ---
-        emovec_mat = self.build_emo_vec(style, emo_vector)
-        # full emo: emovec_mat + (1 - sum(wv)) * emovec(audio); wv_sum for calm ≈ 0.5625
-        emovec_audio = self.gpt.merge_emovec(
-            spk_cond, spk_cond,
-            torch.tensor([spk_cond.shape[-1]], device=dev),
-            torch.tensor([spk_cond.shape[-1]], device=dev), alpha=1.0,
-        )
-        wv_sum = self._last_wv_sum  # set by build_emo_vec
-        emo_vec = self.gpt.emo_layer(emovec_mat + (1 - wv_sum) * emovec_audio)  # [1,1280]
+        # --- emo vec (matrix path; audio-term omitted, see build_emo_vec) ---
+        emo_vec = self.build_emo_vec(style, emo_vector)  # [1,1280]
 
         # --- GPT conditioning + AR decode ---
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]
@@ -320,10 +304,6 @@ class WIndexTTS:
         audio_out = self.bigvgan(mel)  # [1, 1, T_audio]
         audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
         return OUTPUT_SR, audio_out
-
-    # helper: track last normalized wv sum (set in build_emo_vec)
-    _last_wv_sum: float = 0.0
-
 
 if __name__ == "__main__":
     # smoke: end-to-end inference (requires GPT AR generate to be implemented)
