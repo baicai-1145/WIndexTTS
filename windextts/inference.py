@@ -146,6 +146,10 @@ class WIndexTTS:
 
         print(f">> WIndexTTS loaded all modules on {dev}")
 
+        # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
+        # w2v/campplus/mel when the same ref is reused across requests (stage 5).
+        self._ref_cache: dict = {}
+
     # ------------------------------------------------------------------
     # frontend (lazy)
     # ------------------------------------------------------------------
@@ -257,15 +261,25 @@ class WIndexTTS:
             (sample_rate, audio [samples,]) at 22050 Hz mono.
         """
         dev = self.device
-        # --- load + resample ref audio ---
-        audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
-        a16 = torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)
-        a22 = torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(dev).float()
-
-        # --- ref features ---
-        spk_cond = self.extract_spk_cond(a16)           # [1, T, 1024]
-        style = self.extract_style(a16)                 # [1, 192]
-        ref_mel = self.mel_fn(a22)                       # [1, 80, T_ref]
+        # --- ref audio features (cached by path+mtime; stage 5 overlap/cache) ---
+        import os
+        cache_key = None
+        try:
+            cache_key = (spk_audio_prompt, os.path.getmtime(spk_audio_prompt))
+        except OSError:
+            pass
+        cached = self._ref_cache.get(cache_key) if cache_key else None
+        if cached is None:
+            audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
+            a16 = torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)
+            a22 = torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(dev).float()
+            spk_cond = self.extract_spk_cond(a16)
+            style = self.extract_style(a16)
+            ref_mel = self.mel_fn(a22)
+            if cache_key is not None:
+                self._ref_cache[cache_key] = (spk_cond, style, ref_mel)
+        else:
+            spk_cond, style, ref_mel = cached
 
         # --- text tokens ---
         lang_prefix = f"<|{lang.lower()}|> "
