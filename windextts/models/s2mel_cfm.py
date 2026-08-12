@@ -105,8 +105,13 @@ class S2MelCFM(nn.Module):
     ) -> torch.Tensor:
         """Fixed-step Euler ODE solver with classifier-free guidance.
 
-        Replicates flow_matching.py:57-111 exactly.
+        Replicates flow_matching.py:57-111 exactly. When the estimator has
+        TeaCache enabled, redundant DiT forwards are skipped (vLLM-Omni style).
         """
+        # reset TeaCache state for this solve (cond + uncond branches)
+        est = self.estimator
+        if getattr(est, "teacache_enabled", False):
+            est._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
         prompt_len = prompt.size(-1)
         # prompt_x: holds the reference mel in the prompt region; x's prompt region is zeroed.
         prompt_x = torch.zeros_like(x)

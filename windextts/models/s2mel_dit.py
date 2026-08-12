@@ -523,6 +523,12 @@ class DiT(nn.Module):
         self.transformer_style_condition = cfg.style_condition
         self.final_layer_type = cfg.final_layer_type
 
+        # TeaCache state (vLLM-Omni-style step skipping for diffusion)
+        self.teacache_enabled = False
+        self.teacache_thresh = 0.0
+        self.teacache_coef = None  # np.poly1d coefficients for rescaling
+        self._tc_state = None  # per-call reset
+
         # Transformer (gpt_fast ModelArgs, block_size hardcoded 16384 in official)
         self.transformer = Transformer(
             n_layer=cfg.depth,
@@ -592,6 +598,22 @@ class DiT(nn.Module):
     def setup_caches(self, max_batch_size: int, max_seq_length: int) -> None:
         self.transformer.setup_caches(max_batch_size, max_seq_length, use_kv_cache=False)
 
+    def enable_teacache(self, thresh: float = 0.25, coef=None) -> None:
+        """Enable TeaCache step-skipping (vLLM-Omni style).
+
+        thresh: relative-L1 accumulation threshold; higher = more skipping (faster
+          but lower fidelity). Typical 0.15-0.30 for image DiTs; tune per model.
+        coef: optional polynomial rescaling coefficients (np.poly1d). None = linear.
+        """
+        self.teacache_enabled = True
+        self.teacache_thresh = thresh
+        self.teacache_coef = coef
+        self._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
+
+    def disable_teacache(self) -> None:
+        self.teacache_enabled = False
+        self._tc_state = None
+
     # ----- forward -----
 
     def forward(self, x: torch.Tensor, prompt_x: torch.Tensor, x_lens: torch.Tensor,
@@ -646,11 +668,45 @@ class DiT(nn.Module):
                                max_length=x_in.size(1)).to(x.device).unsqueeze(1)  # [B,1,T]
         input_pos = self.input_pos[: x_in.size(1)]
         x_mask_expanded = x_mask[:, None, :].repeat(1, 1, x_in.size(1), 1) if not self.is_causal else None
-        x_res = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)  # [B, T, D]
+        # --- TeaCache: skip transformer when consecutive-step inputs are similar ---
+        # Monitor the core (non-token) input to the transformer. Cache the residual
+        # (transformer_out - transformer_in) over core positions; reuse when the
+        # core input changes slowly between Euler steps (vLLM-Omni TeaCache).
+        x_in_core = x_in
+        n_prefix = 0
         if self.time_as_token:
-            x_res = x_res[:, 1:]
+            n_prefix += 1
         if self.style_as_token:
-            x_res = x_res[:, 1:]
+            n_prefix += 1
+        if n_prefix:
+            x_in_core = x_in[:, n_prefix:]
+        do_full = True
+        if self.teacache_enabled:
+            st = self._tc_state
+            if st["cnt"] == 0:
+                st["accum"] = 0.0
+            elif st["prev_core"] is not None:
+                rel = ((x_in_core - st["prev_core"]).abs().mean() /
+                       (st["prev_core"].abs().mean() + 1e-8)).cpu().item()
+                scaled = float(self.teacache_coef(rel)) if self.teacache_coef is not None else rel
+                st["accum"] += abs(scaled)
+                if st["accum"] < self.teacache_thresh and st["prev_residual"] is not None:
+                    do_full = False
+                else:
+                    st["accum"] = 0.0
+            st["prev_core"] = x_in_core.detach()
+        if do_full:
+            x_res_full = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)  # [B, T_full, D]
+            # strip tokens to get core output
+            x_res = x_res_full[:, n_prefix:] if n_prefix else x_res_full
+            if self.teacache_enabled:
+                self._tc_state["prev_residual"] = (x_res - x_in_core).detach()
+                self._tc_state["cnt"] += 1
+        else:
+            # FAST PATH: reuse cached core residual
+            x_res = x_in_core + self._tc_state["prev_residual"]
+            self._tc_state["cnt"] += 1
+        # (x_res is already core-only; no further stripping needed)
 
         if self.long_skip_connection:
             x_res = self.skip_linear(torch.cat([x_res, x], dim=-1))

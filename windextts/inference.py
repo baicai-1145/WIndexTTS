@@ -248,6 +248,7 @@ class WIndexTTS:
         max_mel_tokens: int = 1000,
         cfm_steps: int = 25,
         cfg_rate: float = 0.7,
+        teacache_thresh: float = 0.15,
     ) -> tuple[int, torch.Tensor]:
         """Zero-shot voice cloning.
 
@@ -310,7 +311,10 @@ class WIndexTTS:
         # --- codec.decode → S_infer ---
         s_infer = self.codec.decode(codes)  # [1, 2*T, 1024]
 
-        # --- S2Mel-CFM → mel ---
+        # --- S2Mel-CFM → mel (TeaCache: skip redundant DiT steps) ---
+        est = self.s2mel.cfm.estimator
+        if teacache_thresh > 0 and not getattr(est, "teacache_enabled", False):
+            est.enable_teacache(thresh=teacache_thresh)
         mel = self.s2mel.inference(
             spk_cond, s_infer, ref_mel, style,
             duration_factor=duration_factor, n_timesteps=cfm_steps,
