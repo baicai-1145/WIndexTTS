@@ -360,6 +360,7 @@ class WIndexTTS:
             spk_cond, s_infer, ref_mel, style,
             duration_factor=duration_factor, n_timesteps=cfm_steps,
             inference_cfg_rate=cfg_rate,
+            use_graph=getattr(self, "s2mel_use_graph", False),
         )  # [1, 80, T_target]
 
         # --- BigVGAN → audio ---

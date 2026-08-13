@@ -8,15 +8,18 @@
 
 | 引擎 | 均值 | 最快 | vs WIndexTTS | 说明 |
 |---|---|---|---|---|
-| **WIndexTTS** | **0.687s** | **0.608s** | — | 纯 torch，零 JIT |
-| vLLM-Omni（默认配置） | 0.655s | 0.601s | 持平（快 5%）| FlashInfer+Triton+编译内核 |
-| 官方 accel+bf16 | 1.128s | 1.090s | WIndexTTS 快 1.6x | 官方 CUDA Graph 加速版 |
-| 官方 bf16 | 1.81s | 1.75s | 快 2.6x | transformers + HF generate |
-| 官方 fp32 | 2.06s | 1.91s | 快 3.0x | 默认精度 |
+| **WIndexTTS**（15步+TeaCache）| **0.672s** | **0.609s** | — | 纯 torch，零 JIT |
+| vLLM-Omni **fast**（全 graph+12步）| **0.506s** | **0.472s** | **快 33%** | DiT+vocoder 全 graph，FlashInfer/Triton |
+| vLLM-Omni（默认配置） | 0.655s | 0.601s | 持平（快 5%）| 25步，无 DiT/vocoder graph |
+| 官方 accel+bf16 | 1.128s | 1.090s | WIndexTTS 快 1.7x | 官方 CUDA Graph 加速版 |
+| 官方 bf16 | 1.81s | 1.75s | 快 2.7x | transformers + HF generate |
+| 官方 fp32 | 2.06s | 1.91s | 快 3.1x | 默认精度 |
 
-### 核心结论：WIndexTTS 追平 vLLM-Omni
+### 核心结论
 
-**零编译依赖的纯 torch 实现已追平依赖编译内核（FlashInfer/Triton）的 vLLM-Omni**。
+- **WIndexTTS 追平 vLLM-Omni 默认配置**（0.672s vs 0.655s，持平）。
+- **vLLM-Omni 全加速档（fast）快 33%**（0.506s vs 0.672s）。差距来自 DiT/vocoder CUDA Graph +
+  SnakeBeta Triton 内核 + FlashInfer attention——这些是 vLLM-Omni 的编译内核优势，纯 torch 路径难复制（见下方差距分析）。
 
 严格复刻对比（同 1 次 warmup + 同 4 文本）：
 
@@ -32,14 +35,38 @@
 - vLLM-Omni：FlashInfer/TRITON_ATTN + vLLM paged KV cache + torch.compile + SnakeBeta Triton 内核 + bf16 DiT
 - WIndexTTS：纯 torch SDPA + 手写 KV cache + CUDA Graph + TeaCache + fp16/bf16 混合精度 + 15 步 ODE（vs vLLM 25 步）
 
-设计取舍：WIndexTTS 用「Windows 零编译开箱即用」换了「内核极致优化」，但实测性能持平。
+设计取舍：WIndexTTS 用「Windows 零编译开箱即用」换了「内核极致优化」，但默认配置实测持平。
 
-### vLLM-Omni low_latency 配置
+### vLLM-Omni 全加速档（fast）跑通记要
 
-vLLM-Omni 的 `indextts2_low_latency.yaml`（FlashInfer backend + FULL_DECODE_ONLY CUDA Graph +
-12 diffusion steps + DiT/vocoder CUDA Graph）在本机初始化失败（cudagraph capture 报错，
-疑似 A10G 兼容性）。该配置更激进，理论上更快，但属不同质量档位（12 步 vs 25 步），
-未能纳入公平对比。
+vLLM-Omni 的 `indextts2_low_latency.yaml` 原始配置在本机初始化失败：
+1. **vocab shape 错误**（`60510 vs 12001`）：该配置在 stage0 漏了 `hf_overrides.use_gpt_latent=false`，
+   且多余的 `tokenizer: gpt2` 导致退化成 GPT-2 vocab 解析。
+2. **DiT torch_compile 与 cuda_graph 互斥**：默认配置继承了 `s2mel_dit_torch_compile=true`，
+   叠加 `cuda_graph=true` 会报 ValueError。
+
+修复方法：以默认配置为基础，叠加 low_latency 的全部加速项（DiT/vocoder CUDA Graph + 12 步 +
+bf16 + GPT FULL_DECODE_ONLY graph），保留 TRITON_ATTN（FlashInfer 对此模型 logits 有偏差），
+生成 `indextts2_fast.yaml`。跑通后测得 **mean 0.506s / min 0.472s**（快默认档 23%）。
+
+### WIndexTTS vs vLLM-Omni fast 的 150ms 差距分析
+
+vLLM-Omni fast（0.506s）比 WIndexTTS（0.672s）快约 150ms，差距来源：
+
+| 加速项 | vLLM-Omni fast | WIndexTTS | 能否迁移 |
+|---|---|---|---|
+| DiT CUDA Graph（12步）| ✅ max_graphs=4 + 长度 bucketing | ❌ TeaCache 互斥，实测变长反复捕获反而更慢 | 部分（需重写 bucketing）|
+| BigVGAN CUDA Graph | ✅ SnakeBeta **Triton** 内核 | ❌ 纯 torch conv 实测反而慢 0.89x | 否（需 Triton）|
+| GPT attention | FlashInfer | mem_eff SDPA | 否（需 FlashInfer）|
+| GPT FULL_DECODE_ONLY graph | ✅ | ✅（已用） | — |
+| DiT bf16 | ✅ | ✅（可开） | — |
+
+**核心瓶颈**：vLLM-Omni 的 DiT/vocoder graph 能获益，是因为其用 **Triton/FlashInfer 编译内核**
+（launch overhead 占比高）。纯 torch 的 conv/SDPA 是 compute-bound，graph 的 copy/replay
+开销 > launch 节省。这是「零 JIT」约束的固有代价。
+
+WIndexTTS 尝试移植这两项均失败（见未采用表）。在纯 torch 路径下，**0.65s 是接近上限的数字**；
+要达 0.50s 需引入编译内核（违反项目约束）。
 
 ### vLLM-Omni 对比的可复现性
 

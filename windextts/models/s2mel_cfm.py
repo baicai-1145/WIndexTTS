@@ -69,6 +69,7 @@ class S2MelCFM(nn.Module):
         n_timesteps: int = 25,
         temperature: float = 1.0,
         inference_cfg_rate: float = 0.7,
+        use_graph: bool = False,
     ) -> torch.Tensor:
         """Solve the CFM ODE from noise to mel.
 
@@ -81,6 +82,8 @@ class S2MelCFM(nn.Module):
             n_timesteps: Euler steps (default 25).
             temperature: noise scale.
             inference_cfg_rate: classifier-free guidance rate (default 0.7).
+            use_graph: if True, use CUDA-Graph-captured Euler loop (faster,
+                but incompatible with TeaCache — disables it for this call).
         Returns:
             mel [B, 80, T] including the prompt region (caller strips it).
         """
@@ -90,6 +93,18 @@ class S2MelCFM(nn.Module):
         self.estimator.setup_caches(max_batch_size=2 * B, max_seq_length=T)
         z = torch.randn([B, self.in_channels, T], device=device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=mu.dtype)
+        if use_graph:
+            # graph path requires the estimator forward to be capture-safe;
+            # TeaCache's data-dependent branching is incompatible, so bypass it.
+            est = self.estimator
+            tc_was = getattr(est, "teacache_enabled", False)
+            est.teacache_enabled = False
+            try:
+                return self.solve_euler_graph(
+                    z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate
+                )
+            finally:
+                est.teacache_enabled = tc_was
         return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
 
     def solve_euler(
@@ -301,6 +316,7 @@ class S2Mel(nn.Module):
         duration_factor: float = 1.0,
         n_timesteps: int = 25,
         inference_cfg_rate: float = 0.7,
+        use_graph: bool = False,
     ) -> torch.Tensor:
         """End-to-end S2Mel: condition → CFM → mel (prompt stripped).
 
@@ -320,6 +336,7 @@ class S2Mel(nn.Module):
         vc = self.cfm.inference(
             cat_condition, x_lens, ref_mel, style, None,
             n_timesteps=n_timesteps, inference_cfg_rate=inference_cfg_rate,
+            use_graph=use_graph,
         )
         # strip prompt region
         return vc[:, :, ref_mel.size(-1):]
