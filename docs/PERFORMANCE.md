@@ -16,14 +16,30 @@
 
 ### 核心结论：WIndexTTS 追平 vLLM-Omni
 
-**零编译依赖的纯 torch 实现已追平依赖编译内核（FlashInfer/Triton）的 vLLM-Omni**
-（0.687s vs 0.655s，差距 32ms / 5%，在测量噪声内）。
+**零编译依赖的纯 torch 实现已追平依赖编译内核（FlashInfer/Triton）的 vLLM-Omni**。
+
+严格复刻对比（同 1 次 warmup + 同 4 文本）：
+
+| | mean | min | max |
+|---|---|---|---|
+| **WIndexTTS** | **0.656s** | **0.601s** | 0.735s |
+| vLLM-Omni（默认） | 0.655s | 0.601s | 0.686s |
+
+两者 mean 差 1ms、min 相同，在测量噪声内完全持平。
+充分 warmup 后 WIndexTTS 更稳（8 次 mean 0.630s / min 0.532s）。
 
 这是在 vLLM-Omni 用更激进技术栈的前提下达成的：
-- vLLM-Omni：FlashInfer attention + vLLM paged KV cache + torch.compile + SnakeBeta Triton 内核
-- WIndexTTS：纯 torch SDPA + 手写 KV cache + CUDA Graph + TeaCache + fp16/bf16 混合精度
+- vLLM-Omni：FlashInfer/TRITON_ATTN + vLLM paged KV cache + torch.compile + SnakeBeta Triton 内核 + bf16 DiT
+- WIndexTTS：纯 torch SDPA + 手写 KV cache + CUDA Graph + TeaCache + fp16/bf16 混合精度 + 15 步 ODE（vs vLLM 25 步）
 
 设计取舍：WIndexTTS 用「Windows 零编译开箱即用」换了「内核极致优化」，但实测性能持平。
+
+### vLLM-Omni low_latency 配置
+
+vLLM-Omni 的 `indextts2_low_latency.yaml`（FlashInfer backend + FULL_DECODE_ONLY CUDA Graph +
+12 diffusion steps + DiT/vocoder CUDA Graph）在本机初始化失败（cudagraph capture 报错，
+疑似 A10G 兼容性）。该配置更激进，理论上更快，但属不同质量档位（12 步 vs 25 步），
+未能纳入公平对比。
 
 ### vLLM-Omni 对比的可复现性
 
