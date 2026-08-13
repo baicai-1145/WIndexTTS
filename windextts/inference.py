@@ -242,6 +242,14 @@ class WIndexTTS:
                 conds, tt, lang, max_new_tokens=220, do_sample=False,
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
             )
+            # also pre-capture the beam-search graph (default production path:
+            # num_beams=3 → static batch K=3 CUDA Graph)
+            self.gpt.generate(
+                conds, tt, lang, max_new_tokens=220, do_sample=True,
+                top_k=30, top_p=0.8, temperature=0.8,
+                stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
+                repetition_penalty=10.0, num_beams=3,
+            )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
             self.s2mel.cfm.estimator.enable_teacache(thresh=0.25)
             mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=12)
