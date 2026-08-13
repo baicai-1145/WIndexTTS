@@ -158,27 +158,24 @@ class WIndexTTS:
 
         print(f">> WIndexTTS loaded all modules on {dev}")
         # apply per-module precision overrides (mixed-precision fast paths)
-        # All three modules run fp16 — verified stable (0/20 brick in stress
-        # test across strong emotions). fp16 is NOT the problem.
+        # All three modules run fp16 — verified stable (0/30 brick in stress
+        # test across multiple texts/seeds) with CUDA Graph enabled.
         #
-        # S2Mel CUDA Graph is DISABLED (s2mel_use_graph=False) due to TWO distinct
-        # graph bugs (root-caused via extensive bisection):
-        #   1. Bucket padding pollution (bucket>1): padding T_true→T_bucket lets
-        #      WN conv reflect-pad leak padding values into valid region.
-        #      diff scales with pad amount (T=116,bucket=64 → diff 2.3).
-        #   2. setup_caches invalidation (bucket=1): each new T triggers
-        #      setup_caches which rebuilds freqs_cis, breaking already-captured
-        #      graphs that bound the old freqs_cis tensor address.
-        # The eager fp16 path is fully stable and fast (~354ms stress median).
-        # Graph re-enable needs: (a) isolate padding region each Euler step, or
-        # (b) freeze estimator caches across captures. NOT an fp16 precision issue.
+        # S2Mel CUDA Graph is ENABLED (s2mel_use_graph=True) after fixing the
+        # root-cause bug (dt_buf GC): the Euler timestep buffer `dt_buf` was a
+        # local variable not retained by the graph cache, so Python GC freed it
+        # and PyTorch's caching allocator reused its memory — the captured graph
+        # then read garbage dt values on replay, producing brick/clipped audio.
+        # Fix: store dt_buf in the cache dict to keep a Python reference alive.
+        # Additional defensive fix: keep_mask zeroes prompt+padding regions each
+        # Euler step to prevent WN conv reflect-pad leakage.
         if self.dtype == torch.float16:
             self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
             self.s2mel.cfm.estimator.to(torch.float16)
             self.s2mel.cfm.estimator_fp16_weights = True
-            self.s2mel_use_graph = False  # eager fp16 (graph has padding+cache bugs)
-            print(">> GPT-AR + BigVGAN + S2Mel-DiT fp16 (eager; S2Mel graph disabled)")
+            self.s2mel_use_graph = True  # CUDA Graph enabled (dt_buf bug fixed)
+            print(">> GPT-AR + BigVGAN + S2Mel-DiT fp16 (CUDA Graph enabled)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).

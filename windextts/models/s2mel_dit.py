@@ -300,7 +300,13 @@ class Transformer(nn.Module):
         self.max_batch_size = max_batch_size
         dtype = self.norm.project_layer.weight.dtype
         device = self.norm.project_layer.weight.device
-        self.freqs_cis = precompute_freqs_cis(self.block_size, self.head_dim, self.rope_base, dtype).to(device)
+        # freqs_cis is sized by block_size (16384) — independent of max_seq_length.
+        # Only build it ONCE (first call). Rebuilding on every max_seq_length
+        # growth changes the tensor address, which invalidates already-captured
+        # CUDA Graphs that bound the old address (graph reads garbage RoPE →
+        # brick audio). This is the root cause of cross-bucket graph corruption.
+        if self.freqs_cis is None:
+            self.freqs_cis = precompute_freqs_cis(self.block_size, self.head_dim, self.rope_base, dtype).to(device)
         self.causal_mask = torch.tril(torch.ones(max_seq_length, max_seq_length, dtype=torch.bool)).to(device)
         self.use_kv_cache = use_kv_cache
 

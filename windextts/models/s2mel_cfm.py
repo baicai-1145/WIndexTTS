@@ -93,14 +93,19 @@ class S2MelCFM(nn.Module):
         B, T = mu.size(0), mu.size(1)
         device = mu.device
         # DiT transformer caches (RoPE freqs_cis, optional KV) must be sized to T.
-        # For the graph path, size to the BUCKETED T (>= real T) since solve_euler_graph
-        # pads the input up to a bucket; freqs_cis must cover the padded length or the
-        # estimator reads out-of-range (garbage) RoPE values — the root cause of the
-        # prior graph numerics divergence.
+        # IMPORTANT (graph mode): freqs_cis is precomputed from block_size (16384),
+        # so it NEVER needs rebuilding for different T. But setup_caches rebuilds
+        # it whenever max_seq_length grows. If a previously-captured graph bound
+        # the old freqs_cis tensor address, rebuilding invalidates it → garbage
+        # RoPE → brick audio. Fix: in graph mode, setup_caches ONCE to a large
+        # fixed max_seq_length (covers all requests); subsequent calls return early.
         cache_T = T
         if use_graph:
             bucket = getattr(self, "_GRAPH_BUCKET", 64)
             cache_T = ((T + bucket - 1) // bucket) * bucket
+            # Pin estimator caches to a large fixed size so setup_caches never
+            # rebuilds freqs_cis after the first call (graph-safe).
+            cache_T = max(cache_T, getattr(self, "_GRAPH_PIN_SEQ", 256))
         self.estimator.setup_caches(max_batch_size=2 * B, max_seq_length=cache_T)
         z = torch.randn([B, self.in_channels, T], device=device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=mu.dtype)
@@ -294,7 +299,9 @@ class S2MelCFM(nn.Module):
                 s_mu = s_mu.half()
                 s_t = s_t.half()
             torch.cuda.synchronize()
-            for _ in range(3):  # warmup
+            # warmup runs the estimator with the INITIAL x (pre-loop) so the
+            # capture below sees warmed-up cuda allocator & cudnn plans.
+            for _ in range(3):
                 sd = self.estimator(s_x.half() if fp16w else s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
                 dphi, cfg_dphi = sd.chunk(2, dim=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
@@ -302,6 +309,13 @@ class S2MelCFM(nn.Module):
             s_x_buf = s_x.clone()
             s_t_buf = s_t.clone()
             x_buf = x.clone()
+            # static keep-mask: True on valid frames [prompt_len:T_true],
+            # False on prompt region and padding tail. Refreshed per-request
+            # (content changes, address fixed) so the captured mul reads it.
+            keep = torch.ones(1, C, T, dtype=torch.bool, device=device)
+            keep[:, :, :prompt_len] = False
+            keep[:, :, T_true:] = False
+            self._graph_keep_mask = keep
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 # fp16 mode: cast s_x_buf to fp16 for the estimator (it lives
@@ -314,11 +328,17 @@ class S2MelCFM(nn.Module):
                 dphi, cfg_dphi = sd.chunk(2, dim=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
                 x_buf.copy_(x_buf + dt_buf * dphi)
-                x_buf[..., :prompt_len] = 0
+                # Bug-1 fix: mask out both the prompt region AND the bucket
+                # padding tail each Euler step, so WN reflect-pad conv cannot
+                # leak padding/prompt values into the valid region. Uses a
+                # static bool mask buffer (same address every replay); its
+                # CONTENT is refreshed per-request (see cache hit branch), so
+                # the captured mul still reads the correct mask each replay.
+                x_buf.mul_(self._graph_keep_mask)
             cache = dict(
                 graph=graph, s_x_buf=s_x_buf, s_t_buf=s_t_buf, x_buf=x_buf,
                 s_prompt_x=s_prompt_x, s_style=s_style, s_mu=s_mu, x_lens_s=x_lens_s,
-                fp16w=fp16w,
+                fp16w=fp16w, keep_mask=self._graph_keep_mask, dt_buf=dt_buf,
             )
             self._graph_cache[key] = cache
         else:
@@ -330,6 +350,12 @@ class S2MelCFM(nn.Module):
             cache["s_mu"][: mu.size(0)].copy_(mu.to(tgt))
             # x_lens_s is the cached static buffer; set it to true len
             cache["x_lens_s"].fill_(T_true)
+            # refresh the keep-mask content for this request's true length
+            # (prompt region [0:prompt_len] and padding tail [T_true:T] masked)
+            km = cache["keep_mask"]
+            km.fill_(True)
+            km[:, :, :prompt_len] = False
+            km[:, :, T_true:] = False
 
         # ---- replay loop (capture-free after first call) ----
         g = cache["graph"]
