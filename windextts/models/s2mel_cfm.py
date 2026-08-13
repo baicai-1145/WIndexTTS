@@ -246,8 +246,12 @@ class S2MelCFM(nn.Module):
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt_padded[..., :prompt_len]
         x[..., :prompt_len] = 0
-        x_lens_b = torch.LongTensor([T]).to(device)  # use bucketed len for attention mask
-        x_lens_s = torch.cat([x_lens_b, x_lens_b], dim=0)
+        # x_lens for the attention mask: STATIC buffer (size 2, fixed address)
+        # so the captured graph reads the same tensor every replay. We copy the
+        # TRUE request length into it before replay — this keeps the mask
+        # correct (only attends real frames) while letting the graph reuse
+        # across requests of different lengths within the same bucket.
+        x_lens_s = torch.zeros(2, dtype=torch.long, device=device)
 
         if cache is None:
             zero_prompt_x = torch.zeros_like(prompt_x)
@@ -286,6 +290,8 @@ class S2MelCFM(nn.Module):
             cache["s_prompt_x"][: x.size(0)].copy_(prompt_x)
             cache["s_style"][: style.size(0)].copy_(style)
             cache["s_mu"][: mu.size(0)].copy_(mu)
+            # x_lens_s is the cached static buffer; set it to true len
+            cache["x_lens_s"].fill_(T_true)
 
         # ---- replay loop (capture-free after first call) ----
         g = cache["graph"]

@@ -372,6 +372,32 @@ class BigVGAN(nn.Module):
             x = torch.clamp(x, min=-1.0, max=1.0)
         return x
 
+    # ----- weight norm removal (official inference path) ----------------
+
+    def remove_weight_norm(self) -> int:
+        """Flatten weight_norm parametrization into plain Conv1d weights.
+
+        The checkpoint stores weight_g/weight_v; weight_norm's _forward_pre_hook
+        recomputes weight = g * v/||v|| on EVERY forward. For inference this is
+        pure overhead (fixed weights) and — critically — the hook adds host
+        dispatch cost to each of BigVGAN's ~330 conv calls (profiler showed
+        149ms of host bubble, 91% from conv1d dispatch). Removing it pre-flattens
+        the weight so the conv runs the fast un-hooked path.
+
+        Math is identical (official BigVGAN calls this after load).
+        Returns count of modules normalized.
+        """
+        from torch.nn.utils import remove_weight_norm as _rwn
+        n = 0
+        for m in self.modules():
+            # weight_norm adds a 'weight_g' param + _forward_pre_hook; try remove.
+            try:
+                _rwn(m)
+                n += 1
+            except (ValueError, KeyError):
+                pass
+        return n
+
     # ----- weight loading --------------------------------------------------
 
     def load_official(self, sd: dict[str, torch.Tensor]) -> None:

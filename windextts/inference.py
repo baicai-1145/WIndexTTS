@@ -143,6 +143,12 @@ class WIndexTTS:
         self.bigvgan = BigVGAN(bcfg).to(dev)
         self.bigvgan.load_official(w.load_bigvgan())
         self.bigvgan.eval()
+        # Flatten weight_norm -> plain weights (official path). Eliminates the
+        # _forward_pre_hook on every conv, removing ~149ms of host dispatch
+        # bubble (profiler: 91% of BigVGAN's large gaps were conv1d dispatch).
+        n = self.bigvgan.remove_weight_norm()
+        # weight_norm params are fp32 here; if BigVGAN later cast to fp16,
+        # the flattened weight goes along with the cast.
 
         print(f">> WIndexTTS loaded all modules on {dev}")
         # apply per-module precision overrides (mixed-precision fast paths)
