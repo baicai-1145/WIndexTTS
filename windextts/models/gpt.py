@@ -42,23 +42,22 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 __all__ = ["UnifiedVoice"]
 
 
-class Conv1D(nn.Module):
-    """HF GPT-2 Conv1D: linear layer with [in, out] weights (no transpose).
+class Conv1D(nn.Linear):
+    """HF GPT-2 Conv1D re-implemented as nn.Linear subclass.
 
-    forward: out = x @ weight + bias   (weight shape [in, out]).
+    Original HF Conv1D stores weight as [in, out] and computes x @ weight.
+    nn.Linear stores weight as [out, in] and computes x @ weight.T.
+    Mathematically identical; subclassing nn.Linear makes the module
+    recognizable by quantization libraries (torchao int4_weight_only filters
+    on isinstance(m, nn.Linear)). Weight is transposed at load time
+    (load_official handles the [in,out] -> [out,in] conversion).
     """
 
     def __init__(self, nf: int, nx: int):
-        super().__init__()
-        self.nf = nf
+        # Conv1D(nf=out, nx=in) -> nn.Linear(in=nx, out=nf)
+        super().__init__(nx, nf)
+        self.nf = nf  # kept for backward-compat (tests may read)
         self.nx = nx
-        self.weight = nn.Parameter(torch.empty(nx, nf))
-        self.bias = nn.Parameter(torch.zeros(nf))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
-        return x.view(size_out)
 
 
 class GPT2Attention(nn.Module):
@@ -407,6 +406,12 @@ class UnifiedVoice(nn.Module):
         after build_emo_conditioning() to load them."""
         remapped: dict[str, torch.Tensor] = {}
         dropped: list[str] = []
+        # Conv1D is now an nn.Linear subclass: official gpt.pth stores Conv1D
+        # weights as [in, out], but nn.Linear expects [out, in]. Detect the
+        # GPT body Conv1D weights (gpt.h.{i}.attn.c_attn/c_proj, mlp.c_fc/c_proj)
+        # and transpose them so load_state_dict lands correct values.
+        _CONV1D_SUFFIXES = (".attn.c_attn.weight", ".attn.c_proj.weight",
+                            ".mlp.c_fc.weight", ".mlp.c_proj.weight")
         for k, v in sd.items():
             is_emo = k.startswith("emo_conditioning_encoder.") or k.startswith("emo_perceiver_encoder.")
             if is_emo and not load_emo_conditioning:
@@ -414,6 +419,8 @@ class UnifiedVoice(nn.Module):
                 continue
             # gpt.pth uses 'gpt.h.{i}.*' and our submodule is also named 'gpt' —
             # keys map 1:1 without any prefix stripping.
+            if any(k.endswith(s) for s in _CONV1D_SUFFIXES) and v.dim() == 2:
+                v = v.t().contiguous()  # [in, out] -> [out, in] for nn.Linear
             remapped[k] = v
         missing, unexpected = self.load_state_dict(remapped, strict=False)
         if missing:

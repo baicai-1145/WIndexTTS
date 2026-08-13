@@ -153,7 +153,18 @@ def synthesize(
 # ---------------------------------------------------------------------------
 # UI layout — mirrors the official IndexTTS webui structure
 # ---------------------------------------------------------------------------
-LANGUAGES = ["ZH", "EN", "JA", "KO", "YUE"]
+# All 99 Whisper languages + extensions. Names from tokenizer.LANGUAGES.
+# Ordered by English name for easy lookup; ZH/EN/JA/KO/YUE kept first (common use).
+_LANG_ORDER = ["ZH", "EN", "JA", "KO", "YUE", "MINNAN", "WUYU"]
+LANGUAGES = _LANG_ORDER + sorted(
+    ["AF","AM","AR","AS","AZ","BA","BE","BG","BN","BO","BR","BS","CA","CS",
+     "CY","DA","DE","EL","ES","ET","EU","FA","FI","FO","FR","GL","GU","HA",
+     "HAW","HE","HI","HR","HT","HU","HY","ID","IS","IT","JW","KA","KK","KM",
+     "KN","LA","LB","LN","LO","LT","LV","MG","MI","MK","ML","MN","MR","MS",
+     "MT","MY","NE","NL","NN","NO","OC","PA","PL","PS","PT","RO","RU","SA",
+     "SD","SI","SK","SL","SN","SO","SQ","SR","SU","SV","SW","TA","TE","TG",
+     "TH","TK","TL","TR","TT","UK","UR","UZ","VI","YI","YO"]
+)
 
 with gr.Blocks(
     title="WIndexTTS WebUI",

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "415040fd-1859-4a2e-8026-3ced3bcf2f65",
+  "title": "return await runs.run('w4a16', {agent:'worker', task:[\"GOAL: 对 WIndexTTS 的 GPT-AR 模块实施 W4A16 量化（t...",
+  "objective": "return await runs.run('w4a16', {agent:'worker', task:[\"GOAL: 对 WIndexTTS 的 GPT-AR 模块实施 W4A16 量化（t...",
+  "status": "failed",
+  "createdAt": "2026-08-13T21:44:30.757Z",
+  "updatedAt": "2026-08-13T21:44:30.936Z",
+  "runs": [
+    {
+      "runId": "a45ee310-4b0e-46ed-8c9e-c9f43e128eaa",
+      "mode": "workflow",
+      "asyncDir": "/tmp/pi-subagents-uid-0/async-subagent-runs/a45ee310-4b0e-46ed-8c9e-c9f43e128eaa",
+      "status": "failed",
+      "startedAt": "2026-08-13T21:44:30.761Z",
+      "completedAt": "2026-08-13T21:44:30.936Z"
+    }
+  ],
+  "workflowChildren": [],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "status",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/a45ee310-4b0e-46ed-8c9e-c9f43e128eaa/status.json"
+    },
+    {
+      "kind": "other",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/a45ee310-4b0e-46ed-8c9e-c9f43e128eaa/events.jsonl",
+      "description": "Lifecycle events"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/root/WIndexTTS",
+  "ownerSessionId": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-12T16-07-13-393Z_019ff6ba-50f0-7ab4-b3dd-4b011ab6a5ff.jsonl",
+  "summary": "workflowScript must be valid JavaScript.\nIf task text contains Markdown fences or backticks, use an array joined with \"\\n\" or escaped strings instead of a raw backtick template literal.\n\nOriginal SyntaxError:\nworkflow-script.js:2\nreturn await runs.run('w4a16', {agent:'worker', task:[\"GOAL: 对 WIndexTTS 的 GPT-AR 模块实施 W4A16 量化（torchao int4_weight_only），验证加速效果 + 数值对齐。\",\"\",\"## 已验证的关键事实（不用重新验证）\",\"1. torchao 0.8.0 已装在 /root/index-tts/.venv（torch 2.8+cu128）\",\"2. torchao int4_weight_only(group_size=128) 的 tinygemm kernel 要求 bf16（fp16 会报 scales dtype 错误）\",\"3. **GPT-AR 在 bf16 下与 fp16 100% 精确匹配**（greedy codes 101/101 一致）——GPT 用 bf16 零误差\",\"4. GPT 的 transformer body 用自定义 Conv1D（windextts/models/gpt.py line 45），不是 nn.Linear。torchao 只量化 nn.Linear\",\"5. Conv1D(nf=out, nx=in) weight shape [in,nx, out=nf]。等价 nn.Linear(in=nx, out=nf)，转换: linear.weight = conv1d.weight.t().contiguous()\",\"6. **Conv1D→Linear 转换已验证无损**（greedy codes 精确匹配=True）\",\"7. 共 96 个 Conv1D（24层 × 4个: c_attn/c_proj/mlp.c_fc/mlp.c_proj），参数量 472M\",\"8. DiT/BigVGAN 保持 fp16 不变（它们的 bf16 有 dtype 混合问题），只 GPT 走 W4A16\",\"\",\"## 需要完成的改造步骤\",\"\",\"### 步骤1: 让 GPT 支持 bf16 + W4A16 量化\",\"修改 windextts/models/gpt.py 和 windextts/inference.py，使 GPT 能在 bf16 下运行：\",\"- 在 inference.py 的 __init__（line ~172）增加 bf16-gpt 路径：当启用 w4a16 时，只把 tts.gpt 转 bf16（gpt.gpt + gpt.mel_head + gpt.final_norm + 所有 embedding + emo_conditioning + spk_emb_proj），DiT/BigVGAN 保持 fp16\",\"- 注意 embedding：mel_embedding/text_embedding/mel_pos_embedding 默认是模型 dtype，转 bf16 后输出 bf16，需确保下游一致\",\"- build_conds_latent (gpt.py line 505-508) 输出 dtype 要和 gpt body 一致\",\"- infer_single (inference.py line 340-347) 里 gpt_dtype = self.gpt.emovec_layer.weight.dtype 已动态读取，应该自动跟随\",\"\",\"### 步骤2: Conv1D→nn.Linear 替换（96个）\",\"在 gpt.py 的 GPT2Transformer 中，把 Conv1D 替换为等价 nn.Linear。\",\"**最干净：直接把 Conv1D 类替换为 nn.Linear**，修改 GPT2Attention/GPT2MLP 的 __init__ 用 nn.Linear，调整 load_official 的权重加载（Conv1D weight[in,out] → Linear weight[out,in] 需要 .t()）。\",\"保留 Conv1D 作为别名向后兼容（对齐测试可能引用）。\",\"\",\"### 步骤3: 接入 torchao int4 量化\",\"- 用 "
+}

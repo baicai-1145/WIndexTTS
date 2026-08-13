@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "c5d208a4-dff0-4859-bd6e-3cd7b7f8ad23",
+  "title": "const fs = await import('fs'); const task = fs.readFileSync('/tmp/w4a16_task.md','utf8'); return ...",
+  "objective": "const fs = await import('fs'); const task = fs.readFileSync('/tmp/w4a16_task.md','utf8'); return ...",
+  "status": "failed",
+  "createdAt": "2026-08-13T21:44:48.101Z",
+  "updatedAt": "2026-08-13T21:44:48.267Z",
+  "runs": [
+    {
+      "runId": "4a796449-4671-4b1a-85d4-664e07c9c196",
+      "mode": "workflow",
+      "asyncDir": "/tmp/pi-subagents-uid-0/async-subagent-runs/4a796449-4671-4b1a-85d4-664e07c9c196",
+      "status": "failed",
+      "startedAt": "2026-08-13T21:44:48.104Z",
+      "completedAt": "2026-08-13T21:44:48.267Z"
+    }
+  ],
+  "workflowChildren": [],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "status",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/4a796449-4671-4b1a-85d4-664e07c9c196/status.json"
+    },
+    {
+      "kind": "other",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/4a796449-4671-4b1a-85d4-664e07c9c196/events.jsonl",
+      "description": "Lifecycle events"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/root/WIndexTTS",
+  "ownerSessionId": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-12T16-07-13-393Z_019ff6ba-50f0-7ab4-b3dd-4b011ab6a5ff.jsonl",
+  "summary": "TypeError [ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING]: A dynamic import callback was not specified.\n    at importModuleDynamicallyCallback (node:internal/modules/esm/utils:295:9)\n    at workflow-script.js:2:12\n    at workflow-script.js:3:3\n    at Script.runInContext (node:vm:150:12)\n    at MessagePort.<anonymous> ([worker eval]:304:34)\n    at [nodejs.internal.kHybridDispatch] (node:internal/event_target:856:20)\n    at MessagePort.<anonymous> (node:internal/per_context/messageport:23:28)"
+}

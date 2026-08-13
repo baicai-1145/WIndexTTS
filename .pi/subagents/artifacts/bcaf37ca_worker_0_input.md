@@ -1,0 +1,57 @@
+# Task for worker
+
+You are a delegated subagent running from a fork of the parent session. Treat the inherited conversation as reference-only context, not a live thread to continue. Do not continue or answer prior messages as if they are waiting for a reply. Your sole job is to execute the task below and return a focused result for that task using your tools.
+
+Task:
+GOAL: 对 WIndexTTS 的 GPT-AR 模块实施 W4A16 量化（torchao int4_weight_only），验证加速效果 + 数值对齐。\n\n## 已验证的关键事实（不用重新验证）\n1. torchao 0.8.0 已装在 /root/index-tts/.venv（torch 2.8+cu128）\n2. torchao int4_weight_only(group_size=128) 的 tinygemm kernel 要求 bf16（fp16 会报 scales dtype 错误）\n3. **GPT-AR 在 bf16 下与 fp16 100% 精确匹配**（greedy codes 101/101 一致）——GPT 用 bf16 零误差\n4. GPT 的 transformer body 用自定义 Conv1D（windextts/models/gpt.py line 45），不是 nn.Linear。torchao 只量化 nn.Linear\n5. Conv1D(nf=out, nx=in) weight shape [in,nx, out=nf]。等价 nn.Linear(in=nx, out=nf)，转换: linear.weight = conv1d.weight.t().contiguous()\n6. **Conv1D→Linear 转换已验证无损**（greedy codes 精确匹配=True）\n7. 共 96 个 Conv1D（24层 × 4个: c_attn/c_proj/mlp.c_fc/mlp.c_proj），参数量 472M\n8. DiT/BigVGAN 保持 fp16 不变（它们的 bf16 有 dtype 混合问题），只 GPT 走 W4A16\n\n## 需要完成的改造步骤\n\n### 步骤1: 让 GPT 支持 bf16 + W4A16 量化\n修改 windextts/models/gpt.py 和 windextts/inference.py，使 GPT 能在 bf16 下运行：\n- 在 inference.py 的 __init__（line ~172）增加 bf16-gpt 路径：当启用 w4a16 时，只把 tts.gpt 转 bf16（gpt.gpt + gpt.mel_head + gpt.final_norm + 所有 embedding + emo_conditioning + spk_emb_proj），DiT/BigVGAN 保持 fp16\n- 注意 embedding：mel_embedding/text_embedding/mel_pos_embedding 默认是模型 dtype，转 bf16 后输出 bf16，需确保下游一致\n- build_conds_latent (gpt.py line 505-508) 输出 dtype 要和 gpt body 一致\n- infer_single (inference.py line 340-347) 里 gpt_dtype = self.gpt.emovec_layer.weight.dtype 已动态读取，应该自动跟随\n\n### 步骤2: Conv1D→nn.Linear 替换（96个）\n在 gpt.py 的 GPT2Transformer 中，把 Conv1D 替换为等价 nn.Linear。\n方案A（推荐，干净）：直接改 GPT2Attention/GPT2MLP/GPT2Transformer 用 nn.Linear，forward 改为 F.linear（注意 weight 要 .t()）。\n方案B（最小改动）：保留 Conv1D 类，但在量化前动态替换。\n建议方案A——在 gpt.py 里把 Conv1D 的 forward 改用 F.linear（weight.t()），这样 torchao 能识别为 Linear。但 Conv1D 不是 nn.Linear 子类，torchao 的 filter_fn 不会匹配。\n**最干净：直接把 Conv1D 类替换为 nn.Linear**，修改 GPT2Attention/GPT2MLP 的 __init__ 用 nn.Linear，调整 load_official 的权重加载（Conv1D weight[in,out] → Linear weight[out,in] 需要 .t()）。\n\n### 步骤3: 接入 torchao int4 量化\n- 用 quantize_(tts.gpt.gpt, int4_weight_only(group_size=128), filter_fn=lambda m,_: isinstance(m, nn.Linear))\n- 量化后 graph 缓存要清除重建\n- **关键风险：tinygemm kernel 能否被 CUDA Graph 捕获**。如果不行，GPT 会退回 eager（1479ms，比 fp16 graph 的 391ms 慢 3.7x），那 W4A16 就无意义\n\n### 步骤4: Graph 兼容性 + 速度验证\n- 量化后重新捕获 graph，测 GPT greedy 速度（目标：比 fp16 graph 391ms 更快）\n- 如果 graph 不兼容 tinygemm，尝试: (a) eager 模式 int4 vs eager fp16 对比（看 int4 kernel 本身是否加速）；(b) 报告结论\n\n### 步骤5: 数值对齐验证\n- W4A16 greedy codes vs fp16 greedy codes 对比（之前 fp16 vs bf16 是 100% 匹配，int4 会有量化误差）\n- 跑 tests/align/ 确认无回归（注意：对齐测试可能因为 Conv1D→Linear 改动需要更新，但要保证数学等价）\n\n## 参考路径\n- torchao int4: from torchao.quantization import int4_weight_only, quantize_\n- Conv1D 定义: windextts/models/gpt.py line 45\n- GPT2Attention.c_attn/c_proj: gpt.py line 80-81\n- GPT2MLP.c_fc/c_proj: gpt.py line 156-157\n- inference.py dtype 控制: line 172-175\n\n## 重要约束\n- 核心推理路径仍纯 torch（torchao 作为可选加速，import 失败时回退）\n- 不破坏现有 24 个对齐测试\n- Windows 兼容（torchao 有预编译 wheel，不算 JIT 编译）\n- 如果 W4A16 最终无法加速（graph 不兼容），保留 Conv1D→Linear 的改动（它是无损的），把 int4 量化做成可选开关（默认关闭），并报告清晰结论\n\n## 交付\n1. gpt.py 的 Conv1D→Linear 改造（可选保留 Conv1D 作为别名向后兼容）\n2. inference.py 的 W4A16 开关（如 enable_w4a16=True）\n3. 完整的速度 + 数值对齐测试结果\n4. 如果成功：提交 commit；如果失败：报告根因 + 回退\n\n先读 windextts/models/gpt.py 完整理解结构，再动手。每步验证。
+
+## Acceptance Contract
+Acceptance level: checked
+Completion is not accepted from prose alone. End with a structured acceptance report.
+
+Criteria:
+- criterion-1: Implement the requested change without widening scope
+
+Required evidence: changed-files, tests-added, commands-run, residual-risks, no-staged-files
+
+Finish with a fenced JSON block tagged `acceptance-report` in this shape:
+Use empty arrays when no items apply; array fields contain strings unless object entries are shown.
+`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.
+`commandsRun[].result` must be exactly one of: passed, failed, not-run.
+`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.
+```acceptance-report
+{
+  "criteriaSatisfied": [
+    {
+      "id": "criterion-1",
+      "status": "satisfied",
+      "evidence": "specific proof"
+    }
+  ],
+  "changedFiles": [
+    "src/file.ts"
+  ],
+  "testsAddedOrUpdated": [
+    "test/file.test.ts"
+  ],
+  "commandsRun": [
+    {
+      "command": "command",
+      "result": "passed",
+      "summary": "short result"
+    }
+  ],
+  "validationOutput": [
+    "validation output or concise summary"
+  ],
+  "residualRisks": [
+    "none"
+  ],
+  "noStagedFiles": true,
+  "diffSummary": "short description of the diff",
+  "reviewFindings": [
+    "blocker: file.ts:12 - issue found, or no blockers"
+  ],
+  "manualNotes": "anything else the parent should know"
+}
+```

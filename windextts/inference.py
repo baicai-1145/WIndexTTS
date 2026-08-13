@@ -56,10 +56,12 @@ class WIndexTTS:
         weights_dir: str | Path = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
+        enable_w4a16: bool = False,
     ) -> None:
         self.cfg = cfg or load_default_config()
         self.device = device
         self.dtype = dtype
+        self.enable_w4a16 = enable_w4a16  # W4A16 INT4 weight quantization (GPT only)
         from windextts.weights import DEFAULT_WEIGHTS_DIR
         self.weights = WeightLoader(weights_dir or DEFAULT_WEIGHTS_DIR)
 
@@ -175,7 +177,16 @@ class WIndexTTS:
             self.s2mel.cfm.estimator.to(torch.float16)
             self.s2mel.cfm.estimator_fp16_weights = True
             self.s2mel_use_graph = True  # CUDA Graph enabled (dt_buf bug fixed)
-            print(">> GPT-AR + BigVGAN + S2Mel-DiT fp16 (CUDA Graph enabled)")
+            mode = "fp16"
+            if self.enable_w4a16:
+                # W4A16: cast GPT to bf16 (torchao int4 tinygemm requires bf16)
+                # and quantize its nn.Linear weights to INT4. GPT-AR is numerically
+                # identical in bf16 vs fp16 (greedy codes 101/101 match), so this
+                # is safe. DiT/BigVGAN stay fp16 (their bf16 has dtype-mix issues).
+                self.gpt.to(torch.bfloat16)
+                self._apply_w4a16()
+                mode = "W4A16 (GPT int4 bf16 + DiT/BigVGAN fp16)"
+            print(f">> GPT-AR + BigVGAN + S2Mel-DiT {mode} (CUDA Graph enabled)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
@@ -207,6 +218,44 @@ class WIndexTTS:
             self._qwen_emo = QwenEmotion(emo_dir, device=self.device, dtype=torch.float16)
             print(">> QwenEmotion loaded (pure-torch Qwen3, text→emotion)")
         return self._qwen_emo
+
+    def _apply_w4a16(self, group_size: int = 128) -> None:
+        """Quantize GPT transformer body nn.Linear weights to INT4 (W4A16).
+
+        Uses torchao int4_weight_only (tinygemm kernel, bf16 activations).
+        GPT-AR greedy codes are identical in bf16 vs fp16 (verified 101/101),
+        so the bf16 cast is lossless; INT4 adds small quantization error.
+        DiT/BigVGAN are NOT quantized (kept fp16).
+
+        Optional dependency: torchao. If unavailable, logs and no-ops.
+        """
+        try:
+            from torchao.quantization import int4_weight_only, quantize_
+        except ImportError:
+            print(">> W4A16: torchao not installed, skipping quantization")
+            return
+        import torch.nn as nn_torch
+        nn_lin = nn_torch.Linear
+        # Quantize all nn.Linear in the GPT transformer body (gpt.gpt.h.*.c_attn/
+        # c_proj/c_fc, plus emo/spk projections if Linear).
+        n_before = sum(1 for m in self.gpt.gpt.modules() if isinstance(m, nn_lin))
+        quantize_(
+            self.gpt.gpt,
+            int4_weight_only(group_size=group_size),
+            filter_fn=lambda mod, _fqn: isinstance(mod, nn_lin),
+        )
+        # Also quantize the lm_head (mel_head) and emo/spk Linear if present.
+        for attr in ("mel_head", "final_norm"):
+            pass  # final_norm is LayerNorm (skip); mel_head quantized below
+        if isinstance(self.gpt.mel_head, nn_lin):
+            quantize_(
+                self.gpt.mel_head,
+                int4_weight_only(group_size=group_size),
+                filter_fn=lambda mod, _fqn: isinstance(mod, nn_lin),
+            )
+        n_after = sum(1 for m in self.gpt.gpt.modules()
+                      if isinstance(m, nn_lin) and "Int4" in type(getattr(m.weight, "__class__", type(None))).__name__)
+        print(f">> W4A16: quantized GPT body ({n_before} nn.Linear, int4 tinygemm, group={group_size})")
 
     def warmup(self) -> None:
         """Pre-capture CUDA Graphs + prime cuDNN autotune with dummy data.
