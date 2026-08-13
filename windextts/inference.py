@@ -239,13 +239,13 @@ class WIndexTTS:
         with torch.no_grad():
             use_cg = dev != "cpu"
             codes = self.gpt.generate(
-                conds, tt, lang, max_new_tokens=220, do_sample=False,
+                conds, tt, lang, max_new_tokens=720, do_sample=False,
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
             )
             # also pre-capture the beam-search graph (default production path:
             # num_beams=3 → static batch K=3 CUDA Graph)
             self.gpt.generate(
-                conds, tt, lang, max_new_tokens=220, do_sample=True,
+                conds, tt, lang, max_new_tokens=720, do_sample=True,
                 top_k=30, top_p=0.8, temperature=0.8,
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
                 repetition_penalty=10.0, num_beams=3,
@@ -415,7 +415,7 @@ class WIndexTTS:
         top_p: float = 0.8,
         top_k: int = 30,
         temperature: float = 0.8,
-        max_mel_tokens: int = 220,
+        max_mel_tokens: int | None = None,
         cfm_steps: int = 12,
         cfg_rate: float = 0.7,
         teacache_thresh: float = 0.25,
@@ -442,7 +442,10 @@ class WIndexTTS:
             max_text_tokens_per_segment: split long text into segments of at
                 most this many tokens; segments are synthesized separately and
                 concatenated with interval_silence_ms of silence between them.
-            interval_silence_ms: silence inserted between segments (ms).
+            max_mel_tokens: max mel codes GPT may emit per segment. If None
+                (recommended), auto-derived as max_text_tokens_per_segment * 6
+                (text→mel ratio ~5.5x measured) so the limits stay coupled and a
+                segment is never truncated. Set explicitly to override.
             repetition_penalty: HF repetition-penalty scale (official 10.0).
             num_beams: GPT-AR beam width (official 3). Beam search now runs
                 through the CUDA-Graph decode path too (static batch K, fixed
@@ -452,6 +455,15 @@ class WIndexTTS:
             (sample_rate, audio [samples,]) at 22050 Hz mono.
         """
         dev = self.device
+
+        # --- auto-couple max_mel_tokens to max_text_tokens_per_segment ---
+        # text→mel ratio is language-dependent (measured, beam3 do_sample):
+        #   ZH ~5.5x, JA ~5.2x, EN ~6.7-10.6x (English BPE tokens carry more
+        #   phonetic content per token). Use a language-specific multiplier
+        # so a segment is never truncated regardless of language.
+        _MEL_RATIO = {"ZH": 6, "JA": 6, "EN": 11, "KO": 8, "YUE": 6}
+        if max_mel_tokens is None:
+            max_mel_tokens = max_text_tokens_per_segment * _MEL_RATIO.get(lang.upper(), 12)
 
         # --- text normalization (G2P: digits→words, punctuation, names) ---
         if text_normalization:

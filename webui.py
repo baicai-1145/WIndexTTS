@@ -79,7 +79,6 @@ def synthesize(
     top_p,
     top_k,
     temperature,
-    max_mel_tokens,
     # perf knobs (WIndexTTS extensions vs official)
     cfm_steps,
     teacache_thresh,
@@ -129,7 +128,6 @@ def synthesize(
             top_p=float(top_p),
             top_k=int(top_k),
             temperature=float(temperature),
-            max_mel_tokens=int(max_mel_tokens),
             cfm_steps=int(cfm_steps),
             teacache_thresh=float(teacache_thresh),
             text_normalization=bool(text_normalization),
@@ -197,7 +195,7 @@ with gr.Blocks(
                         label="文本归一化 (数字→中文)", value=True,
                     )
                     max_text_tokens_per_segment = gr.Slider(
-                        label="分段 token 上限", minimum=20, maximum=600, value=120, step=10,
+                        label="分段 token 上限 (单段文本长度, mel生成长度按语言自动匹配: 中文/日语×6, 英文×11)", minimum=20, maximum=600, value=120, step=10,
                     )
 
             with gr.Column(scale=1):
@@ -238,7 +236,6 @@ with gr.Blocks(
                 top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.8, step=0.05)
                 top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=30, step=1)
                 temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
-                max_mel_tokens = gr.Slider(label="max_mel_tokens (生成长度上限)", minimum=50, maximum=1000, value=220, step=10)
 
         with gr.Accordion("性能调优 (WIndexTTS 专属)", open=False):
             gr.Markdown(
@@ -258,7 +255,7 @@ with gr.Blocks(
                 text_normalization, max_text_tokens_per_segment,
                 emo_control, emo_upload, emo_weight,
                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
-                do_sample, top_p, top_k, temperature, max_mel_tokens,
+                do_sample, top_p, top_k, temperature,
                 cfm_steps, teacache_thresh,
             ],
             outputs=output_audio,
@@ -277,74 +274,6 @@ with gr.Blocks(
         outputs=[emo_ref_group, emo_vec_group, emo_text_group],
     )
 
-    # -----------------------------------------------------------------------
-    # Benchmark tab — one-click latency measurement (A10G fp16)
-    # -----------------------------------------------------------------------
-    with gr.Tab("性能基准"):
-        gr.Markdown(
-            "### WIndexTTS 端到端延迟基准\n"
-            "点击下方按钮，运行当前 UI 参数下的多次推理并统计延迟（需预热）。\n"
-            "参考值（A10G fp16，短文本）：**WIndexTTS ~400ms · vLLM-Omni ~470ms · 官方 fp32 ~1.4s**"
-        )
-        with gr.Row():
-            bench_button = gr.Button("📊 运行基准 (10 次)", variant="secondary")
-            bench_output = gr.Textbox(label="结果", lines=10, interactive=False)
-
-        def run_benchmark(
-            prompt_audio, text, lang, duration_factor, text_normalization,
-            max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
-            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
-            do_sample, top_p, top_k, temperature, max_mel_tokens,
-            cfm_steps, teacache_thresh,
-        ):
-            import statistics
-            ref_path = prompt_audio if prompt_audio is not None else cmd_args.ref
-            if ref_path is None or not text.strip():
-                return "请先上传参考音频并输入文本"
-            # warmup (also triggers graph capture)
-            for _ in range(2):
-                synthesize(prompt_audio, text, lang, duration_factor, text_normalization,
-                           max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
-                           vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
-                           do_sample, top_p, top_k, temperature, max_mel_tokens,
-                           cfm_steps, teacache_thresh)
-            # measure
-            ts, audio_lens = [], []
-            for i in range(10):
-                out = synthesize(prompt_audio, text, lang, duration_factor, text_normalization,
-                                 max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
-                                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
-                                 do_sample, top_p, top_k, temperature, max_mel_tokens,
-                                 cfm_steps, teacache_thresh)
-                if out is None:
-                    return "基准失败，请检查输入"
-                import torchaudio as _ta
-                info = _ta.info(out)
-                ts.append(info.num_frames / info.sample_rate)
-            ts.sort()
-            med = statistics.median(ts) * 1000
-            mn = min(ts) * 1000
-            trimmed = statistics.mean(ts[1:-1]) * 1000
-            return (
-                f"10 次基准 (音频 ~{ts[0]*1000:.0f}ms):\n"
-                f"  median: {med:.0f}ms\n"
-                f"  min:    {mn:.0f}ms\n"
-                f"  trimmed mean (±1σ): {trimmed:.0f}ms\n"
-                f"  RTF:    {med/(ts[0]*1000):.3f}\n"
-            )
-
-        bench_button.click(
-            run_benchmark,
-            inputs=[
-                prompt_audio, text_input, lang_dropdown, duration_factor,
-                text_normalization, max_text_tokens_per_segment,
-                emo_control, emo_upload, emo_weight,
-                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
-                do_sample, top_p, top_k, temperature, max_mel_tokens,
-                cfm_steps, teacache_thresh,
-            ],
-            outputs=bench_output,
-        )
 
 
 if __name__ == "__main__":
