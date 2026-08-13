@@ -414,6 +414,8 @@ class WIndexTTS:
         text_normalization: bool = True,
         max_text_tokens_per_segment: int = 120,
         interval_silence_ms: int = 200,
+        repetition_penalty: float = 10.0,
+        num_beams: int = 3,
     ) -> tuple[int, torch.Tensor]:
         """Zero-shot voice cloning.
 
@@ -433,6 +435,10 @@ class WIndexTTS:
                 most this many tokens; segments are synthesized separately and
                 concatenated with interval_silence_ms of silence between them.
             interval_silence_ms: silence inserted between segments (ms).
+            repetition_penalty: HF repetition-penalty scale (official 10.0).
+            num_beams: GPT-AR beam width (official 3). Beam search disables the
+                CUDA-Graph decode path (dynamic branching) but is the official
+                quality configuration.
         Returns:
             (sample_rate, audio [samples,]) at 22050 Hz mono.
         """
@@ -460,6 +466,7 @@ class WIndexTTS:
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
                 max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+                repetition_penalty, num_beams,
             )
 
         # multi-segment: synthesize each, join with silence
@@ -470,6 +477,7 @@ class WIndexTTS:
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
                 max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+                repetition_penalty, num_beams,
             )
             wavs.append(wav)
         silence = torch.zeros(int(OUTPUT_SR * interval_silence_ms / 1000))
@@ -497,6 +505,8 @@ class WIndexTTS:
         cfm_steps: int,
         cfg_rate: float,
         teacache_thresh: float,
+        repetition_penalty: float = 10.0,
+        num_beams: int = 3,
     ) -> tuple[int, torch.Tensor]:
         """Synthesize a single (already normalized, short) text segment."""
         dev = self.device
@@ -541,13 +551,15 @@ class WIndexTTS:
 
         # --- GPT conditioning + AR decode ---
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]
-        use_cg = self.device != "cpu"
+        use_cg = self.device != "cpu" and num_beams <= 1
         codes = self.gpt.generate(
             conds_latent, text_tokens, lang_id,
             max_new_tokens=max_mel_tokens, do_sample=do_sample,
             top_k=top_k, top_p=top_p, temperature=temperature,
             stop_token=self.cfg.gpt.stop_mel_token,
             use_cuda_graph=use_cg,
+            repetition_penalty=repetition_penalty,
+            num_beams=num_beams,
         )  # [1, T_codes]
 
         # strip stop token if present

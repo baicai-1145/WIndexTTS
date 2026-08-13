@@ -620,7 +620,7 @@ class UnifiedVoice(nn.Module):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_decode_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    def _build_decode_mask(attention_mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Additive [B,1,1,T_total] mask for a single decode query.
 
         The query is the newest token (last position), so causal masking is
@@ -628,11 +628,11 @@ class UnifiedVoice(nn.Module):
         (attention_mask == 0). Matches HF GPT2Model decode behavior (pad keys
         stay masked; -inf == torch.finfo(dtype).min, same as prefill mask).
         """
-        min_dt = torch.finfo(torch.float32).min
+        min_dt = torch.finfo(dtype).min
         pad = attention_mask == 0  # [B,T]
         mask = torch.zeros(
             (attention_mask.shape[0], 1, 1, attention_mask.shape[1]),
-            dtype=torch.float32, device=attention_mask.device,
+            dtype=dtype, device=attention_mask.device,
         )
         return mask.masked_fill(pad[:, None, None, :], min_dt)
 
@@ -643,12 +643,27 @@ class UnifiedVoice(nn.Module):
         top_k: int,
         top_p: float,
         temperature: float,
+        generated_ids: torch.Tensor | None = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.Tensor:
         """Sample next token ids from [B, V] logits (HF warper semantics).
 
-        Matches HF generate: temperature → top_k → top_p (only when
-        do_sample=True; greedy is a plain argmax, exactly like HF).
+        Matches HF generate: repetition_penalty → temperature → top_k → top_p
+        (only when do_sample=True; greedy is a plain argmax, exactly like HF).
+        Official IndexTTS uses repetition_penalty=10.0 (very strong) to prevent
+        the AR decoder from repeating similar mel codes (the root cause of
+        dragging/muffled quality when omitted).
         """
+        if repetition_penalty != 1.0 and generated_ids is not None:
+            # HF RepetitionPenaltyLogitsProcessor: gather scores of already-
+            # generated tokens; negative → multiply (more negative), positive →
+            # divide (smaller). Both directions reduce probability (transformers
+            # repetition_penalty.py: score<0 ? score*penalty : score/penalty).
+            for b in range(generated_ids.size(0)):
+                prev = generated_ids[b]
+                score = logits[b].gather(0, prev)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                logits[b].scatter_(0, prev, score)
         if do_sample:
             if temperature != 1.0:
                 logits = logits / temperature
@@ -684,6 +699,8 @@ class UnifiedVoice(nn.Module):
         temperature: float = 0.8,
         stop_token: Optional[int] = None,
         use_cuda_graph: bool = False,
+        repetition_penalty: float = 1.0,
+        num_beams: int = 1,
     ) -> torch.Tensor:
         """Autoregressive mel-code generation (batch=1), pure torch.
 
@@ -710,6 +727,16 @@ class UnifiedVoice(nn.Module):
                 Graph (batch=1, CUDA only). Output is bit-identical to the eager
                 path (same math; KV buffers + attention mask only). The graph is
                 captured once per (max_seq, dtype) and replayed on later calls.
+            repetition_penalty: HF RepetitionPenaltyLogitsProcessor scale
+                (official IndexTTS uses 10.0). Applied to already-generated ids.
+            num_beams: beam width for beam-search multinomial sampling matching
+                HF generate(num_beams=K, do_sample=..., top_p=..., ...). K beams
+                are expanded from the single prefill, each sampled independently
+                per step (with repetition_penalty), scored by cumulative
+                log-prob, and the highest-scoring finished hypothesis wins.
+                num_beams=1 keeps the exact current greedy/sample loop.
+                Beam search is incompatible with the CUDA Graph path (dynamic
+                branching), so num_beams>1 forces use_cuda_graph off.
         Returns:
             codes [B, T_gen] (T_gen includes the stop token when produced;
             may be shorter than max_new_tokens if stop was hit).
@@ -724,10 +751,17 @@ class UnifiedVoice(nn.Module):
         mdtype = next(self.parameters()).dtype
         if conditional_latents.dtype != mdtype:
             conditional_latents = conditional_latents.to(mdtype)
-        if use_cuda_graph:
+        if use_cuda_graph and num_beams <= 1:
             return self._generate_cuda_graph(
                 conditional_latents, text_inputs, langs, max_new_tokens,
                 do_sample, top_k, top_p, temperature, stop_token,
+                repetition_penalty=repetition_penalty,
+            )
+        if num_beams > 1:
+            return self._generate_beam_search(
+                conditional_latents, text_inputs, langs, max_new_tokens,
+                do_sample, top_k, top_p, temperature, stop_token,
+                num_beams, repetition_penalty,
             )
         device = conditional_latents.device
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
@@ -746,9 +780,12 @@ class UnifiedVoice(nn.Module):
         # --- decode loop ---
         codes: list[torch.Tensor] = []
         cur_logits = logits[:, -1, :]  # [B,V] predicts first mel code
+        gen_ids = torch.empty(input_ids.size(0), 0, dtype=torch.long, device=input_ids.device)
         for step in range(max_new_tokens):
-            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature)
+            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature,
+                                   generated_ids=gen_ids, repetition_penalty=repetition_penalty)
             codes.append(next_id)
+            gen_ids = torch.cat([gen_ids, next_id.unsqueeze(1)], dim=1)
             if next_id.item() == stop_token:
                 break
             # official decode emb: mel_embedding(token) + mel_pos at
@@ -769,7 +806,7 @@ class UnifiedVoice(nn.Module):
                 ],
                 dim=-1,
             )  # [B, T_total+1]
-            dec_mask = self._build_decode_mask(attention_mask)  # [B,1,1,T_total+1]
+            dec_mask = self._build_decode_mask(attention_mask, dtype=mdtype)  # [B,1,1,T_total+1]
             hidden, kvs = self.gpt(
                 inputs_embeds=emb_dec, attention_mask=dec_mask,
                 past_key_values=kvs,
@@ -777,6 +814,126 @@ class UnifiedVoice(nn.Module):
             cur_logits = self.mel_head(self.final_norm(hidden))[:, -1, :]
 
         return torch.stack(codes, dim=1)  # [B, T_gen]
+
+    def _generate_beam_search(
+        self,
+        conditional_latents: torch.Tensor,
+        text_inputs: torch.Tensor,
+        langs: Optional[torch.Tensor],
+        max_new_tokens: int,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        stop_token: int,
+        num_beams: int,
+        repetition_penalty: float = 1.0,
+    ) -> torch.Tensor:
+        """Beam-search multinomial sampling (HF generate num_beams>1 semantics).
+
+        Pure-torch reimplementation of the official path
+        (infer_v2_5.py:782-789 → HF GPT2InferenceModel.generate with
+        num_beams=3, repetition_penalty=10.0, do_sample=True, top_p=0.8,
+        top_k=30, temperature=0.8, length_penalty=0.0).
+
+        Design (batch=1 prefill → K beams, batched decode over active beams):
+          - prefill once; replicate logits/KV/mask to K beams (equal scores 0).
+          - per step: each active beam samples ONE token from its warped logits
+            (repetition_penalty → temperature → top_k → top_p when do_sample;
+            argmax when greedy). Candidate score = beam_score + log-softmax
+            prob of the sampled token. With one candidate per beam, "keep
+            top-K" is a no-op beyond the EOS filter (n_active ≤ K always).
+          - EOS (stop_token): the beam is frozen into the finished-hypothesis
+            list with its cumulative score; remaining beams continue.
+          - stop when all beams finished or max_new_tokens exhausted.
+          - length_penalty=0.0 (official): no length normalization.
+          - return the highest-scoring finished hypothesis's codes (stop token
+            stripped); if none finished, the best active beam.
+        """
+        device = conditional_latents.device
+        mdtype = next(self.parameters()).dtype
+        input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
+            conditional_latents, text_inputs, langs
+        )
+        mel_len = inputs_embeds.shape[1]  # S (conds+text, BEFORE start_mel)
+
+        # --- prefill (batch=1, same math as generate()) ---
+        last_ids = input_ids[:, mel_len:]  # [B,1] start_mel token
+        last_emb = self.mel_embedding(last_ids)
+        last_emb = last_emb + self.mel_pos_embedding(last_emb)  # mel pos 0
+        emb = torch.cat([inputs_embeds, last_emb], dim=1)  # [B, S+1, dim]
+        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        logits = self.mel_head(self.final_norm(hidden))  # [B, S+1, V]
+
+        K = num_beams
+        # replicate the single-sequence state to K beams (materialized copies)
+        cur_logits = logits[:, -1, :].expand(K, -1).contiguous()  # [K, V]
+        kvs = [
+            (k.expand(K, -1, -1, -1).contiguous(), v.expand(K, -1, -1, -1).contiguous())
+            for k, v in kvs
+        ]  # per-layer [K, H, S+1, head_dim]
+        attention_mask = attention_mask.expand(K, -1).contiguous()  # [K, S+1]
+        beam_scores = torch.zeros(K, dtype=torch.float32, device=device)
+        gen_ids = torch.empty(K, 0, dtype=torch.long, device=device)
+        finished: list[tuple[float, list[int]]] = []
+
+        for step in range(max_new_tokens):
+            n_active = cur_logits.shape[0]
+            if n_active == 0:
+                break
+            next_id = self._sample(
+                cur_logits, do_sample, top_k, top_p, temperature,
+                generated_ids=gen_ids, repetition_penalty=repetition_penalty,
+            )  # [n_active]
+            # log-prob of the sampled token under the (warped) distribution;
+            # _sample mutated cur_logits in place with penalty+warpers.
+            tok_lp = F.log_softmax(cur_logits, dim=-1).gather(
+                1, next_id.unsqueeze(1)
+            ).squeeze(1)  # [n_active]
+            cand_score = beam_scores + tok_lp  # [n_active] fp32
+
+            is_eos = next_id == stop_token  # [n_active] bool
+            if is_eos.any():
+                eos_scores = cand_score[is_eos].tolist()
+                eos_codes = gen_ids[is_eos].tolist()  # codes BEFORE stop
+                finished.extend(zip(eos_scores, eos_codes))
+            keep = ~is_eos
+            if not keep.any():
+                break
+            # keep only the still-active (non-EOS) beams; all share step length
+            beam_scores = cand_score[keep].float()
+            gen_ids = torch.cat([gen_ids[keep], next_id[keep].unsqueeze(1)], dim=1)
+            cur_logits = cur_logits[keep]
+            kvs = [(k[keep], v[keep]) for k, v in kvs]
+            attention_mask = attention_mask[keep]
+
+            # advance the transformer for the active beams (batched)
+            pos = step + 2  # mel pos (matches eager path)
+            emb_dec = self.mel_embedding(next_id[keep].unsqueeze(-1))  # [n,1,dim]
+            emb_dec = emb_dec + self.mel_pos_embedding.get_fixed_embedding(pos, device)
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=attention_mask.dtype, device=device,
+                    ),
+                ],
+                dim=-1,
+            )  # [n, T_total+1]
+            dec_mask = self._build_decode_mask(attention_mask, dtype=mdtype)  # [n,1,1,T_total+1]
+            hidden, kvs = self.gpt(
+                inputs_embeds=emb_dec, attention_mask=dec_mask,
+                past_key_values=kvs,
+            )
+            cur_logits = self.mel_head(self.final_norm(hidden))[:, -1, :]
+
+        if finished:
+            best = max(finished, key=lambda x: x[0])  # highest cumulative score
+            return torch.tensor([best[1]], dtype=torch.long, device=device)  # [1, T_gen]
+        # none finished: return the best-scoring active beam
+        best_beam = int(beam_scores.argmax().item())
+        return gen_ids[best_beam].unsqueeze(0)  # [1, T_gen]
 
     # ------------------------------------------------------------------
     # CUDA Graph AR decode (stage 3b)
@@ -862,6 +1019,7 @@ class UnifiedVoice(nn.Module):
         top_p: float,
         temperature: float,
         stop_token: int,
+        repetition_penalty: float = 1.0,
     ) -> torch.Tensor:
         """CUDA-Graph AR decode — bit-identical to the eager generate() path.
 
@@ -872,6 +1030,7 @@ class UnifiedVoice(nn.Module):
         argmax are not graph-captured).
         """
         device = conditional_latents.device
+        mdtype = next(self.parameters()).dtype
         if device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError(
                 "use_cuda_graph=True requires CUDA; pass use_cuda_graph=False on CPU"
@@ -910,9 +1069,12 @@ class UnifiedVoice(nn.Module):
         min_dt = torch.finfo(mask_buf.dtype).min
         codes: list[torch.Tensor] = []
         cur_logits = logits[:, -1, :]  # [B,V] predicts first mel code
+        gen_ids = torch.empty(input_ids.size(0), 0, dtype=torch.long, device=input_ids.device)
         for step in range(max_new_tokens):
-            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature)
+            next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature,
+                                   generated_ids=gen_ids, repetition_penalty=repetition_penalty)
             codes.append(next_id)
+            gen_ids = torch.cat([gen_ids, next_id.unsqueeze(1)], dim=1)
             if next_id.item() == stop_token:
                 break
             kv_pos = S + step  # absolute KV buffer column for this token
