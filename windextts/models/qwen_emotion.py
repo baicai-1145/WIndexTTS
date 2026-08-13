@@ -45,8 +45,10 @@ MELANCHOLIC_WORDS = {"低落", "melancholy", "melancholic", "depression", "depre
 EOS_TOKEN_ID = 151643  # <|endoftext|>
 THINK_END_ID = 151668  # </think> (present only when enable_thinking=True)
 
-# Greedy max tokens — emotion JSON is short (~70 tokens). Cap generously.
-MAX_NEW_TOKENS = 512
+# Greedy max tokens — emotion JSON is short (~70 tokens). The official uses
+# 32768 (way overkill); 150 is safe for any emotion output and keeps the KV
+# cache + attention small (total_max ≈ prompt+150) for faster graph decode.
+MAX_NEW_TOKENS = 150
 
 
 def _build_chat_prompt(text_input: str) -> str:
@@ -146,7 +148,8 @@ class QwenEmotion:
         input_ids = torch.tensor([enc.ids], device=self.device, dtype=torch.long)
 
         full = self.model.generate(
-            input_ids, max_new_tokens=MAX_NEW_TOKENS, eos_token_id=EOS_TOKEN_ID
+            input_ids, max_new_tokens=MAX_NEW_TOKENS, eos_token_id=EOS_TOKEN_ID,
+            use_cuda_graph=True,
         )
         gen_ids = full[0, input_ids.size(1) :].tolist()
 
