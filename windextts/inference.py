@@ -228,7 +228,7 @@ class WIndexTTS:
             spk = self.extract_spk_cond(a16)
             style = self.extract_style(a16)
             refmel = self.mel_fn(a22)
-            emo = self.build_emo_vec(style)
+            emo = self.build_emo_vec(style, spk)
             conds = self.gpt.build_conds_latent(style, emo)
         tt = torch.tensor([[1, 2, 3, 1]], device=dev, dtype=torch.int)
         from windextts.frontend.tokenizer import lang_to_token
@@ -305,24 +305,42 @@ class WIndexTTS:
     # emo vector handling (infer_v2_5.py:672-678 + normalize_emo_vec)
     # ------------------------------------------------------------------
 
-    def build_emo_vec(self, style: torch.Tensor, emo_vector: list[float] | None = None) -> torch.Tensor:
-        """Build the emo_vec [1,1280] for GPT conditioning via emo_matrix_lookup.
+    def build_emo_vec(self, style: torch.Tensor, spk_cond: torch.Tensor, emo_vector: list[float] | None = None) -> torch.Tensor:
+        """Build the emo_vec [1,1280] for GPT conditioning.
 
-        Uses the matrix path (emovec_mat only). The (1-sum)*emovec(audio) correction
-        term from infer_v2_5.py:764 requires the merge_emovec conformer (not yet
-        ported); omitted here as a first-version simplification (dominant term is
-        emovec_mat when weights are concentrated).
+        Full official formula (infer_v2_5.py:757-764):
+            emovec_audio = merge_emovec(spk, spk, alpha=1.0)  # conformer path
+            emovec = emovec_mat + (1 - sum(normalize(w))) * emovec_audio
+
+        The (1-sum)*emovec_audio correction was previously omitted (caused
+        'brick' output when a single emotion weight was high — without the
+        spk-base emovec term, the conditioning lost the speaker's base
+        characteristics). Now restored via the conformer path.
         """
         if emo_vector is None:
             emo_vector = [0, 0, 0, 0, 0, 0, 0, 1.0]  # calm default
         emo_vec_raw = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
         spk_chunks = tuple(torch.split(self.spk_matrix, self.emo_num))
         emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
-        emovec_mat = self.gpt.emo_matrix_lookup(
+        emovec_mat_raw = self.gpt.emo_matrix_lookup(
             style, emo_vec_raw, spk_chunks, emo_chunks
-        )  # [1,1280] (normalize_emo_vec applied inside)
-        # final emo_layer projection; cast to GPT dtype (fp16 mixed-precision path)
-        return self.gpt.emo_layer(emovec_mat.to(self.gpt.emo_layer.weight.dtype))
+        )  # [1,1280] (normalize_emo_vec applied inside; NOT through emo_layer)
+        # conformer path: emovec_audio from spk's own audio (alpha=1, pure spk)
+        gpt_dtype = self.gpt.emovec_layer.weight.dtype
+        emovec_audio = self.gpt.get_emovec(spk_cond.to(gpt_dtype))  # [1,1280] (through emo_layer)
+        # compute normalize_emo_vec weights to get the (1-sum) scalar
+        bias = torch.tensor(
+            [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
+            device=self.device, dtype=torch.float32,
+        )
+        wv = emo_vec_raw * bias
+        s = wv.sum()
+        if s > 0.8:
+            wv = wv * (0.8 / s)
+        complement = float((1.0 - wv.sum()).clamp(min=0.0))
+        # emovec_mat needs emo_layer projection to match emovec_audio's space
+        emovec_mat = self.gpt.emo_layer(emovec_mat_raw.to(gpt_dtype))
+        return emovec_mat + complement * emovec_audio
 
     @torch.no_grad()
     def build_emo_vec_full(
@@ -345,7 +363,7 @@ class WIndexTTS:
         - emo_ref_path None: pure matrix path (build_emo_vec).
         """
         if emo_ref_path is None:
-            return self.build_emo_vec(style, emo_vector)
+            return self.build_emo_vec(style, spk_cond, emo_vector)
 
         # --- conformer path: extract emo_cond_emb from the reference audio ---
         import torchaudio as _ta
