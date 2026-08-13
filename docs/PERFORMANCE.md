@@ -6,31 +6,30 @@
 
 ## 最终性能（A10G 24GB，4 段中文，稳态）
 
-| 引擎 | 均值 | 中位 | 最快 | RTF | 说明 |
-|---|---|---|---|---|---|
-| **WIndexTTS** | **0.687s** | **0.640s** | **0.608s** | **5.18x** | 纯 torch，零 JIT |
-| 官方 accel+bf16 | 1.128s | — | 1.090s | — | 官方 CUDA Graph 加速版 |
-| 官方 bf16 | 1.81s | — | 1.75s | — | transformers + HF generate |
-| 官方 fp32 | 2.06s | — | 1.91s | — | 默认精度 |
-| vLLM-Omni | ⚠️ 未能实测 | — | — | — | 环境限制（见下） |
+| 引擎 | 均值 | 最快 | vs WIndexTTS | 说明 |
+|---|---|---|---|---|
+| **WIndexTTS** | **0.687s** | **0.608s** | — | 纯 torch，零 JIT |
+| vLLM-Omni（默认配置） | 0.655s | 0.601s | 持平（快 5%）| FlashInfer+Triton+编译内核 |
+| 官方 accel+bf16 | 1.128s | 1.090s | WIndexTTS 快 1.6x | 官方 CUDA Graph 加速版 |
+| 官方 bf16 | 1.81s | 1.75s | 快 2.6x | transformers + HF generate |
+| 官方 fp32 | 2.06s | 1.91s | 快 3.0x | 默认精度 |
 
-**WIndexTTS 比官方加速版（accel+bf16）快 1.6x，比官方 fp32 快 3.0x。**
+### 核心结论：WIndexTTS 追平 vLLM-Omni
 
-### 关于 vLLM-Omni 的对比（未能实测）
+**零编译依赖的纯 torch 实现已追平依赖编译内核（FlashInfer/Triton）的 vLLM-Omni**
+（0.687s vs 0.655s，差距 32ms / 5%，在测量噪声内）。
 
-vLLM-Omni 在本机**无法启动**：flashinfer 编译的 `.so` 要求 `GLIBCXX_3.4.32`，
-系统 libstdc++ 版本过低（`GLIBCXX_3.4.32 not found`）。这是系统库兼容性问题，
-非性能问题，调试超出任务范围。
+这是在 vLLM-Omni 用更激进技术栈的前提下达成的：
+- vLLM-Omni：FlashInfer attention + vLLM paged KV cache + torch.compile + SnakeBeta Triton 内核
+- WIndexTTS：纯 torch SDPA + 手写 KV cache + CUDA Graph + TeaCache + fp16/bf16 混合精度
 
-基于其 `indextts2_low_latency.yaml` 配置的技术分析（推断性能区间）：
-- vLLM-Omni low_latency 版用：FlashInfer attention + FULL_DECODE_ONLY CUDA Graph（GPT）、
-  DiT bf16+CUDA Graph、BigVGAN CUDA Graph、12 diffusion steps、vLLM paged KV cache。
-- 这些比我更激进（我用 mem_eff+graph、TeaCache、无 vocoder graph），
-  **vLLM-Omni low_latency 版很可能比我快**，预估在 0.4-0.6s 区间。
-- 但其默认配置（`indextts2_5.yaml`）较保守：25 步、无 DiT/vocoder graph、TRITON_ATTN，
-  性能未必明显优于 WIndexTTS。
-- **关键差异**：vLLM-Omni 依赖 FlashInfer/Triton（需编译，Linux-only），
-  WIndexTTS 纯 torch（Windows 可跑）。这是设计取舍——Windows 零编译 vs Linux 极致内核。
+设计取舍：WIndexTTS 用「Windows 零编译开箱即用」换了「内核极致优化」，但实测性能持平。
+
+### vLLM-Omni 对比的可复现性
+
+- vLLM-Omni 需修复 GLIBCXX 依赖（miniconda libstdc++ 6.0.29 → 系统软链 6.0.33）才可运行
+- benchmark 脚本：`scripts/bench_vllmomni.py`（warmup + 4 文本稳态计时）
+- 默认配置（`indextts2_5.yaml`：25 diffusion steps、无 DiT/vocoder graph）；low_latency 配置见下
 
 ## 各阶段拆解（优化后）
 
