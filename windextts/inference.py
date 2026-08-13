@@ -69,6 +69,7 @@ class WIndexTTS:
         self._featurizer = None
         self._mel_fn = None
         self._tokenizer = None
+        self.w2v_use_autocast = False  # set True when w2v-bert runs in fp16 (LayerNorm fp32 fallback)
 
         self._load_modules()
 
@@ -172,8 +173,15 @@ class WIndexTTS:
         # Additional defensive fix: keep_mask zeroes prompt+padding regions each
         # Euler step to prevent WN conv reflect-pad leakage.
         if self.dtype == torch.float16:
+            # w2v-bert: fp16 weights (cosine 0.99997 vs fp32, saves 1.16GB).
+            # It only runs once (prefill), so no AR error-cascading risk.
+            self.w2v_bert.to(torch.float16)
+            self.w2v_mean = self.w2v_mean.half()
+            self.w2v_std = self.w2v_std.half()
             self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
+            self.codec.to(torch.float16)  # codec.decode output feeds length_regulator
+            self.length_regulator.to(torch.float16)  # InterpolateRegulator
             self.s2mel.cfm.estimator.to(torch.float16)
             self.s2mel.cfm.estimator_fp16_weights = True
             self.s2mel_use_graph = True  # CUDA Graph enabled (dt_buf bug fixed)
@@ -349,7 +357,10 @@ class WIndexTTS:
         """w2v-bert hidden_states[17] normalized → [B, T, 1024]."""
         inp = self.featurizer(audio_16k.to(self.device))
         am = torch.ones(inp.shape[:2], dtype=torch.int32, device=self.device)
-        feat = self.w2v_bert(inp, am, return_layer=17)
+        # match w2v-bert weight dtype (fp16 on the fast path) to avoid mixed-dtype
+        # errors in the first feature_projection LayerNorm.
+        wb_dtype = self.w2v_bert.feature_projection.layer_norm.weight.dtype
+        feat = self.w2v_bert(inp.to(wb_dtype), am, return_layer=17)
         return (feat - self.w2v_mean) / self.w2v_std
 
     @torch.no_grad()

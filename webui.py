@@ -40,6 +40,7 @@ parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the
 parser.add_argument("--fp16", action="store_true", default=True, help="Use fp16 (mixed precision)")
 parser.add_argument("--no_fp16", dest="fp16", action="store_false", help="Disable fp16")
 parser.add_argument("--ref", type=str, default=None, help="Default reference audio path")
+parser.add_argument("--w4a16", action="store_true", default=False, help="Enable W4A16 INT4 weight quantization for GPT (requires torchao)")
 cmd_args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ cmd_args = parser.parse_args()
 # ---------------------------------------------------------------------------
 dtype = torch.float16 if cmd_args.fp16 else torch.float32
 print(f">> Loading WIndexTTS (weights_dir={cmd_args.model_dir}, dtype={dtype})...")
-tts = WIndexTTS(weights_dir=cmd_args.model_dir, device="cuda", dtype=dtype)
+tts = WIndexTTS(weights_dir=cmd_args.model_dir, device="cuda", dtype=dtype, enable_w4a16=cmd_args.w4a16)
 tts.warmup()
 print(">> WIndexTTS ready.")
 
