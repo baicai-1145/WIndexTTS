@@ -252,6 +252,7 @@ class S2MelCFM(nn.Module):
         # correct (only attends real frames) while letting the graph reuse
         # across requests of different lengths within the same bucket.
         x_lens_s = torch.zeros(2, dtype=torch.long, device=device)
+        x_lens_s.fill_(T_true)  # init to true len so capture/warmup mask is correct
 
         if cache is None:
             zero_prompt_x = torch.zeros_like(prompt_x)

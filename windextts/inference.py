@@ -170,11 +170,12 @@ class WIndexTTS:
         first infer() call to model-load time. Call once after __init__ if
         you care about first-request latency.
         """
-        # Enable DiT bf16 via autocast ONLY (do NOT precast weights — precast
-        # conflicts with autocast and falls back to fp32 sgemm). With pure
-        # autocast, GEMMs correctly dispatch to ampere_bf16_s1688gemm +
-        # xmma_bf16 (~2x faster than fp32 sgemm). Numerics stay aligned.
-        self.s2mel.cfm.estimator_autocast_dtype = torch.bfloat16
+        # NOTE: DiT bf16 autocast was tested profiler-free and is NET SLOWER
+        # for single-request inference (207ms vs 175ms fp32). bf16 kernels are
+        # faster but autocast's per-op dispatch overhead exceeds the kernel
+        # saving at batch=1 (the host becomes the bottleneck). Keep S2Mel fp32.
+        # (bf16+graph would recover it, but graph bucketing has numerics issues.)
+        # self.s2mel.cfm.estimator_autocast_dtype = torch.bfloat16
         import torchaudio
         dev = self.device
         # dummy ref audio (1s silence) to populate caches + capture graphs
