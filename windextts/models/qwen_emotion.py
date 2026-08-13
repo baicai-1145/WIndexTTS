@@ -45,10 +45,11 @@ MELANCHOLIC_WORDS = {"低落", "melancholy", "melancholic", "depression", "depre
 EOS_TOKEN_ID = 151643  # <|endoftext|>
 THINK_END_ID = 151668  # </think> (present only when enable_thinking=True)
 
-# Greedy max tokens — emotion JSON is short (~70 tokens). The official uses
-# 32768 (way overkill); 150 is safe for any emotion output and keeps the KV
-# cache + attention small (total_max ≈ prompt+150) for faster graph decode.
-MAX_NEW_TOKENS = 150
+# Greedy max tokens — emotion JSON is highly templated: across 12 diverse
+# inputs (zh/en/ja, varied emotion) generation length is 76-77 tokens (the
+# fixed JSON skeleton + 8 emotion scores). 80 leaves a safe margin and keeps
+# the KV cache + attention footprint small for faster graph decode.
+MAX_NEW_TOKENS = 80
 
 
 def _build_chat_prompt(text_input: str) -> str:
