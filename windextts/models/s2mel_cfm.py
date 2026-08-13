@@ -93,7 +93,15 @@ class S2MelCFM(nn.Module):
         B, T = mu.size(0), mu.size(1)
         device = mu.device
         # DiT transformer caches (RoPE freqs_cis, optional KV) must be sized to T.
-        self.estimator.setup_caches(max_batch_size=2 * B, max_seq_length=T)
+        # For the graph path, size to the BUCKETED T (>= real T) since solve_euler_graph
+        # pads the input up to a bucket; freqs_cis must cover the padded length or the
+        # estimator reads out-of-range (garbage) RoPE values — the root cause of the
+        # prior graph numerics divergence.
+        cache_T = T
+        if use_graph:
+            bucket = getattr(self, "_GRAPH_BUCKET", 64)
+            cache_T = ((T + bucket - 1) // bucket) * bucket
+        self.estimator.setup_caches(max_batch_size=2 * B, max_seq_length=cache_T)
         z = torch.randn([B, self.in_channels, T], device=device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=mu.dtype)
         if use_graph:
