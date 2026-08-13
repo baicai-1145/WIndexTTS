@@ -9,10 +9,28 @@
 | 引擎 | 均值 | 中位 | 最快 | RTF | 说明 |
 |---|---|---|---|---|---|
 | **WIndexTTS** | **0.687s** | **0.640s** | **0.608s** | **5.18x** | 纯 torch，零 JIT |
-| 官方 IndexTTS bf16 | 1.81s | — | 1.75s | — | transformers + HF generate |
-| 官方 IndexTTS fp32 | 2.06s | — | 1.91s | — | 默认精度 |
+| 官方 accel+bf16 | 1.128s | — | 1.090s | — | 官方 CUDA Graph 加速版 |
+| 官方 bf16 | 1.81s | — | 1.75s | — | transformers + HF generate |
+| 官方 fp32 | 2.06s | — | 1.91s | — | 默认精度 |
+| vLLM-Omni | ⚠️ 未能实测 | — | — | — | 环境限制（见下） |
 
-**WIndexTTS 比官方 bf16 快 2.6x，比官方 fp32 快 3.0x。** 基线（优化前）1.38s → 优化后 0.687s（**2.0x**）。
+**WIndexTTS 比官方加速版（accel+bf16）快 1.6x，比官方 fp32 快 3.0x。**
+
+### 关于 vLLM-Omni 的对比（未能实测）
+
+vLLM-Omni 在本机**无法启动**：flashinfer 编译的 `.so` 要求 `GLIBCXX_3.4.32`，
+系统 libstdc++ 版本过低（`GLIBCXX_3.4.32 not found`）。这是系统库兼容性问题，
+非性能问题，调试超出任务范围。
+
+基于其 `indextts2_low_latency.yaml` 配置的技术分析（推断性能区间）：
+- vLLM-Omni low_latency 版用：FlashInfer attention + FULL_DECODE_ONLY CUDA Graph（GPT）、
+  DiT bf16+CUDA Graph、BigVGAN CUDA Graph、12 diffusion steps、vLLM paged KV cache。
+- 这些比我更激进（我用 mem_eff+graph、TeaCache、无 vocoder graph），
+  **vLLM-Omni low_latency 版很可能比我快**，预估在 0.4-0.6s 区间。
+- 但其默认配置（`indextts2_5.yaml`）较保守：25 步、无 DiT/vocoder graph、TRITON_ATTN，
+  性能未必明显优于 WIndexTTS。
+- **关键差异**：vLLM-Omni 依赖 FlashInfer/Triton（需编译，Linux-only），
+  WIndexTTS 纯 torch（Windows 可跑）。这是设计取舍——Windows 零编译 vs Linux 极致内核。
 
 ## 各阶段拆解（优化后）
 

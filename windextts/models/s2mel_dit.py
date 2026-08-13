@@ -614,6 +614,22 @@ class DiT(nn.Module):
         self.teacache_enabled = False
         self._tc_state = None
 
+    def precast_linear_bf16(self) -> int:
+        """Cast only Linear/Conv1d weights to bf16 (vLLM-Omni strategy).
+
+        Keeps LayerNorm/embeddings in fp32 so mixed-dtype ops don't break, while
+        halving GEMM cost and restoring flash-attention eligibility (bf16+nomask).
+        Returns count of params cast.
+        """
+        import torch.nn as _nn
+        n = 0
+        for m in self.modules():
+            if isinstance(m, (_nn.Linear, _nn.Conv1d)):
+                for p in m.parameters(recurse=False):
+                    p.data = p.data.to(torch.bfloat16)
+                    n += p.numel()
+        return n
+
     # ----- forward -----
 
     def forward(self, x: torch.Tensor, prompt_x: torch.Tensor, x_lens: torch.Tensor,

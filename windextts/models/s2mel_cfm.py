@@ -112,6 +112,15 @@ class S2MelCFM(nn.Module):
         est = self.estimator
         if getattr(est, "teacache_enabled", False):
             est._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
+        # bf16 autocast for the estimator forward (vLLM-Omni strategy): Euler
+        # state stays fp32; only the DiT forward runs reduced-precision, halving
+        # GEMM cost and restoring flash-attention eligibility.
+        ac_dtype = getattr(self, "estimator_autocast_dtype", None)
+        def _run_estimator(*a, **kw):
+            if ac_dtype is None:
+                return est(*a, **kw)
+            with torch.autocast(a[0].device.type, dtype=ac_dtype):
+                return est(*a, **kw)
         prompt_len = prompt.size(-1)
         # prompt_x: holds the reference mel in the prompt region; x's prompt region is zeroed.
         prompt_x = torch.zeros_like(x)
@@ -129,14 +138,14 @@ class S2MelCFM(nn.Module):
                 stacked_x = torch.cat([x, x], dim=0)
                 stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
 
-                stacked_dphi_dt = self.estimator(
+                stacked_dphi_dt = _run_estimator(
                     stacked_x, stacked_prompt_x, x_lens, stacked_t, stacked_style, stacked_mu,
-                )
+                ).float()
                 dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
                 # CFG formula (flow_matching.py:103): (1+cfg)*cond - cfg*uncond
                 dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
+                dphi_dt = _run_estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu).float()
 
             x = x + dt * dphi_dt
             t = t + dt
