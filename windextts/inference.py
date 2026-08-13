@@ -194,7 +194,7 @@ class WIndexTTS:
         with torch.no_grad():
             use_cg = dev != "cpu"
             codes = self.gpt.generate(
-                conds, tt, lang, max_new_tokens=10, do_sample=False,
+                conds, tt, lang, max_new_tokens=220, do_sample=False,
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
             )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)

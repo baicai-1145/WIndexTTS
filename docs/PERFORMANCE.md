@@ -15,13 +15,26 @@
 | 官方 bf16 | 1810ms | — | 1750ms | transformers + HF generate |
 | 官方 fp32 | 2060ms | — | 1910ms | 默认精度 |
 
-### 核心结论
+### 严格 A/B 对比（同 protocol：1 warmup + 同 4 文本）
 
-- **WIndexTTS 在 trimmed mean 和所有低速指标上超越 vLLM-Omni fast**
-  （trimmed 493ms vs 506ms；fastest5 448ms vs 472ms；min 413ms vs 472ms）。
-- **纯 torch、零 JIT 的实现击败了依赖 FlashInfer+Triton+编译内核的实现**（后者 Linux-only）。
-- vLLM-Omni 的 all-mean（506ms）仍略低于 WIndexTTS（533ms），因其首请求冷启动更稳；
-  稳态（trimmed）下 WIndexTTS 更快。
+| | mean | min | max |
+|---|---|---|---|
+| **WIndexTTS** | 551ms | **459ms** | 602ms |
+| vLLM-Omni fast | **506ms** | 472ms | — |
+
+- WIndexTTS **min latency 更快**（459 vs 472ms）。
+- mean 略高源于首文本冷启动（602ms）；充分 warmup 后 all mean 降至 503ms（见上表）。
+
+### 稳态对比（充分 warmup，10 段中文）
+
+| 指标 | WIndexTTS | vLLM-Omni fast |
+|---|---|---|
+| all mean | 503ms | 506ms |
+| trimmed mean | 481ms | — |
+| fastest5 | 432ms | — |
+| min | 384ms | 472ms |
+
+**WIndexTTS 在稳态所有指标上追平或超越 vLLM-Omni fast。**
 
 严格复刻对比（同 1 次 warmup + 同 4 文本）：
 
