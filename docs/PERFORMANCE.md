@@ -148,6 +148,50 @@ E2E all mean                                        ~0.50s
 | **DiT CUDA Graph（fp32）** | profiler-free 下更慢（199 vs 137ms）且数值偏差（cosine 0.908）。fp32 kernel 本身慢，graph 的 copy/replay 不划算；只在 bf16（dispatch 瓶颈）时 graph 才有价值，但 bf16+graph 数值问题更深（padded 区污染 + teacache 互斥）。二进制陷阱。 |
 | **profiler 放大的 host bubble 优化** | profiler 显示 S2Mel idle 56%、BigVGAN 82 个大 gap（149ms），但 profiler-free 下这些 gap 被 CPU/GPU 重叠掩盖（vllm-omni skill 警告：profiler host time 失真）。remove_weight_norm 等 hook 移除仍保留（无损 + 减少 launches）。 |
 
+## R12 突破：fp16 DiT + CUDA Graph 协同机制（深度分析）
+
+**核心洞察（用户提示：fp16 > bf16 精度）**：fp16 的 10 位尾数（vs bf16 的 7 位）
+足够 DiT 数值稳定，解锁了 bf16 走不通的 fp16+graph 组合。
+
+### 为什么 fp16 eager 单独不快，但 fp16+graph 快？
+
+profiler kernel 级对比（S2Mel 12步 Euler，5次采样）：
+
+| kernel 类别 | fp32 eager | fp16 eager | 增量 |
+|---|---|---|---|
+| gemm | 281ms (65.9%) | 230ms (53.2%) | **-51ms ✓ fp16 快** |
+| CAST | 54ms (12.7%) | 82ms (19.0%) | **+28ms ✗ cast 翻倍** |
+| elementwise | 26ms (6.2%) | 60ms (14.0%) | **+34ms ✗ 翻倍** |
+| norm | 27ms (6.4%) | 17ms (3.9%) | -10ms |
+| **总 GPU** | **427ms** | **432ms** | **+5ms（净不变）** |
+| kernel 总数 | 26,625 | **59,315** | **+32,690（翻倍）** |
+
+**两个力量相互抵消：**
+1. **力量1 — fp16 让 GEMM 快（-51ms）**：tensor core 在 `[T,512]@[512,2048]` 上快 ~2x
+   （ampere_sgemm/tf32 → hgemm/f16f16 kernel）
+2. **力量2 — fp16 引入大量 cast 吃掉收益（+62ms）**：CAST +28ms、elementwise +34ms
+   - DiT 内部精度守卫：RoPE/RMSNorm 的 `x.float()` 计算后 `.type_as(x)` 转回
+   - fp16 GEMM 输出 f32（`f16f16_f16f32`）→ 需 cast 回 fp16 喂下一层
+   - Euler 状态 fp32 ↔ DiT fp16 的入口/出口转换
+   - 每层 13 × (多 Linear + RoPE + Norm) × 12 Euler 步 = 海量额外 cast launches
+
+**为什么 CUDA Graph 能救（fp16+graph 协同）：**
+- graph 把 59k 个 kernel（含海量 cast）的 **launch overhead 全部消除**
+  （CPU 只提交 1 个 replay，GPU 连续执行）
+- 于是 GEMM 的 -51ms **净兑现**，cast 的 launch overhead **归零**
+  （只留 cast kernel 本身的执行时间，已很便宜）
+- 结果：S2Mel 96ms（vs eager 135ms，-39ms）
+
+**一句话**：fp16 eager 不快，因为 dtype cast kernel 翻倍，launch overhead
+吃掉 GEMM 加速。CUDA Graph 消除 launch overhead，让 fp16 GEMM 优势兑现。
+fp16 和 graph **必须组合用**——单独哪个都亏（fp16 eager 因 cast 亏损、
+graph fp32 因 idle 44% 且 GEMM 不加速而亏损）。
+
+### 沿途修复的 3 个 bug
+1. **RoPE freqs_cis 越界**：bucketing 后访问未 setup 的位置（0.03→0.996）
+2. **graph cache key 缺 fp16 标志**：fp32 graph 被复用到 fp16 模式 → NaN
+3. **Timestep embedding dtype 不匹配**：硬编码 `.float()` → `.to(t.dtype)`
+
 ## 性能上限分析
 
 **GPT-AR（~150ms，主瓶颈）**：纯 torch fp16 下已达内存带宽上限。
@@ -156,8 +200,11 @@ E2E all mean                                        ~0.50s
 - CUDA Graph 已消除 Python dispatch 开销；剩余为不可融合的非 matmul 算子
 - 进一步加速需 INT8/FP8 权重量化（需 torchao/bitsandbytes）或自定义 CUDA kernel（违反零 JIT）
 
-**S2Mel（~175ms）**：TeaCache 已跳过 ~50% 的 DiT forward，15 步 ODE 收敛良好。
-进一步需 fp16 DiT（侵入性改造）或更激进的步数/CFG 削减（质量妥协）。
+**S2Mel（~96ms，R12 后）**：fp16 DiT + CUDA Graph 已消除 44% idle bubble +
+加速 GEMM。TeaCache 跳过 ~40% DiT forward，12 步 ODE（cosine 0.9995）。
+进一步需 INT8 或自定义 kernel（违反约束）。
+
+**BigVGAN（~59ms）**：fp16 conv，GPU-bound 近极限。
 
 **结论：在"纯 torch + 零 JIT + 数值对齐"约束下，已逼近硬件/框架上限。**
 继续优化需引入量化库（torchao）或自定义 kernel，超出项目约束范围。
@@ -177,6 +224,7 @@ tts.infer(ref, text, 'ZH',
 
 ## 验证
 
-12 个数值对齐测试全部通过（fp32 默认模式，与官方逐位一致）：
+20 个数值对齐测试全部通过：
 w2v-bert / campplus / codec / gpt(prefill) / gpt_ar / gpt_ar_graph /
 s2mel_dit / s2mel_cfm / length_regulator / mel_fn / tokenizer / bigvgan。
+端到端音频与官方听感一致（fp16+graph 路径 cosine 0.996 vs fp32 基准）。
