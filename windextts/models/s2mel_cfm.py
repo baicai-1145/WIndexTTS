@@ -142,23 +142,43 @@ class S2MelCFM(nn.Module):
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
 
+        # ---- hoist all loop-invariant tensors out of the step loop ----
+        # The CFG stacked buffers (prompt_x/style/mu with a zeroed uncond half)
+        # never change shape or (mostly) content across steps; allocating them
+        # once outside the loop removes per-step Python dispatch + kernel
+        # launches that show up as host bubbles (profiler: 50.9% idle here).
+        # Only stacked_x changes per step (new x), so we update just its halves
+        # in-place instead of torch.cat each iteration.
+        if inference_cfg_rate > 0:
+            zero_prompt_x = torch.zeros_like(prompt_x)
+            zero_style = torch.zeros_like(style)
+            zero_mu = torch.zeros_like(mu)
+            stacked_prompt_x = torch.cat([prompt_x, zero_prompt_x], dim=0)
+            stacked_style = torch.cat([style, zero_style], dim=0)
+            stacked_mu = torch.cat([mu, zero_mu], dim=0)
+            x_lens_s = torch.cat([x_lens, x_lens], dim=0) if x_lens is not None else None
+            # stacked_x lives across steps; refresh its two halves per step.
+            stacked_x = torch.empty(2 * x.size(0), x.size(1), x.size(2),
+                                    dtype=x.dtype, device=x.device)
+            # precompute the two repeated t entries per step is cheap; keep as-is.
+            cfg = float(inference_cfg_rate)
+            one_plus_cfg = 1.0 + cfg
+
         t = t_span[0]
         for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
-                # Batched CFG: stack [cond, uncond(null)] for a single estimator forward.
-                stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
-                stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
-                stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-                stacked_x = torch.cat([x, x], dim=0)
+                # refresh only the per-step-changing half of stacked_x (in-place)
+                stacked_x[:x.size(0)].copy_(x)
+                stacked_x[x.size(0):].copy_(x)
                 stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
 
                 stacked_dphi_dt = _run_estimator(
-                    stacked_x, stacked_prompt_x, x_lens, stacked_t, stacked_style, stacked_mu,
+                    stacked_x, stacked_prompt_x, x_lens_s, stacked_t, stacked_style, stacked_mu,
                 ).float()
                 dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
                 # CFG formula (flow_matching.py:103): (1+cfg)*cond - cfg*uncond
-                dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
+                dphi_dt = one_plus_cfg * dphi_dt - cfg * cfg_dphi_dt
             else:
                 dphi_dt = _run_estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu).float()
 
