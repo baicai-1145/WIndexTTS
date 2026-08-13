@@ -171,6 +171,33 @@ class WIndexTTS:
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
         self._ref_cache: dict = {}
+        # lazy-loaded text-processing modules (only built on first use)
+        self._normalizer = None
+        self._qwen_emo = None
+
+    def _ensure_normalizer(self):
+        """Lazily build the TextNormalizer (heavy: loads NeMo TN grammars)."""
+        if self._normalizer is None:
+            from windextts.frontend.normalizer import TextNormalizer
+            self._normalizer = TextNormalizer()
+        return self._normalizer
+
+    def _ensure_qwen_emo(self):
+        """Lazily load the QwenEmotion text→emotion predictor (~1.2GB, fp16)."""
+        if self._qwen_emo is None:
+            import os
+            # qwen0.6bemo4-merge lives directly under the model dir (config.yaml:
+            # qwen_emo_path). Hardcoded name since it's fixed for IndexTTS-2.5.
+            emo_dir = os.path.join(str(self.weights.dir), "qwen0.6bemo4-merge")
+            if not os.path.isdir(emo_dir):
+                raise FileNotFoundError(
+                    f"QwenEmotion model not found at {emo_dir}. emo_text requires "
+                    "the qwen0.6bemo4-merge directory in the model path."
+                )
+            from windextts.models.qwen_emotion import QwenEmotion
+            self._qwen_emo = QwenEmotion(emo_dir, device=self.device, dtype=torch.float16)
+            print(">> QwenEmotion loaded (pure-torch Qwen3, text→emotion)")
+        return self._qwen_emo
 
     def warmup(self) -> None:
         """Pre-capture CUDA Graphs + prime cuDNN autotune with dummy data.
@@ -302,6 +329,7 @@ class WIndexTTS:
         text: str,
         lang: str = "ZH",
         emo_vector: list[float] | None = None,
+        emo_text: str | None = None,
         duration_factor: float = 1.0,
         do_sample: bool = True,
         top_p: float = 0.8,
@@ -311,18 +339,90 @@ class WIndexTTS:
         cfm_steps: int = 12,
         cfg_rate: float = 0.7,
         teacache_thresh: float = 0.25,
+        text_normalization: bool = True,
+        max_text_tokens_per_segment: int = 120,
+        interval_silence_ms: int = 200,
     ) -> tuple[int, torch.Tensor]:
         """Zero-shot voice cloning.
 
         Args:
             spk_audio_prompt: path to reference audio (any sr).
-            text: text to synthesize (already normalized; complex G2P is TODO).
+            text: text to synthesize (raw user text; normalized if
+                text_normalization=True).
             lang: ZH / EN / JA / ...
-            emo_vector: 8-dim emotion weights, or None for calm.
+            emo_vector: 8-dim emotion weights [happy,angry,sad,afraid,
+                disgusted,melancholic,surprised,calm], or None for calm.
+            emo_text: free-text emotion description (e.g. "很开心的语气").
+                If given, overrides emo_vector via QwenEmotion prediction.
             duration_factor: scales target length (1.72 * factor).
+            text_normalization: run G2P text normalization (digits→words,
+                punctuation, etc.) before tokenization.
+            max_text_tokens_per_segment: split long text into segments of at
+                most this many tokens; segments are synthesized separately and
+                concatenated with interval_silence_ms of silence between them.
+            interval_silence_ms: silence inserted between segments (ms).
         Returns:
             (sample_rate, audio [samples,]) at 22050 Hz mono.
         """
+        dev = self.device
+
+        # --- text normalization (G2P: digits→words, punctuation, names) ---
+        if text_normalization:
+            norm = self._ensure_normalizer()
+            text = norm.normalize(text)
+
+        # --- emo_text → emo_vector (via pure-torch QwenEmotion) ---
+        if emo_text is not None:
+            qe = self._ensure_qwen_emo()
+            emo_vector = qe.inference(emo_text)
+
+        # --- long-text segmentation (split by punctuation + token budget) ---
+        from windextts.frontend.segmenter import split_text_by_tokens
+        lang_prefix = f"<|{lang.lower()}|> "
+        enc = lambda s: self.tokenizer.encode(s, allowed_special="all")
+        segments = split_text_by_tokens(text, enc, max_tokens=max_text_tokens_per_segment, lang_prefix=lang_prefix)
+
+        if len(segments) == 1:
+            return self._infer_single(
+                spk_audio_prompt, segments[0], lang, emo_vector,
+                duration_factor, do_sample, top_p, top_k, temperature,
+                max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+            )
+
+        # multi-segment: synthesize each, join with silence
+        wavs = []
+        for seg in segments:
+            sr, wav = self._infer_single(
+                spk_audio_prompt, seg, lang, emo_vector,
+                duration_factor, do_sample, top_p, top_k, temperature,
+                max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+            )
+            wavs.append(wav)
+        silence = torch.zeros(int(OUTPUT_SR * interval_silence_ms / 1000))
+        parts = []
+        for i, w in enumerate(wavs):
+            parts.append(w)
+            if i < len(wavs) - 1:
+                parts.append(silence)
+        return OUTPUT_SR, torch.cat(parts)
+
+    def _infer_single(
+        self,
+        spk_audio_prompt: str,
+        text: str,
+        lang: str,
+        emo_vector: list[float] | None,
+        duration_factor: float,
+        do_sample: bool,
+        top_p: float,
+        top_k: int,
+        temperature: float,
+        max_mel_tokens: int,
+        cfm_steps: int,
+        cfg_rate: float,
+        teacache_thresh: float,
+    ) -> tuple[int, torch.Tensor]:
+        """Synthesize a single (already normalized, short) text segment."""
         dev = self.device
         # --- ref audio features (cached by path+mtime; stage 5 overlap/cache) ---
         import os

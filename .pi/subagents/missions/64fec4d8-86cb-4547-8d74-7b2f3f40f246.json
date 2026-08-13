@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "64fec4d8-86cb-4547-8d74-7b2f3f40f246",
+  "title": "目标: 为 WIndexTTS 实现文本归一化模块 windextts/frontend/normalizer.py, 移植官方 /root/index-tts/indextts/utils/f...",
+  "objective": "目标: 为 WIndexTTS 实现文本归一化模块 windextts/frontend/normalizer.py, 移植官方 /root/index-tts/indextts/utils/front.py 的 TextNormalizer。\n\n## 背景\nWIndexTTS 是 IndexTTS-2.5 的纯 torch 重写。当前 infer() 的 text 参数要求'已归一化', 但 webui 用户输入是任意中文(含数字/标点/英文), 必须先归一化。\n\n## 参考 (只读, 不要修改)\n- 官方 TextNormalizer: /root/index-tts/indextts/utils/front.py (756行)\n- 官方 common.py 的 tokenize_by_CJK_char / de_tokenized_by_CJK_char: /root/index-tts/indextts/utils/common.py\n- 参考 env: /root/index-tts/.venv (Python 3.11, 已装 jieba/cn2an/tn)\n\n## 关键约束\n- 不引入 transformers/modelscope (违反铁律)\n- 用 tn (NeMo text processing) 做底层 TN, 不用 wetext 包装层 (当前环境 tn 已装, wetext 未装)。官方 Linux 用 tn, Mac/Win 用 wetext; 我们统一用 tn 底层 API:\n    from tn.chinese.normalizer import Normalizer as NormalizerZh\n    from tn.english.normalizer import Normalizer as NormalizerEn\n    zh = NormalizerZh(cache_dir=<tmp>, remove_interjections=False, remove_erhua=False, overwrite_cache=False)\n    en = NormalizerEn(overwrite_cache=False)\n- cache_dir 用 tempfile.gettempdir()/windextts_tn_cache, 自动创建\n\n## 要移植的核心方法 (front.py 里的 TextNormalizer 类)\n- normalize(text): 主入口, 按语言分发 (use_chinese 判断), 保护人名/技术词/拼音声调/发音标注, 调 TN, 恢复\n- use_chinese(s): 判断是中文还是英文 (用于选择 zh/en normalizer)\n- save_names / restore_names: 保护人名不被 TN 破坏 (jieba 分词识别)\n- save_tech_terms / restore_tech_terms: 保护技术术语 (如 GPT-5-nano)\n- save_pinyin_tones / restore_pinyin_tones / correct_pinyin: 保护拼音声调 (如 xing2)\n- apply_glossary_terms: 术语词典应用 (enable_glossary 可选, 先实现基础版)\n- _protect_pronunciation_annotations / _restore_pronunciation_annotations: 保护 <字|读音> 标注\n- load(): 延迟加载 zh/en normalizer\n\n## 注意\n- 不需要移植 SentencePiece 相关 (那是旧版用的, v2.5 用 tiktoken)\n- 人名/技术词的正则和映射表 (name_pattern, tech_term_pattern, char_rep_map, zh_char_rep_map) 要从 front.py 完整复制过来\n- normalizer 的全部常量和正则都在 __init__ 里定义, 要完整复制\n\n## 验证 (必须跑)\n写一个 if __name__=='__main__' 块, 测试以下输入:\n```python\nnorm = TextNormalizer()\ntests = ['我有123本书', '3.14%的利润', '2024年1月1日', '你好world', 'GPT-5的参数', 'IT行业薪资', '我叫张三']\nfor t in tests: print(f'{t!r} -> {norm.normalize(t)!r}')\n```\n期望: 数字转中文(一百二十三)、百分号转(百分之)、日期转(二零二四年一月一日)、技术词保留(GPT-5)、人名保留。\n\n## 返回\n报告: 创建的文件路径、移植了哪些方法、哪些省略、测试结果(输入→输出对照)、与官方的差异(如有)、风险。\n用 /root/index-tts/.venv/bin/python 运行测试。",
+  "status": "completed",
+  "createdAt": "2026-08-13T09:53:41.484Z",
+  "updatedAt": "2026-08-13T09:57:19.187Z",
+  "runs": [
+    {
+      "runId": "4e136d78-bfea-4da4-99c2-229fa034414a",
+      "mode": "workflow",
+      "asyncDir": "/tmp/pi-subagents-uid-0/async-subagent-runs/4e136d78-bfea-4da4-99c2-229fa034414a",
+      "status": "complete",
+      "startedAt": "2026-08-13T09:53:41.487Z",
+      "completedAt": "2026-08-13T09:57:19.187Z"
+    }
+  ],
+  "workflowChildren": [
+    {
+      "workflowRunId": "4e136d78-bfea-4da4-99c2-229fa034414a",
+      "key": "normalizer",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:53:41.595Z",
+      "updatedAt": "2026-08-13T09:56:43.708Z",
+      "artifactPaths": [
+        "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-666Z_019ffa8a-b322-74f4-8eb5-fe8fedb259b3.jsonl"
+      ],
+      "runId": "d0dfc218",
+      "agent": "worker",
+      "task": "目标: 为 WIndexTTS 实现文本归一化模块 windextts/frontend/normalizer.py, 移植官方 /root/index-tts/indextts/utils/front.py 的 TextNormalizer。\n\n## 背景\nWIndexTTS 是 IndexTTS-2.5 的纯 torch 重写。当前 infer() 的 text 参数要求'已归一化', 但 webui 用户输入是任意中文(含数字/标点/英文), 必须先归一化。\n\n## 参考 (只读, 不要修改)\n- 官方 TextNormalizer: /root/index-tts/indextts/utils/front.py (756行)\n- 官方 common.py 的 tokenize_by_CJK_char / de_tokenized_by_CJK_char: /root/index-tts/indextts/utils/common.py\n- 参考 env: /root/index-tts/.venv (Python 3.11, 已装 jieba/cn2an/tn)\n\n## 关键约束\n- 不引入 transformers/modelscope (违反铁律)\n- 用 tn (NeMo text processing) 做底层 TN, 不用 wetext 包装层 (当前环境 tn 已装, wetext 未装)。官方 Linux 用 tn, Mac/Win 用 wetext; 我们统一用 tn 底层 API:\n    from tn.chinese.normalizer import Normalizer as NormalizerZh\n    from tn.english.normalizer import Normalizer as NormalizerEn\n    zh = NormalizerZh(cache_dir=<tmp>, remove_interjections=False, remove_erhua=False, overwrite_cache=False)\n    en = NormalizerEn(overwrite_cache=False)\n- cache_dir 用 tempfile.gettempdir()/windextts_tn_cache, 自动创建\n\n## 要移植的核心方法 (front.py 里的 TextNormalizer 类)\n- normalize(text): 主入口, 按语言分发 (use_chinese 判断), 保护人名/技术词/拼音声调/发音标注, 调 TN, 恢复\n- use_chinese(s): 判断是中文还是英文 (用于选择 zh/en normalizer)\n- save_names / restore_names: 保护人名不被 TN 破坏 (jieba 分词识别)\n- save_tech_terms / restore_tech_terms: 保护技术术语 (如 GPT-5-nano)\n- save_pinyin_tones / restore_pinyin_tones / correct_pinyin: 保护拼音声调 (如 xing2)\n- apply_glossary_terms: 术语词典应用 (enable_glossary 可选, 先实现基础版)\n- _protect_pronunciation_annotations / _restore_pronunciation_annotations: 保护 <字|读音> 标注\n- load(): 延迟加载 zh/en normalizer\n\n## 注意\n- 不需要移植 SentencePiece 相关 (那是旧版用的, v2.5 用 tiktoken)\n- 人名/技术词的正则和映射表 (name_pattern, tech_term_pattern, char_rep_map, zh_char_rep_map) 要从 front.py 完整复制过来\n- normalizer 的全部常量和正则都在 __init__ 里定义, 要完整复制\n\n## 验证 (必须跑)\n写一个 if __name__=='__main__' 块, 测试以下输入:\n```python\nnorm = TextNormalizer()\ntests = ['我有123本书', '3.14%的利润', '2024年1月1日', '你好world', 'GPT-5的参数', 'IT行业薪资', '我叫张三']\nfor t in tests: print(f'{t!r} -> {norm.normalize(t)!r}')\n```\n期望: 数字转中文(一百二十三)、百分号转(百分之)、日期转(二零二四年一月一日)、技术词保留(GPT-5)、人名保留。\n\n## 返回\n报告: 创建的文件路径、移植了哪些方法、哪些省略、测试结果(输入→输出对照)、与官方的差异(如有)、风险。\n用 /root/index-tts/.venv/bin/python 运行测试。",
+      "completedAt": "2026-08-13T09:56:43.708Z",
+      "sessionPath": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-666Z_019ffa8a-b322-74f4-8eb5-fe8fedb259b3.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:56:43.708Z",
+        "status": "completed"
+      }
+    },
+    {
+      "workflowRunId": "4e136d78-bfea-4da4-99c2-229fa034414a",
+      "key": "segmenter",
+      "status": "completed",
+      "startedAt": "2026-08-13T09:53:41.834Z",
+      "updatedAt": "2026-08-13T09:57:18.730Z",
+      "artifactPaths": [
+        "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-890Z_019ffa8a-b401-7fd9-a20f-7c74184a1a6a.jsonl"
+      ],
+      "runId": "7d12bfef",
+      "agent": "worker",
+      "task": "目标: 为 WIndexTTS 实现长文本分段模块 windextts/frontend/segmenter.py。\n\n## 背景\nWIndexTTS 的 GPT-AR 有 max_text_tokens 上限(默认600)。用户输入长文本(如一篇文章)必须按标点+token预算切成多段, 分别合成后拼接(段间加静音)。\n\n## 参考 (只读)\n- 官方分段逻辑: /root/index-tts/indextts/infer_v2_5.py 的 split_text_by_tokens 方法 (约413-464行) 和 _split_atomic_pieces\n- 官方 split_text_by_punctuation (约467-490行): 低显存模式的按字符数切分\n- WIndexTTS 的 tokenizer: /root/WIndexTTS/windextts/frontend/tokenizer.py (有 encode 方法)\n\n## 要实现\n1. split_text_by_tokens(text, tokenizer, max_tokens, lang_prefix='') -> list[str]\n   - 完全对齐官方 split_text_by_tokens 逻辑\n   - 按标点 [，。！？、；：,.!?;:\\n] 切分\n   - SPLIT_PROTECTED_PATTERN 保护某些片段(从官方复制这个正则)\n   - 用 tokenizer.encode(text) 计算每段 token 数, 确保不超 budget\n   - 超长段递归按字符切, 再按 budget 合并\n\n2. split_text_by_punctuation(text, max_chars=40) -> list[str]\n   - 官方低显存模式用的, 按标点切, 每段最多 max_chars 字符\n\n## 关键: SPLIT_PROTECTED_PATTERN\n从官方 infer_v2_5.py 复制这个正则常量(它保护 <字|读音> 这类标注不被切段)。搜索 SPLIT_PROTECTED_PATTERN 找到它。\n\n## 验证 (必须跑)\n```python\nimport sys; sys.path.insert(0,'/root/WIndexTTS')\nfrom windextts.frontend.tokenizer import WhisperTokenizer\ntok = WhisperTokenizer('/root/IndexTTS-2.5/multilingual_zh_ja_yue_char_del.tiktoken')\nfrom windextts.frontend.segmenter import split_text_by_tokens\nlong = '这是第一句话。这是第二句话，它比较长用来测试分段。第三句！最后一句。'\nfor seg in split_text_by_tokens(long, tok, max_tokens=20): print(repr(seg))\n```\n用 /root/index-tts/.venv/bin/python 运行。\n\n## 返回\n报告: 文件路径、实现的方法、SPLIT_PROTECTED_PATTERN 来源、测试结果、风险。",
+      "completedAt": "2026-08-13T09:57:18.730Z",
+      "sessionPath": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-890Z_019ffa8a-b401-7fd9-a20f-7c74184a1a6a.jsonl",
+      "heartbeat": {
+        "updatedAt": "2026-08-13T09:57:18.730Z",
+        "status": "completed"
+      }
+    }
+  ],
+  "decisions": [],
+  "artifacts": [
+    {
+      "kind": "status",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/4e136d78-bfea-4da4-99c2-229fa034414a/status.json"
+    },
+    {
+      "kind": "other",
+      "path": "/tmp/pi-subagents-uid-0/async-subagent-runs/4e136d78-bfea-4da4-99c2-229fa034414a/events.jsonl",
+      "description": "Lifecycle events"
+    },
+    {
+      "kind": "output",
+      "path": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-666Z_019ffa8a-b322-74f4-8eb5-fe8fedb259b3.jsonl"
+    },
+    {
+      "kind": "output",
+      "path": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-13T09-53-41-890Z_019ffa8a-b401-7fd9-a20f-7c74184a1a6a.jsonl"
+    }
+  ],
+  "receipts": [],
+  "cwd": "/root/WIndexTTS",
+  "ownerSessionId": "/root/.pi/agent/sessions/--root-WIndexTTS--/2026-08-12T16-07-13-393Z_019ff6ba-50f0-7ab4-b3dd-4b011ab6a5ff.jsonl",
+  "summary": "Workflow completed with 2 child run(s). Return: [\n  {\n    \"key\": \"normalizer\",\n    \"ok\": true,\n    \"agent\": \"worker\",\n    \"runId\": \"d0dfc218\",\n    \"output\": \"The grep exit 1 confirms the module has **zero third-party imports at module level** (only stdlib: `re`, `os`, `tempfile`, `traceback`, `functools`; `tn` is lazily imported inside `load()`). Everything is verified.\\n\\n## Acceptance Report\\n\\n**完成：`windextts/frontend/normalizer.py`** — 官方 `TextNormalizer` 的完整移植，41 个官方用例逐字一致。\\n\\n### 移植的方法（与官方 front.py 1:1 对应）\\n- `normalize()` — 主入口，按 `use_chinese` 分发 zh/en 路径，含发音标注保护 → TN → 人名/拼音/技术词恢复 → 标点映射\\n- `use_chinese()` / `match_email()` — 语言判断\\n- `load()` — 延迟加载 zh/en TN（用 `tn` 底层 API，非 wetext 包装层；cache 在 `/tmp/windextts_tn_cache`）\\n- `save_names/restore_names`、`save_tech_terms/restore_tech_terms`、`save_pinyin_tones/restore_pinyin_tones`、`correct_pinyin` — 保护机制\\n- `apply_glossary_terms` / `load_glossary` / `load_glossary_from_yaml` / `save_glossary_to_yaml` — 术语词典\\n- `_protect_pronunciation_annotations` / `_restore_pronunciation_annotati Trace: 4 event(s)."
+}
