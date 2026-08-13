@@ -366,6 +366,10 @@ class UnifiedVoice(nn.Module):
         # emo path (user-supplied emo_vec, no conformer encoder needed)
         self.emo_layer = nn.Linear(model_dim, model_dim)
         self.emovec_layer = nn.Linear(1024, model_dim)
+        # emo_conditioning modules: lazily added by build_emo_conditioning()
+        # when the emo_ref_audio path is enabled (loads 149 keys from gpt.pth).
+        self.emo_conditioning_encoder = None
+        self.emo_perceiver_encoder = None
         self.lang_embedding = nn.Embedding(107, model_dim)  # len(LANGUAGE_DICT)+1
 
         self.text_embedding = nn.Embedding(self.number_text_tokens * types + 1, model_dim)
@@ -395,13 +399,15 @@ class UnifiedVoice(nn.Module):
     # weight loading
     # ------------------------------------------------------------------
 
-    def load_official(self, sd: dict[str, torch.Tensor]) -> None:
-        """Load gpt.pth state_dict (456 keys). Drops unimplemented submodules
-        (emo_conditioning_encoder / emo_perceiver_encoder) and reports count."""
+    def load_official(self, sd: dict[str, torch.Tensor], load_emo_conditioning: bool = False) -> None:
+        """Load gpt.pth state_dict. By default drops the 149 emo_conditioning
+        keys (heavy, only needed for emo_ref_audio path). Pass load_emo_conditioning=True
+        after build_emo_conditioning() to load them."""
         remapped: dict[str, torch.Tensor] = {}
         dropped: list[str] = []
         for k, v in sd.items():
-            if k.startswith("emo_conditioning_encoder.") or k.startswith("emo_perceiver_encoder."):
+            is_emo = k.startswith("emo_conditioning_encoder.") or k.startswith("emo_perceiver_encoder.")
+            if is_emo and not load_emo_conditioning:
                 dropped.append(k)
                 continue
             # gpt.pth uses 'gpt.h.{i}.*' and our submodule is also named 'gpt' —
@@ -412,7 +418,42 @@ class UnifiedVoice(nn.Module):
             raise RuntimeError(f"missing keys loading GPT: {missing}")
         if unexpected:
             raise RuntimeError(f"unexpected keys loading GPT: {unexpected}")
-        print(f"[GPT] loaded {len(remapped)} keys, dropped {len(dropped)} emo-conditioner keys")
+        note = f" (loaded {149-len(dropped)} emo-cond keys)" if load_emo_conditioning else ""
+        print(f"[GPT] loaded {len(remapped)} keys, dropped {len(dropped)} emo-conditioner keys{note}")
+
+    def build_emo_conditioning(self) -> None:
+        """Lazily create the emo_conditioning modules (160M params) for the
+        emo_ref_audio path. Call before load_official(load_emo_conditioning=True)."""
+        from windextts.models.emo_conditioning import EmoConformerEncoder, EmoPerceiverEncoder
+        self.emo_conditioning_encoder = EmoConformerEncoder()
+        self.emo_perceiver_encoder = EmoPerceiverEncoder()
+
+    @torch.no_grad()
+    def get_emovec(self, cond_emb: torch.Tensor) -> torch.Tensor:
+        """cond_emb [B,T,1024] (w2v-bert[17] normalized) → emo_vec [B,1280].
+
+        Runs conformer → perceiver → emovec_layer → emo_layer.
+        Requires build_emo_conditioning() to have been called."""
+        from windextts.models.emo_conditioning import get_emovec as _get_emovec
+        if self.emo_conditioning_encoder is None:
+            raise RuntimeError("emo_conditioning not built; call build_emo_conditioning() first")
+        dev = cond_emb.device
+        lens = torch.tensor([cond_emb.shape[1]], device=dev)
+        return _get_emovec(
+            self.emo_conditioning_encoder, self.emo_perceiver_encoder,
+            self.emovec_layer, self.emo_layer,
+            cond_emb, lens,
+        )
+
+    @torch.no_grad()
+    def merge_emovec(self, spk_cond_emb: torch.Tensor, emo_cond_emb: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        """Blend spk + emo reference emovecs: base + alpha*(ref - base).
+
+        Replicates GPT.merge_emovec in model_v2.py:833. Both inputs are
+        [B,T,1024] w2v-bert[17] features. Returns [B,1280]."""
+        emo_vec = self.get_emovec(emo_cond_emb)
+        base_vec = self.get_emovec(spk_cond_emb)
+        return base_vec + alpha * (emo_vec - base_vec)
 
     # ------------------------------------------------------------------
     # conditioning assembly

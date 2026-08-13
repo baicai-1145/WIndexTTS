@@ -112,7 +112,13 @@ class WIndexTTS:
 
         # GPT-AR (UnifiedVoice)
         self.gpt = UnifiedVoice().to(dev)
-        self.gpt.load_official(w.load_gpt())
+        # Build + load emo_conditioning (160M) for the emo_ref_audio path.
+        # This adds ~1.2GB to the GPT footprint but enables reference-audio
+        # emotion extraction (official emo_audio_prompt feature).
+        self.gpt.build_emo_conditioning()
+        self.gpt.emo_conditioning_encoder = self.gpt.emo_conditioning_encoder.to(dev)
+        self.gpt.emo_perceiver_encoder = self.gpt.emo_perceiver_encoder.to(dev)
+        self.gpt.load_official(w.load_gpt(), load_emo_conditioning=True)
         self.gpt.eval()
 
         # emo matrices
@@ -318,6 +324,66 @@ class WIndexTTS:
         # final emo_layer projection; cast to GPT dtype (fp16 mixed-precision path)
         return self.gpt.emo_layer(emovec_mat.to(self.gpt.emo_layer.weight.dtype))
 
+    @torch.no_grad()
+    def build_emo_vec_full(
+        self,
+        style: torch.Tensor,
+        spk_cond: torch.Tensor,
+        emo_vector: list[float] | None,
+        emo_ref_path: str | None,
+        emo_alpha: float,
+    ) -> torch.Tensor:
+        """Unified emo_vec [1,1280] assembly covering all three control modes.
+
+        Mirrors infer_v2_5.py:672-778 priority: emo_ref_path (conformer) >
+        emo_vector (matrix) > calm default.
+
+        - emo_ref_path given: emovec_audio = merge_emovec(spk, emo_ref, alpha)
+          via the 160M conformer. If emo_vector also given, add the matrix
+          correction: emovec_mat + (1-sum(w))*emovec_audio (official line 764).
+          Otherwise emovec_audio alone is the final emo_vec.
+        - emo_ref_path None: pure matrix path (build_emo_vec).
+        """
+        if emo_ref_path is None:
+            return self.build_emo_vec(style, emo_vector)
+
+        # --- conformer path: extract emo_cond_emb from the reference audio ---
+        import torchaudio as _ta
+        emo_audio, emo_sr = self._load_audio(emo_ref_path, REF_MAX_SECONDS)
+        emo_16k = _ta.transforms.Resample(emo_sr, REF_SR_W2V)(emo_audio)
+        emo_cond = self.extract_spk_cond(emo_16k)  # [1,T,1024]
+
+        # cast to GPT dtype (conformer runs in fp16 on the fast path)
+        gpt_dtype = self.gpt.emovec_layer.weight.dtype
+        emovec_audio = self.gpt.merge_emovec(
+            spk_cond.to(gpt_dtype), emo_cond.to(gpt_dtype), alpha=emo_alpha
+        )  # [1,1280] (already through emo_layer inside get_emovec)
+
+        if emo_vector is None:
+            return emovec_audio
+
+        # matrix correction: emovec_mat + (1 - sum(weights)) * emovec_audio
+        emo_vec_raw = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        spk_chunks = tuple(torch.split(self.spk_matrix, self.emo_num))
+        emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
+        emovec_mat = self.gpt.emo_matrix_lookup(
+            style, emo_vec_raw, spk_chunks, emo_chunks
+        )  # [1,1280] (normalize_emo_vec inside; not yet through emo_layer)
+        # normalize_emo_vec already applied in emo_matrix_lookup; compute the
+        # (1 - sum(weight)) scalar the same way the official does.
+        bias = torch.tensor(
+            [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
+            device=self.device, dtype=torch.float32,
+        )
+        wv = emo_vec_raw * bias
+        s = wv.sum()
+        if s > 0.8:
+            wv = wv * (0.8 / s)
+        complement = float((1.0 - wv.sum()).clamp(min=0.0))
+        # emovec_mat needs emo_layer projection to match emovec_audio's space
+        emovec_mat = self.gpt.emo_layer(emovec_mat.to(gpt_dtype))
+        return emovec_mat + complement * emovec_audio
+
     # ------------------------------------------------------------------
     # main entry point
     # ------------------------------------------------------------------
@@ -330,6 +396,8 @@ class WIndexTTS:
         lang: str = "ZH",
         emo_vector: list[float] | None = None,
         emo_text: str | None = None,
+        emo_ref_path: str | None = None,
+        emo_alpha: float = 1.0,
         duration_factor: float = 1.0,
         do_sample: bool = True,
         top_p: float = 0.8,
@@ -385,6 +453,7 @@ class WIndexTTS:
         if len(segments) == 1:
             return self._infer_single(
                 spk_audio_prompt, segments[0], lang, emo_vector,
+                emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
                 max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
             )
@@ -394,6 +463,7 @@ class WIndexTTS:
         for seg in segments:
             sr, wav = self._infer_single(
                 spk_audio_prompt, seg, lang, emo_vector,
+                emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
                 max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
             )
@@ -412,6 +482,8 @@ class WIndexTTS:
         text: str,
         lang: str,
         emo_vector: list[float] | None,
+        emo_ref_path: str | None,
+        emo_alpha: float,
         duration_factor: float,
         do_sample: bool,
         top_p: float,
@@ -452,8 +524,16 @@ class WIndexTTS:
         from windextts.frontend.tokenizer import lang_to_token
         lang_id = torch.LongTensor([lang_to_token(lang)]).to(dev)
 
-        # --- emo vec (matrix path; audio-term omitted, see build_emo_vec) ---
-        emo_vec = self.build_emo_vec(style, emo_vector)  # [1,1280]
+        # --- emo vec assembly ---
+        # Three paths (priority: emo_ref_path > emo_vector > calm default):
+        #  (1) emo_ref_path: conformer path — merge_emovec(spk, emo_ref) then
+        #      optionally add matrix correction if emo_vector also given.
+        #      Replicates infer_v2_5.py:757-764.
+        #  (2) emo_vector only: matrix path (build_emo_vec).
+        #  (3) neither: calm default vector.
+        emo_vec = self.build_emo_vec_full(
+            style, spk_cond, emo_vector, emo_ref_path, emo_alpha
+        )  # [1,1280]
 
         # --- GPT conditioning + AR decode ---
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]

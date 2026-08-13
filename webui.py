@@ -93,22 +93,21 @@ def synthesize(
     if not text.strip():
         gr.Warning("请输入要合成的文本")
         return None
-    if emo_control_method == 1:
-        gr.Info("情感参考音频模式尚未实现，使用音色参考音频的默认情感（平静）。可用向量/文本模式替代。")
+    if emo_control_method == 1 and emo_ref_path is None:
+        gr.Warning("情感参考音频模式需要上传情感参考音频")
 
     ref_path = prompt_audio if prompt_audio is not None else cmd_args.ref
 
     # resolve emotion source
     emo_vector = None
     emo_text_arg = None
-    if emo_control_method == 2:  # custom vector
+    emo_ref_arg = None
+    if emo_control_method == 1:  # emotion reference audio (conformer path)
+        emo_ref_arg = emo_ref_path
+    elif emo_control_method == 2:  # custom vector
         emo_vector = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        # apply weight scaling (alpha) — matches official: scale each dim
-        if emo_weight != 1.0:
-            emo_vector = [int(v * emo_weight * 10000) / 10000 for v in emo_vector]
     elif emo_control_method == 3:  # text description
         emo_text_arg = emo_text if emo_text else None
-    # method 1 (ref audio) and 0 (none) → emo_vector=None (calm default)
 
     progress(0.2, desc="合成中...")
     acquired = _infer_lock.acquire(timeout=300)
@@ -123,6 +122,8 @@ def synthesize(
             lang=lang,
             emo_vector=emo_vector,
             emo_text=emo_text_arg,
+            emo_ref_path=emo_ref_arg,
+            emo_alpha=float(emo_weight),
             duration_factor=float(duration_factor),
             do_sample=bool(do_sample),
             top_p=float(top_p),
