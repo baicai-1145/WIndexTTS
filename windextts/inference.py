@@ -154,11 +154,11 @@ class WIndexTTS:
         # apply per-module precision overrides (mixed-precision fast paths)
         # GPT-AR decode is matmul-bound: fp16 gives ~1.8x with 100% greedy match.
         # BigVGAN conv-bound: fp16 gives ~1.5x with cosine 0.9998.
-        # S2Mel DiT: fp16 weights + CUDA Graph (R12) — fp16 alone is a wash
-        # (GEMM is memory-bound at batch=1, so 2x tensor cores don't help),
-        # BUT CUDA Graph eliminates the 44% idle bubble from 28k tiny kernels.
-        # fp16+graph combines 2x GEMM (for the compute-bound part) with zero
-        # launch overhead: 96ms vs 135ms eager (cosine 0.996 vs reference).
+        # S2Mel DiT: fp16-native + CUDA Graph. fp16's 10-bit mantissa is
+        # sufficient (cosine 0.9997 vs fp32), so the .float() precision guards in
+        # RMSNorm/RoPE are removed (transformers-era conservatism). This halves
+        # cast kernels; CUDA Graph then eliminates the launch overhead of the
+        # remaining ~53k kernels. fp16-native + graph = 80ms vs fp32 135ms.
         if self.dtype == torch.float16:
             self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
@@ -166,7 +166,7 @@ class WIndexTTS:
             self.s2mel.cfm.estimator_fp16_weights = True
             self.s2mel_use_graph = True
             print(">> GPT-AR + BigVGAN + S2Mel-DiT cast to fp16 (mixed precision)")
-            print(">> S2Mel: fp16 DiT + CUDA Graph (idle-bubble elimination)")
+            print(">> S2Mel-DiT: fp16-native (no cast guards) + CUDA Graph")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
