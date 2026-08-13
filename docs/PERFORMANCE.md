@@ -85,6 +85,7 @@ E2E 稳态                                       ~0.69s
 | **Flash attention 解码** | 不支持 seqlen_q ≠ seqlen_k 的 is_causal（解码 Q=1, K≈90）；mem_eff 已是最佳可用内核 |
 | **流水线 stream overlap** | 各阶段串行依赖（每阶段需上阶段输出），单请求无可重叠的独立工作 |
 | **CFG=0（去 uncond 分支）** | 可省 ~50ms（cosine 0.98），但偏离训练分布；保留为可调参数 |
+| **BigVGAN CUDA Graph** | 实测 **反而变慢**（121.8ms vs eager 108.2ms，0.89x）且 fp16 下引入数值偏差（max_diff=1.7e-2）。原因：BigVGAN 是少数大 conv（compute-bound），不受 launch overhead 支配；GPT-AR 有数百个小 kernel launch 才从 graph 获益。vLLM-Omni low_latency 对 BigVGAN 开 graph，但其用 SnakeBeta Triton 内核（不同 kernel 栈）；纯 torch conv 下 graph 的 copy/replay 开销 > 收益。已回退。 |
 
 ## 性能上限分析
 
