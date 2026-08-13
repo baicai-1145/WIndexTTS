@@ -394,6 +394,8 @@ class UnifiedVoice(nn.Module):
 
         # CUDA Graph decode cache: key (max_seq, dtype) -> captured resources.
         self._graph_cache: dict = {}
+        # CUDA Graph beam-search cache: key (num_beams, max_seq, dtype) -> resources.
+        self._beam_graph_cache: dict = {}
 
     # ------------------------------------------------------------------
     # weight loading
@@ -735,8 +737,10 @@ class UnifiedVoice(nn.Module):
                 per step (with repetition_penalty), scored by cumulative
                 log-prob, and the highest-scoring finished hypothesis wins.
                 num_beams=1 keeps the exact current greedy/sample loop.
-                Beam search is incompatible with the CUDA Graph path (dynamic
-                branching), so num_beams>1 forces use_cuda_graph off.
+                With use_cuda_graph=True and num_beams>1, the decode loop runs
+                through a captured CUDA Graph with static batch K (fixed
+                KV buffers, no beam removal/reordering — EOS beams keep feeding
+                the stop token).
         Returns:
             codes [B, T_gen] (T_gen includes the stop token when produced;
             may be shorter than max_new_tokens if stop was hit).
@@ -751,6 +755,12 @@ class UnifiedVoice(nn.Module):
         mdtype = next(self.parameters()).dtype
         if conditional_latents.dtype != mdtype:
             conditional_latents = conditional_latents.to(mdtype)
+        if use_cuda_graph and num_beams > 1:
+            return self._generate_beam_graph(
+                conditional_latents, text_inputs, langs, max_new_tokens,
+                do_sample, top_k, top_p, temperature, stop_token,
+                num_beams, repetition_penalty,
+            )
         if use_cuda_graph and num_beams <= 1:
             return self._generate_cuda_graph(
                 conditional_latents, text_inputs, langs, max_new_tokens,
@@ -927,6 +937,117 @@ class UnifiedVoice(nn.Module):
                 past_key_values=kvs,
             )
             cur_logits = self.mel_head(self.final_norm(hidden))[:, -1, :]
+
+        if finished:
+            best = max(finished, key=lambda x: x[0])  # highest cumulative score
+            return torch.tensor([best[1]], dtype=torch.long, device=device)  # [1, T_gen]
+        # none finished: return the best-scoring active beam
+        best_beam = int(beam_scores.argmax().item())
+        return gen_ids[best_beam].unsqueeze(0)  # [1, T_gen]
+
+    def _generate_beam_graph(
+        self,
+        conditional_latents: torch.Tensor,
+        text_inputs: torch.Tensor,
+        langs: Optional[torch.Tensor],
+        max_new_tokens: int,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        stop_token: int,
+        num_beams: int,
+        repetition_penalty: float = 1.0,
+    ) -> torch.Tensor:
+        """CUDA-Graph beam-search multinomial sampling.
+
+        Same algorithm as _generate_beam_search (K parallel independent
+        samplers, one candidate per beam per step, cumulative-score winner)
+        with the transformer decode step captured in a CUDA Graph. The key
+        simplification: the batch is FIXED at K beams for the whole loop — no
+        KV reordering, no beam removal. Beams that hit the stop token are
+        frozen (score + codes recorded) and keep feeding the stop token so the
+        graph shape never changes; their logits are ignored afterwards.
+
+        Memory: static kv_bufs [K,H,max_seq,D] per layer + K input/mask/logits
+        buffers (same bucket sizing as the greedy graph).
+        """
+        device = conditional_latents.device
+        mdtype = next(self.parameters()).dtype
+        if device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError(
+                "use_cuda_graph=True requires CUDA; pass use_cuda_graph=False on CPU"
+            )
+        input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(
+            conditional_latents, text_inputs, langs
+        )
+        mel_len = inputs_embeds.shape[1]  # S (conds+text, BEFORE start_mel)
+
+        # --- prefill (batch=1, same math as generate()) ---
+        last_ids = input_ids[:, mel_len:]  # [B,1] start_mel token
+        last_emb = self.mel_embedding(last_ids)
+        last_emb = last_emb + self.mel_pos_embedding(last_emb)  # mel pos 0
+        emb = torch.cat([inputs_embeds, last_emb], dim=1)  # [B, S+1, dim]
+        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        logits = self.mel_head(self.final_norm(hidden))  # [B, S+1, V]
+
+        K = num_beams
+        S = mel_len + 1  # prefill token count (KV buffer positions 0..S-1)
+        pad_len = int((attention_mask[0] == 0).sum().item())
+        raw_seq = S + max_new_tokens + 8
+        max_seq = ((raw_seq + 63) // 64) * 64
+        cache_key = (K, max_seq, mdtype)
+        cache = self._beam_graph_cache.get(cache_key)
+        if cache is None:
+            cache = self._capture_graph(K, max_seq)
+            self._beam_graph_cache[cache_key] = cache
+        g, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf = cache
+
+        # copy prefill KVs into the front of the static buffers (K replicates)
+        for (k, v), (k_buf, v_buf) in zip(kvs, kv_bufs):
+            k_buf[:, :, :S, :].copy_(k.expand(K, -1, -1, -1))
+            v_buf[:, :, :S, :].copy_(v.expand(K, -1, -1, -1))
+
+        min_dt = torch.finfo(mask_buf.dtype).min
+        cur_logits = logits[:, -1, :].expand(K, -1).contiguous().float()  # [K,V]
+        beam_scores = torch.zeros(K, dtype=torch.float32, device=device)
+        gen_ids = torch.empty(K, 0, dtype=torch.long, device=device)
+        finished: list[tuple[float, list[int]]] = []
+        done = torch.zeros(K, dtype=torch.bool, device=device)
+        stop_t = torch.tensor([stop_token], dtype=torch.long, device=device)
+
+        for step in range(max_new_tokens):
+            next_id = self._sample(
+                cur_logits, do_sample, top_k, top_p, temperature,
+                generated_ids=gen_ids, repetition_penalty=repetition_penalty,
+            )  # [K]
+            tok_lp = F.log_softmax(cur_logits, dim=-1).gather(
+                1, next_id.unsqueeze(1)
+            ).squeeze(1)  # [K]
+            cand_score = beam_scores + tok_lp  # [K] fp32
+
+            is_eos = (next_id == stop_token) & ~done  # newly finished beams
+            if is_eos.any():
+                eos_scores = cand_score[is_eos].tolist()
+                eos_codes = gen_ids[is_eos].tolist()  # codes BEFORE stop
+                finished.extend(zip(eos_scores, eos_codes))
+                done = done | is_eos
+                if done.all():
+                    break
+            # freeze done beams' scores; active beams accumulate
+            beam_scores = torch.where(done, beam_scores, cand_score)
+            # gen_ids for active beams only (done rows frozen, never re-read)
+            gen_ids = torch.cat([gen_ids, next_id.unsqueeze(1)], dim=1)
+            # feed: done beams keep feeding stop_token (logits ignored)
+            feed = torch.where(done, stop_t.expand(K), next_id)
+            kv_pos = S + step
+            input_id_buf.copy_(feed.unsqueeze(1))  # [K,1]
+            pos_buf.fill_(step + 2)
+            kv_pos_buf.fill_(kv_pos)
+            mask_buf.fill_(min_dt)
+            mask_buf[:, :, :, pad_len:kv_pos + 1].fill_(0.0)
+            g.replay()
+            cur_logits = logits_buf.float()  # [K,V] fp32 for stable sampling
 
         if finished:
             best = max(finished, key=lambda x: x[0])  # highest cumulative score

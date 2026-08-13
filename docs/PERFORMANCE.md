@@ -96,14 +96,19 @@ WIndexTTS 尝试移植这两项均失败（见未采用表）。在纯 torch 路
 ## 各阶段拆解（优化后）
 
 ```
-GPT-AR (fp16 + CUDA Graph + bucket 256)           ~282ms  ~56%
-S2Mel-CFM (12 Euler步 + TeaCache 0.25)            ~137ms  ~27%
-BigVGAN (fp16 + remove_weight_norm)                ~59ms  ~12%
-codec + 前端 + Python 设置                          ~25ms   ~5%
+GPT-AR beam3 (CUDA Graph 静态 batch K=3)          ~490ms  ~62%
+S2Mel-CFM (12 Euler步 + TeaCache 0.25)            ~137ms  ~17%
+BigVGAN (fp16 + remove_weight_norm)                ~59ms   ~8%
+codec + 前端 + Python 设置                          ~25ms   ~3%
 ─────────────────────────────────────────────────────────
-E2E 稳态 (trimmed mean)                            ~0.48s
-E2E all mean                                        ~0.50s
+E2E 稳态 (beam3，5 次均值)                          ~0.95s
+E2E all mean (benchmark_e2e.py, 4 文本)             ~0.74s
+E2E min                                              ~0.65s
 ```
+
+> 注：R14 之前 e2e 基准走 num_beams=1（greedy）路径，~0.48s。R14 将官方质量配置
+> beam3 纳入 CUDA Graph 后，e2e 默认（num_beams=3）为 0.65-0.95s——beam3 质量档
+> 对比原 eager beam3（~1.4s）加速 2.2x；若需极致延迟可 num_beams=1（greedy，~0.5s）。
 
 **阶段上限分析（profiler-free 实测）：**
 - GPT-AR 282ms = 58ms prefill + 3.1ms/token × ~80 token（decode）。per-token 已接近
@@ -135,6 +140,7 @@ E2E all mean                                        ~0.50s
 | **R11** | **warmup 捕获正确 bucket**（max_new_tokens 10→220） | GPT | 消除首请求 recapture | — |
 | **R12** | **S2Mel CUDA Graph 修复并启用**（根因：dt_buf GC + freqs_cis rebuild） | S2Mel | eager 488→graph 442ms (-46ms trimmed) | 0/75 板砖 |
 | **R13** | **Path A：fp16-native DiT**（移除 .float() 精度守卫） | S2Mel | GPU-work 433→400ms (-33ms) | cosine 0.9997 |
+| **R14** | **CUDA-Graph beam search**（静态 batch K，无 KV 重排；EOS 束继续喂 stop_token） | GPT | eager beam3 1464→graph beam3 ~490ms (3.0x)，e2e 1.4s→0.65s | 9/10 seed 与 eager 位级一致，音频等长等 rms |
 
 ## 未采用/失败的方案及原因
 
@@ -146,6 +152,7 @@ E2E all mean                                        ~0.50s
 | **GPT INT8 量化** | torchao / bitsandbytes 未安装；零外部依赖原则 |
 | **S2Mel CUDA Graph（全序列）** | ✅ **R12 已修复并启用**。原 TeaCache 互斥问题通过禁用 TeaCache（graph 路径）解决。两个根因 bug 修复后稳定：见下方 R12 明细。 |
 | **S2Mel fp16** | ✅ **R13 已启用**（Path A：fp16-native DiT，移除 transformers 时代的 .float() 精度守卫）。fp16 的 10-bit mantissa 足够，cosine 0.9997。 |
+| **GPT beam3 + CUDA Graph（真 beam 重排）** | ✅ **R14 已启用**（简化版：静态 batch K=num_beams，无 KV 重排/无束删除——EOS 束冻结分数并继续喂 stop_token 保持 graph 形状）。eager beam3 1464→graph beam3 ~490ms。与 eager 的差异仅在束中途 EOS 时的 RNG 消耗模式（9/10 seed 位级一致，其余仅末 token 不同，统计等价）。 |
 | **Flash attention 解码** | 不支持 seqlen_q ≠ seqlen_k 的 is_causal（解码 Q=1, K≈90）；mem_eff 已是最佳可用内核 |
 | **流水线 stream overlap** | 各阶段串行依赖（每阶段需上阶段输出），单请求无可重叠的独立工作 |
 | **CFG=0（去 uncond 分支）** | 可省 ~50ms（cosine 0.98），但偏离训练分布；保留为可调参数 |

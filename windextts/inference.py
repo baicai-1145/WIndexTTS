@@ -436,9 +436,10 @@ class WIndexTTS:
                 concatenated with interval_silence_ms of silence between them.
             interval_silence_ms: silence inserted between segments (ms).
             repetition_penalty: HF repetition-penalty scale (official 10.0).
-            num_beams: GPT-AR beam width (official 3). Beam search disables the
-                CUDA-Graph decode path (dynamic branching) but is the official
-                quality configuration.
+            num_beams: GPT-AR beam width (official 3). Beam search now runs
+                through the CUDA-Graph decode path too (static batch K, fixed
+                KV buffers — no beam removal/reordering in the graph loop), so
+                the official quality configuration is no longer slow.
         Returns:
             (sample_rate, audio [samples,]) at 22050 Hz mono.
         """
@@ -551,7 +552,9 @@ class WIndexTTS:
 
         # --- GPT conditioning + AR decode ---
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]
-        use_cg = self.device != "cpu" and num_beams <= 1
+        # CUDA Graph is now supported for beam search too (static batch K,
+        # fixed KV buffers — no beam removal/reordering in the graph loop).
+        use_cg = self.device != "cpu"
         codes = self.gpt.generate(
             conds_latent, text_tokens, lang_id,
             max_new_tokens=max_mel_tokens, do_sample=do_sample,
