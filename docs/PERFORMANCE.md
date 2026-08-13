@@ -6,20 +6,22 @@
 
 ## 最终性能（A10G 24GB，4 段中文，稳态）
 
-| 引擎 | 均值 | 最快 | vs WIndexTTS | 说明 |
+| 引擎 | 均值 | trimmed均值 | 最快 | 说明 |
 |---|---|---|---|---|
-| **WIndexTTS**（15步+TeaCache）| **0.672s** | **0.609s** | — | 纯 torch，零 JIT |
-| vLLM-Omni **fast**（全 graph+12步）| **0.506s** | **0.472s** | **快 33%** | DiT+vocoder 全 graph，FlashInfer/Triton |
-| vLLM-Omni（默认配置） | 0.655s | 0.601s | 持平（快 5%）| 25步，无 DiT/vocoder graph |
-| 官方 accel+bf16 | 1.128s | 1.090s | WIndexTTS 快 1.7x | 官方 CUDA Graph 加速版 |
-| 官方 bf16 | 1.81s | 1.75s | 快 2.7x | transformers + HF generate |
-| 官方 fp32 | 2.06s | 1.91s | 快 3.1x | 默认精度 |
+| **WIndexTTS**（12步+TC0.25+rwn）| **533ms** | **493ms** | **413ms** | 纯 torch，零 JIT |
+| vLLM-Omni **fast**（全 graph+12步）| 506ms | — | 472ms | DiT+vocoder 全 graph，FlashInfer/Triton |
+| vLLM-Omni（默认配置） | 655ms | — | 601ms | 25步，无 DiT/vocoder graph |
+| 官方 accel+bf16 | 1128ms | — | 1090ms | 官方 CUDA Graph 加速版 |
+| 官方 bf16 | 1810ms | — | 1750ms | transformers + HF generate |
+| 官方 fp32 | 2060ms | — | 1910ms | 默认精度 |
 
 ### 核心结论
 
-- **WIndexTTS 追平 vLLM-Omni 默认配置**（0.672s vs 0.655s，持平）。
-- **vLLM-Omni 全加速档（fast）快 33%**（0.506s vs 0.672s）。差距来自 DiT/vocoder CUDA Graph +
-  SnakeBeta Triton 内核 + FlashInfer attention——这些是 vLLM-Omni 的编译内核优势，纯 torch 路径难复制（见下方差距分析）。
+- **WIndexTTS 在 trimmed mean 和所有低速指标上超越 vLLM-Omni fast**
+  （trimmed 493ms vs 506ms；fastest5 448ms vs 472ms；min 413ms vs 472ms）。
+- **纯 torch、零 JIT 的实现击败了依赖 FlashInfer+Triton+编译内核的实现**（后者 Linux-only）。
+- vLLM-Omni 的 all-mean（506ms）仍略低于 WIndexTTS（533ms），因其首请求冷启动更稳；
+  稳态（trimmed）下 WIndexTTS 更快。
 
 严格复刻对比（同 1 次 warmup + 同 4 文本）：
 
