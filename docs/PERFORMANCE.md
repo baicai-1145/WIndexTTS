@@ -92,13 +92,23 @@ WIndexTTS 尝试移植这两项均失败（见未采用表）。在纯 torch 路
 ## 各阶段拆解（优化后）
 
 ```
-GPT-AR (fp16 + CUDA Graph + 紧凑KV buffer)   ~150ms  ~40%
-S2Mel-CFM (15 Euler步 + TeaCache)            ~175ms  ~37%
-BigVGAN (fp16)                                ~58ms  ~15%
-codec + 前端 + Python 设置                    ~50ms   ~8%
+GPT-AR (fp16 + CUDA Graph + bucket 256)           ~282ms  ~56%
+S2Mel-CFM (12 Euler步 + TeaCache 0.25)            ~137ms  ~27%
+BigVGAN (fp16 + remove_weight_norm)                ~59ms  ~12%
+codec + 前端 + Python 设置                          ~25ms   ~5%
 ─────────────────────────────────────────────────────────
-E2E 稳态                                       ~0.69s
+E2E 稳态 (trimmed mean)                            ~0.48s
+E2E all mean                                        ~0.50s
 ```
+
+**阶段上限分析（profiler-free 实测）：**
+- GPT-AR 282ms = 58ms prefill + 3.1ms/token × ~80 token（decode）。per-token 已接近
+  memory-bound 理论下限（1.6GB fp16 权重 / 600GB/s ≈ 2.7ms/token）。GEMM 146ms 是
+  hardware floor，进一步需 INT8 量化（违反零外部依赖）。
+- S2Mel 137ms = TeaCache 跳过 ~40% DiT forward + 12 步 ODE。bf16 kernel 更快但
+  autocast dispatch 开销使其 profiler-free 下净变慢（已验证回退）；bf16+graph
+  数值未解。
+- BigVGAN 59ms = GPU-bound（conv dgrad 24% + elementwise 28%），接近极限。
 
 ## 优化轮次明细
 
@@ -113,6 +123,12 @@ E2E 稳态                                       ~0.69s
 | + | 64-bucket KV（减少跨请求 graph 重捕获） | GPT | 会话级 | — |
 | + | warmup() 预捕获（冷启动 1.67→0.93s） | 全局 | 首请求 | — |
 | + | 参考音频特征缓存 | 前端 | 重复请求省 ~30ms | — |
+| **R6** | **remove_weight_norm**（官方路径，消除 conv dispatch hook） | BigVGAN | launches 2624→2508 | diff=0.0 |
+| **R7** | **profiler-free 回退 bf16**（autocast dispatch 净变慢） | S2Mel | fp32 比 bf16 快 32ms | diff=0 |
+| **R8** | **TeaCache 0.15→0.25** | S2Mel | 185→165ms | cosine 0.999 |
+| **R9** | **CFM 步数 15→12** | S2Mel | 168→137ms | cosine 0.9995 |
+| **R10** | **max_mel_tokens 300→220**（bucket 384→256，减少 attention） | GPT | -43ms | 无截断 |
+| **R11** | **warmup 捕获正确 bucket**（max_new_tokens 10→220） | GPT | 消除首请求 recapture | — |
 
 ## 未采用/失败的方案及原因
 
@@ -128,6 +144,9 @@ E2E 稳态                                       ~0.69s
 | **流水线 stream overlap** | 各阶段串行依赖（每阶段需上阶段输出），单请求无可重叠的独立工作 |
 | **CFG=0（去 uncond 分支）** | 可省 ~50ms（cosine 0.98），但偏离训练分布；保留为可调参数 |
 | **BigVGAN CUDA Graph** | 实测 **反而变慢**（121.8ms vs eager 108.2ms，0.89x）且 fp16 下引入数值偏差（max_diff=1.7e-2）。原因：BigVGAN 是少数大 conv（compute-bound），不受 launch overhead 支配；GPT-AR 有数百个小 kernel launch 才从 graph 获益。vLLM-Omni low_latency 对 BigVGAN 开 graph，但其用 SnakeBeta Triton 内核（不同 kernel 栈）；纯 torch conv 下 graph 的 copy/replay 开销 > 收益。已回退。 |
+| **bf16 DiT autocast（单用）** | profiler-free A/B 证明净**变慢** 32ms（207 vs 175ms）。bf16 kernel 快 57% 但 autocast 的 per-op dispatch 开销在 batch=1 下超过 kernel 节省，使 host 成瓶颈（idle 48%→73%）。已回退 fp32。 |
+| **DiT CUDA Graph（fp32）** | profiler-free 下更慢（199 vs 137ms）且数值偏差（cosine 0.908）。fp32 kernel 本身慢，graph 的 copy/replay 不划算；只在 bf16（dispatch 瓶颈）时 graph 才有价值，但 bf16+graph 数值问题更深（padded 区污染 + teacache 互斥）。二进制陷阱。 |
+| **profiler 放大的 host bubble 优化** | profiler 显示 S2Mel idle 56%、BigVGAN 82 个大 gap（149ms），但 profiler-free 下这些 gap 被 CPU/GPU 重叠掩盖（vllm-omni skill 警告：profiler host time 失真）。remove_weight_norm 等 hook 移除仍保留（无损 + 减少 launches）。 |
 
 ## 性能上限分析
 
