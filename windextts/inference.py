@@ -159,19 +159,25 @@ class WIndexTTS:
         print(f">> WIndexTTS loaded all modules on {dev}")
         # apply per-module precision overrides (mixed-precision fast paths)
         # All three modules run fp16 — verified stable (0/20 brick in stress
-        # test across strong emotions). The prior 'fp32 fallback' was a misdiagnosis.
+        # test across strong emotions). fp16 is NOT the problem.
         #
-        # IMPORTANT: S2Mel CUDA Graph is DISABLED (s2mel_use_graph=False). The
-        # graph-capture path has a latent bug producing 'brick'/clipped audio
-        # (~90% rate) for strong emotions. The eager fp16 path is fully stable
-        # and fast (354ms median). Graph re-enable only after fixing
-        # solve_euler_graph's capture/replay buffer management — NOT an fp16 issue.
+        # S2Mel CUDA Graph is DISABLED (s2mel_use_graph=False) due to TWO distinct
+        # graph bugs (root-caused via extensive bisection):
+        #   1. Bucket padding pollution (bucket>1): padding T_true→T_bucket lets
+        #      WN conv reflect-pad leak padding values into valid region.
+        #      diff scales with pad amount (T=116,bucket=64 → diff 2.3).
+        #   2. setup_caches invalidation (bucket=1): each new T triggers
+        #      setup_caches which rebuilds freqs_cis, breaking already-captured
+        #      graphs that bound the old freqs_cis tensor address.
+        # The eager fp16 path is fully stable and fast (~354ms stress median).
+        # Graph re-enable needs: (a) isolate padding region each Euler step, or
+        # (b) freeze estimator caches across captures. NOT an fp16 precision issue.
         if self.dtype == torch.float16:
             self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
             self.s2mel.cfm.estimator.to(torch.float16)
             self.s2mel.cfm.estimator_fp16_weights = True
-            self.s2mel_use_graph = False  # eager fp16 (graph has brick bug)
+            self.s2mel_use_graph = False  # eager fp16 (graph has padding+cache bugs)
             print(">> GPT-AR + BigVGAN + S2Mel-DiT fp16 (eager; S2Mel graph disabled)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
