@@ -8,12 +8,16 @@
 
 | 引擎 | 均值 | trimmed均值 | 最快 | 说明 |
 |---|---|---|---|---|
-| **WIndexTTS**（12步+TC0.25+rwn）| **533ms** | **493ms** | **413ms** | 纯 torch，零 JIT |
+| **WIndexTTS**（S2Mel graph +12步+TC）| **442ms** | **442ms** | **372ms** | 纯 torch，零 JIT，S2Mel CUDA Graph 修复后 |
 | vLLM-Omni **fast**（全 graph+12步）| 506ms | — | 472ms | DiT+vocoder 全 graph，FlashInfer/Triton |
 | vLLM-Omni（默认配置） | 655ms | — | 601ms | 25步，无 DiT/vocoder graph |
 | 官方 accel+bf16 | 1128ms | — | 1090ms | 官方 CUDA Graph 加速版 |
 | 官方 bf16 | 1810ms | — | 1750ms | transformers + HF generate |
 | 官方 fp32 | 2060ms | — | 1910ms | 默认精度 |
+
+> **R12 更新**：S2Mel CUDA Graph 两个根因 bug（dt_buf GC + freqs_cis rebuild）修复后，
+> trimmed mean 从 481ms→442ms（-39ms），min 从 458ms→372ms（-86ms）。
+> **0/75 brick**（3情感×5文本×5seed），21/21 对齐测试通过。
 
 ### 严格 A/B 对比（同 protocol：1 warmup + 同 4 文本）
 
@@ -129,6 +133,8 @@ E2E all mean                                        ~0.50s
 | **R9** | **CFM 步数 15→12** | S2Mel | 168→137ms | cosine 0.9995 |
 | **R10** | **max_mel_tokens 300→220**（bucket 384→256，减少 attention） | GPT | -43ms | 无截断 |
 | **R11** | **warmup 捕获正确 bucket**（max_new_tokens 10→220） | GPT | 消除首请求 recapture | — |
+| **R12** | **S2Mel CUDA Graph 修复并启用**（根因：dt_buf GC + freqs_cis rebuild） | S2Mel | eager 488→graph 442ms (-46ms trimmed) | 0/75 板砖 |
+| **R13** | **Path A：fp16-native DiT**（移除 .float() 精度守卫） | S2Mel | GPU-work 433→400ms (-33ms) | cosine 0.9997 |
 
 ## 未采用/失败的方案及原因
 
@@ -138,14 +144,14 @@ E2E all mean                                        ~0.50s
 | **torch.compile GPT** | 与混合精度不兼容（"invalid dtype for bias"） |
 | **torch.compile S2Mel DiT** | TeaCache 的动态状态（dict/int 计数）触发持续重编译，慢 14x |
 | **GPT INT8 量化** | torchao / bitsandbytes 未安装；零外部依赖原则 |
-| **S2Mel CUDA Graph（全序列）** | TeaCache 的数据依赖分支（.cpu().item()）无法被 graph 捕获；二者互斥，TeaCache 收益更大 |
-| **S2Mel fp16** | DiT forward 有多处 fp32 内部构造（t_embedder/cond_proj），侵入性大；TeaCache 已减半 |
+| **S2Mel CUDA Graph（全序列）** | ✅ **R12 已修复并启用**。原 TeaCache 互斥问题通过禁用 TeaCache（graph 路径）解决。两个根因 bug 修复后稳定：见下方 R12 明细。 |
+| **S2Mel fp16** | ✅ **R13 已启用**（Path A：fp16-native DiT，移除 transformers 时代的 .float() 精度守卫）。fp16 的 10-bit mantissa 足够，cosine 0.9997。 |
 | **Flash attention 解码** | 不支持 seqlen_q ≠ seqlen_k 的 is_causal（解码 Q=1, K≈90）；mem_eff 已是最佳可用内核 |
 | **流水线 stream overlap** | 各阶段串行依赖（每阶段需上阶段输出），单请求无可重叠的独立工作 |
 | **CFG=0（去 uncond 分支）** | 可省 ~50ms（cosine 0.98），但偏离训练分布；保留为可调参数 |
 | **BigVGAN CUDA Graph** | 实测 **反而变慢**（121.8ms vs eager 108.2ms，0.89x）且 fp16 下引入数值偏差（max_diff=1.7e-2）。原因：BigVGAN 是少数大 conv（compute-bound），不受 launch overhead 支配；GPT-AR 有数百个小 kernel launch 才从 graph 获益。vLLM-Omni low_latency 对 BigVGAN 开 graph，但其用 SnakeBeta Triton 内核（不同 kernel 栈）；纯 torch conv 下 graph 的 copy/replay 开销 > 收益。已回退。 |
 | **bf16 DiT autocast（单用）** | profiler-free A/B 证明净**变慢** 32ms（207 vs 175ms）。bf16 kernel 快 57% 但 autocast 的 per-op dispatch 开销在 batch=1 下超过 kernel 节省，使 host 成瓶颈（idle 48%→73%）。已回退 fp32。 |
-| **DiT CUDA Graph（fp32）** | profiler-free 下更慢（199 vs 137ms）且数值偏差（cosine 0.908）。fp32 kernel 本身慢，graph 的 copy/replay 不划算；只在 bf16（dispatch 瓶颈）时 graph 才有价值，但 bf16+graph 数值问题更深（padded 区污染 + teacache 互斥）。二进制陷阱。 |
+| **DiT CUDA Graph（fp32）** | ❌（已证不可行）。但 **fp16 DiT CUDA Graph（R12）可行**——根因不是 fp16 精度，而是两个 tensor 生命周期 bug（见 R12）。fp16 graph 0/75 板砖。 |
 | **profiler 放大的 host bubble 优化** | profiler 显示 S2Mel idle 56%、BigVGAN 82 个大 gap（149ms），但 profiler-free 下这些 gap 被 CPU/GPU 重叠掩盖（vllm-omni skill 警告：profiler host time 失真）。remove_weight_norm 等 hook 移除仍保留（无损 + 减少 launches）。 |
 
 ## R12 突破：fp16 DiT + CUDA Graph 协同机制（深度分析）
@@ -191,6 +197,35 @@ graph fp32 因 idle 44% 且 GEMM 不加速而亏损）。
 1. **RoPE freqs_cis 越界**：bucketing 后访问未 setup 的位置（0.03→0.996）
 2. **graph cache key 缺 fp16 标志**：fp32 graph 被复用到 fp16 模式 → NaN
 3. **Timestep embedding dtype 不匹配**：硬编码 `.float()` → `.to(t.dtype)`
+
+### R12 后续：CUDA Graph brick 的真正根因（dt_buf GC + freqs_cis rebuild）
+
+R12 启用 graph 后发现 fp16 graph 在多文本/do_sample 下产生 brick（裁顶音频）。
+经过深度二分调试（seisa），定位两个 **tensor 生命周期 bug**（不是 fp16 精度问题）：
+
+**Bug A — dt_buf 垃圾回收（单 graph replay 损坏）**：
+- `solve_euler_graph` 在 capture 块内创建 `dt_buf` 局部变量，但**未存入 cache dict**
+- capture 后 Python GC 丢弃唯一引用，PyTorch allocator 复用该内存
+- 已捕获的 graph 仍记录旧地址 → replay 读垃圾 dt 值 → Euler 积分错误 → brick
+- 证据：capture 调用(seed0)正确(diff 0.28)，所有 replay(seed1+)损坏(diff 4.5)
+  reuse-vs-reuse 确定(diff 0)→证明是稳定的垃圾值
+- 修复：dt_buf 存入 cache dict 保持 Python 引用
+
+**Bug B — freqs_cis 跨 bucket 重建（多 graph 损坏）**：
+- `Transformer.setup_caches` 在 max_seq_length 增长时重建 `self.freqs_cis`
+- freqs_cis 基于 block_size(16384)，与 max_seq_length 无关，重建只是在新地址复制相同值
+- 当更大 bucket 触发重建，已捕获的小 bucket graph 绑定旧 freqs_cis 地址 → 过期 RoPE
+- 证据：长文本 do_sample（变长 codes→跨 bucket cache 复用）=14/20 brick；
+  短文本(单 bucket)=0/20；pin=256 无效(192>128 仍触发重建)
+- 修复：freqs_cis 只建一次（首次 setup_caches），永不重建
+
+**防御性修复（部分 padding 隔离）**：keep_mask 每步清零 prompt+padding 区域，
+限制 WN 卷积 reflect-pad 泄漏（padding case diff 2.3→1.8）。
+
+修复后：**0/75 brick**（3情感×5文本×5seed），21/21 对齐通过，trimmed 442ms/min 372ms。
+
+教训：CUDA Graph capture 的 tensor 必须保持 Python 引用存活（防 GC），
+且 graph 绑定的内部状态（如 freqs_cis）地址不能跨 capture 变化。
 
 ## 性能上限分析
 
