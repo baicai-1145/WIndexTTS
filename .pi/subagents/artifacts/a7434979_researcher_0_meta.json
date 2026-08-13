@@ -1,0 +1,110 @@
+{
+  "runId": "a7434979",
+  "agent": "researcher",
+  "task": "Goal: Find downloadable multilingual parallel text corpora covering 99+ languages, where each language has at least 50 short sentences.\n\n**Requirement**:\n- Must cover these 99 Whisper languages: en, zh, de, es, ru, ko, fr, ja, pt, tr, pl, ca, nl, ar, sv, it, id, hi, fi, vi, he, uk, el, ms, cs, ro, da, hu, ta, no, th, ur, hr, bg, lt, la, mi, ml, cy, sk, te, fa, lv, bn, sr, az, sl, kn, et, mk, br, eu, is, hy, ne, mn, bs, kk, sq, sw, gl, mr, pa, si, km, sn, yo, so, af, oc, ka, be, tg, sd, gu, am, yi, lo, uz, fo, ht, ps, tk, nn, mt, sa, lb, my, bo, tl, mg, as, tt, haw, ln, ha, ba, jw, su\n- Plus extensions: yue, minnan, wuyu, dialect, zh/en, en/zh\n- At least 50 sentences per language (100+ preferred)\n- Each sentence should be natural standalone (not too long, not too short)\n\n**Best candidates to investigate**:\n1. FLORES-200/ FLORES-101 dataset (842 sentences in 200 languages, on HuggingFace facebook/flores)\n2. OPUS-100 / OPUS datasets\n3. Tatoeba sentences\n4. UDHR (Universal Declaration of Human Rights) translations\n\n**Deliverable**: For each source found, give me:\n- Exact download URL or HuggingFace dataset name\n- How to load it (python code snippet: datasets.load_dataset(...) or urllib URL)\n- How many of the 99 languages it covers\n- Format (parallel pairs? monolingual?)\n\n**Focus**: FLORES-200 is the best bet (200 languages, 842 sentences each). Find its exact HF dataset path and loading code. Also check if there's a way to get yue/minnan/wuyu from FLORES or other sources.\n\nRead-only research. Return concrete loading code and coverage info.\n\n---\n**Output:**\nWrite your findings to exactly this path: /root/WIndexTTS/.pi/subagents/artifacts/outputs/a7434979/research.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 1,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": 0,
+    "turns": 0
+  },
+  "model": "newapi/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "newapi/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "newapi/deepseek-v4-flash:high",
+      "success": false,
+      "exitCode": 1,
+      "error": "Subagent process terminated by signal SIGTERM.",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "cost": 0,
+        "turns": 0
+      }
+    }
+  ],
+  "durationMs": 65,
+  "toolCount": 0,
+  "error": "Subagent process terminated by signal SIGTERM.",
+  "launchContractDigest": "1bc5c04827147985b96d3f1b765cde2bce398f0db68588bd3aac4d27d46d503f",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:51a9b93ec8cd5030"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:51a9b93ec8cd5030"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "rejected",
+    "evidenceStatus": "rejected",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [
+      {
+        "id": "attestation",
+        "status": "failed",
+        "message": "Structured acceptance report not found."
+      }
+    ],
+    "verifyRuns": [],
+    "childReportParseError": "Structured acceptance report not found."
+  },
+  "transcriptPath": "/root/WIndexTTS/.pi/subagents/artifacts/a7434979_researcher_0_transcript.jsonl",
+  "timestamp": 1786644375107
+}
