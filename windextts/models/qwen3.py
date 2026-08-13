@@ -299,12 +299,20 @@ class Qwen3ForCausalLM(nn.Module):
             rope_sin = self._rope_sin[cache_pos : cache_pos + T]
 
         # causal mask for prefill (T>1). For decode (T==1) with tensor cache_pos,
-        # the attention layer builds the KV-validity mask internally.
+        # build the KV-validity mask ONCE here (not per-layer) — saves 28× the
+        # arange+compare kernel launches per decode step.
         mask = None
         if T > 1:
             mask = torch.full((T, T), float("-inf"), device=device, dtype=x.dtype)
             mask = torch.triu(mask, diagonal=1)
             mask = mask.unsqueeze(0).unsqueeze(0)
+        elif cache_pos_is_tensor and kv_caches is not None:
+            # decode mask: positions >= (cache_pos+T) get -1e4 additive bias.
+            # Reuse a static positions buffer if available (graph-friendly).
+            max_seq = kv_caches[0][0].size(2)
+            positions = torch.arange(max_seq, device=device)
+            valid = cache_pos + T
+            mask = ((positions >= valid).to(x.dtype) * -1e4).view(1, 1, 1, max_seq)
 
         for i, layer in enumerate(self.layers):
             kc = kv_caches[i] if kv_caches is not None else None
@@ -390,7 +398,10 @@ class Qwen3ForCausalLM(nn.Module):
         with torch.cuda.graph(graph):
             decode_step()
 
-        # replay loop: each replay = one decode step
+        # replay loop: each replay = one decode step. The per-step .item()
+        # eos check IS a host sync, but it enables early termination (emotion
+        # JSON ends at eos ~76 tokens, far below max_new_tokens=150), which
+        # saves more than the sync costs.
         for _ in range(max_new_tokens - 1):
             graph.replay()
             tok_buf.copy_(out_buf.unsqueeze(1))
