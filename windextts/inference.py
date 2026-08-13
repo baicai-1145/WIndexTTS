@@ -158,24 +158,21 @@ class WIndexTTS:
 
         print(f">> WIndexTTS loaded all modules on {dev}")
         # apply per-module precision overrides (mixed-precision fast paths)
-        # GPT-AR decode is matmul-bound: fp16 gives ~1.8x with 100% greedy match.
-        # BigVGAN conv-bound: fp16 gives ~1.5x with cosine 0.9998.
-        # S2Mel DiT: fp16-native + CUDA Graph. fp16's 10-bit mantissa is
-        # sufficient (cosine 0.9997 vs fp32), so the .float() precision guards in
-        # RMSNorm/RoPE are removed (transformers-era conservatism). This halves
-        # cast kernels; CUDA Graph then eliminates the launch overhead of the
-        # remaining ~53k kernels. fp16-native + graph = 80ms vs fp32 135ms.
-        # GPT-AR: stays fp32. It's memory-bound (AR decode), so fp16's bandwidth
-        # gain is real BUT fp16/bf16 both corrupt AR decode for strong emotion
-        # vectors (spk_emb_proj ~32 magnitude vs emo_vec ~0.8 → mantissa loss).
-        # S2Mel-DiT: ALSO fp32. CFM's random initial noise z, run through 12-25
-        # Euler steps in fp16, intermittently overflows for certain noise seeds
-        # → NaN/brick audio (non-deterministic: same input, ~40% bad). fp32 is
-        # stable across all seeds. BigVGAN stays fp16 (conv-bound, verified stable).
+        # All three modules run fp16 — verified stable (0/20 brick in stress
+        # test across strong emotions). The prior 'fp32 fallback' was a misdiagnosis.
+        #
+        # IMPORTANT: S2Mel CUDA Graph is DISABLED (s2mel_use_graph=False). The
+        # graph-capture path has a latent bug producing 'brick'/clipped audio
+        # (~90% rate) for strong emotions. The eager fp16 path is fully stable
+        # and fast (354ms median). Graph re-enable only after fixing
+        # solve_euler_graph's capture/replay buffer management — NOT an fp16 issue.
         if self.dtype == torch.float16:
+            self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
-            self.s2mel_use_graph = False  # fp32 DiT: graph offers little gain
-            print(">> GPT-AR + S2Mel-DiT stay fp32 (precision); BigVGAN fp16")
+            self.s2mel.cfm.estimator.to(torch.float16)
+            self.s2mel.cfm.estimator_fp16_weights = True
+            self.s2mel_use_graph = False  # eager fp16 (graph has brick bug)
+            print(">> GPT-AR + BigVGAN + S2Mel-DiT fp16 (eager; S2Mel graph disabled)")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
