@@ -85,6 +85,24 @@ tts.infer(ref, text, 'ZH',
 
 > **注**：仓库不含权重和测试音频（见 `.gitignore`）。参考音频用任意 5-15s 干净人声 wav。
 
+### WebUI（Gradio）
+
+```bash
+# 安装 gradio（可选依赖）
+pip install -e ".[webui]"
+
+# 启动（默认 fp16 快速档，0.0.0.0:7860）
+python webui.py --model_dir /root/IndexTTS-2.5
+python webui.py --port 7860 --host 0.0.0.0  # 同上
+python webui.py --no_fp16                # 质量优先（fp32）
+```
+
+功能：参考音频上传、多语言（ZH/EN/JA/KO/YUE）、情感控制（向量/文本描述）、
+采样参数、性能调优（CFM 步数/TeaCache）、一键延迟基准。多个请求会自动排队
+（CUDA Graph 为单会话设计，并发用锁串行化）。
+
+### Python API
+
 ```bash
 # 用官方 venv（有 torch/torchaudio/tiktoken/safetensors）
 /root/index-tts/.venv/bin/python -c "

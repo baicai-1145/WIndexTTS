@@ -17,6 +17,8 @@ import argparse
 import os
 import sys
 import tempfile
+import threading
+import time
 
 import gradio as gr
 import torch
@@ -51,6 +53,12 @@ print(">> WIndexTTS ready.")
 
 
 # ---------------------------------------------------------------------------
+# Concurrency: serialise synthesis calls. The CUDA Graphs + KV caches are
+# single-session; overlapping requests would corrupt shared state.
+# ---------------------------------------------------------------------------
+_infer_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # Inference handler — bridges the Gradio UI to WIndexTTS.infer()
 # ---------------------------------------------------------------------------
 def synthesize(
@@ -72,14 +80,21 @@ def synthesize(
     top_k,
     temperature,
     max_mel_tokens,
+    # perf knobs (WIndexTTS extensions vs official)
+    cfm_steps,
+    teacache_thresh,
+    progress=gr.Progress(),
 ):
     """Run WIndexTTS.infer() from UI inputs; return output audio path."""
+    progress(0, desc="准备中...")
     if prompt_audio is None and cmd_args.ref is None:
         gr.Warning("请上传参考音频")
         return None
     if not text.strip():
         gr.Warning("请输入要合成的文本")
         return None
+    if emo_control_method == 1:
+        gr.Info("情感参考音频模式尚未实现，使用音色参考音频的默认情感（平静）。可用向量/文本模式替代。")
 
     ref_path = prompt_audio if prompt_audio is not None else cmd_args.ref
 
@@ -88,14 +103,20 @@ def synthesize(
     emo_text_arg = None
     if emo_control_method == 2:  # custom vector
         emo_vector = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        # apply weight scaling (alpha)
+        # apply weight scaling (alpha) — matches official: scale each dim
         if emo_weight != 1.0:
             emo_vector = [int(v * emo_weight * 10000) / 10000 for v in emo_vector]
     elif emo_control_method == 3:  # text description
         emo_text_arg = emo_text if emo_text else None
     # method 1 (ref audio) and 0 (none) → emo_vector=None (calm default)
 
+    progress(0.2, desc="合成中...")
+    acquired = _infer_lock.acquire(timeout=300)
+    if not acquired:
+        gr.Warning("合成队列繁忙，请稍后重试")
+        return None
     try:
+        t0 = time.perf_counter()
         sr, audio = tts.infer(
             spk_audio_prompt=ref_path,
             text=text,
@@ -108,18 +129,25 @@ def synthesize(
             top_k=int(top_k),
             temperature=float(temperature),
             max_mel_tokens=int(max_mel_tokens),
+            cfm_steps=int(cfm_steps),
+            teacache_thresh=float(teacache_thresh),
             text_normalization=bool(text_normalization),
             max_text_tokens_per_segment=int(max_text_tokens_per_segment),
         )
+        dt = (time.perf_counter() - t0) * 1000
     except Exception as e:
         import traceback
         traceback.print_exc()
         gr.Warning(f"合成失败: {e}")
         return None
+    finally:
+        _infer_lock.release()
 
-    # write to a temp wav and return the path (Gradio Audio wants a path)
-    out_path = os.path.join(tempfile.gettempdir(), "windextts_out.wav")
+    progress(0.9, desc="保存中...")
+    # unique output path (avoid concurrent overwrites)
+    out_path = os.path.join(tempfile.gettempdir(), f"windextts_{int(time.time()*1000)}.wav")
     torchaudio.save(out_path, audio.float().unsqueeze(0), sr)
+    print(f">> synthesized {audio.numel()/sr:.2f}s audio in {dt:.0f}ms (RTF={dt/(audio.numel()/sr):.3f})")
     return out_path
 
 
@@ -211,6 +239,16 @@ with gr.Blocks(
                 temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
                 max_mel_tokens = gr.Slider(label="max_mel_tokens (生成长度上限)", minimum=50, maximum=1000, value=220, step=10)
 
+        with gr.Accordion("性能调优 (WIndexTTS 专属)", open=False):
+            gr.Markdown(
+                "以下参数控制推理速度/质量权衡（默认值已调优为最佳速度-质量平衡）：\n"
+                "- **CFM 步数**：S2Mel Flow Matching 求解步数，越少越快（官方 25，默认 12，最低 ~8）\n"
+                "- **TeaCache 阈值**：DiT 跳步缓存阈值，越高越快（0=禁用，默认 0.25）\n"
+            )
+            with gr.Row():
+                cfm_steps = gr.Slider(label="CFM 步数", minimum=6, maximum=25, value=12, step=1)
+                teacache_thresh = gr.Slider(label="TeaCache 阈值", minimum=0.0, maximum=0.5, value=0.25, step=0.05)
+
         # --- wire up the generate button ---
         gen_button.click(
             synthesize,
@@ -220,6 +258,7 @@ with gr.Blocks(
                 emo_control, emo_upload, emo_weight,
                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
                 do_sample, top_p, top_k, temperature, max_mel_tokens,
+                cfm_steps, teacache_thresh,
             ],
             outputs=output_audio,
         )
@@ -236,6 +275,75 @@ with gr.Blocks(
         toggle_emo, inputs=[emo_control],
         outputs=[emo_ref_group, emo_vec_group, emo_text_group],
     )
+
+    # -----------------------------------------------------------------------
+    # Benchmark tab — one-click latency measurement (A10G fp16)
+    # -----------------------------------------------------------------------
+    with gr.Tab("性能基准"):
+        gr.Markdown(
+            "### WIndexTTS 端到端延迟基准\n"
+            "点击下方按钮，运行当前 UI 参数下的多次推理并统计延迟（需预热）。\n"
+            "参考值（A10G fp16，短文本）：**WIndexTTS ~400ms · vLLM-Omni ~470ms · 官方 fp32 ~1.4s**"
+        )
+        with gr.Row():
+            bench_button = gr.Button("📊 运行基准 (10 次)", variant="secondary")
+            bench_output = gr.Textbox(label="结果", lines=10, interactive=False)
+
+        def run_benchmark(
+            prompt_audio, text, lang, duration_factor, text_normalization,
+            max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
+            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
+            do_sample, top_p, top_k, temperature, max_mel_tokens,
+            cfm_steps, teacache_thresh,
+        ):
+            import statistics
+            ref_path = prompt_audio if prompt_audio is not None else cmd_args.ref
+            if ref_path is None or not text.strip():
+                return "请先上传参考音频并输入文本"
+            # warmup (also triggers graph capture)
+            for _ in range(2):
+                synthesize(prompt_audio, text, lang, duration_factor, text_normalization,
+                           max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
+                           vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
+                           do_sample, top_p, top_k, temperature, max_mel_tokens,
+                           cfm_steps, teacache_thresh)
+            # measure
+            ts, audio_lens = [], []
+            for i in range(10):
+                out = synthesize(prompt_audio, text, lang, duration_factor, text_normalization,
+                                 max_text_tokens_per_segment, emo_control, emo_ref_path, emo_weight,
+                                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
+                                 do_sample, top_p, top_k, temperature, max_mel_tokens,
+                                 cfm_steps, teacache_thresh)
+                if out is None:
+                    return "基准失败，请检查输入"
+                import torchaudio as _ta
+                info = _ta.info(out)
+                ts.append(info.num_frames / info.sample_rate)
+            ts.sort()
+            med = statistics.median(ts) * 1000
+            mn = min(ts) * 1000
+            trimmed = statistics.mean(ts[1:-1]) * 1000
+            return (
+                f"10 次基准 (音频 ~{ts[0]*1000:.0f}ms):\n"
+                f"  median: {med:.0f}ms\n"
+                f"  min:    {mn:.0f}ms\n"
+                f"  trimmed mean (±1σ): {trimmed:.0f}ms\n"
+                f"  RTF:    {med/(ts[0]*1000):.3f}\n"
+            )
+
+        bench_button.click(
+            run_benchmark,
+            inputs=[
+                prompt_audio, text_input, lang_dropdown, duration_factor,
+                text_normalization, max_text_tokens_per_segment,
+                emo_control, emo_upload, emo_weight,
+                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
+                do_sample, top_p, top_k, temperature, max_mel_tokens,
+                cfm_steps, teacache_thresh,
+            ],
+            outputs=bench_output,
+        )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-xdist"]
+webui = ["gradio>=4.0"]
 
 [tool.setuptools.packages.find]
 include = ["windextts*"]
