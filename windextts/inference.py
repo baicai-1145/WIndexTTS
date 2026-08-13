@@ -165,14 +165,17 @@ class WIndexTTS:
         # RMSNorm/RoPE are removed (transformers-era conservatism). This halves
         # cast kernels; CUDA Graph then eliminates the launch overhead of the
         # remaining ~53k kernels. fp16-native + graph = 80ms vs fp32 135ms.
+        # GPT-AR: stays fp32. It's memory-bound (AR decode), so fp16's bandwidth
+        # gain is real BUT fp16/bf16 both corrupt AR decode for strong emotion
+        # vectors (spk_emb_proj ~32 magnitude vs emo_vec ~0.8 → mantissa loss).
+        # S2Mel-DiT: ALSO fp32. CFM's random initial noise z, run through 12-25
+        # Euler steps in fp16, intermittently overflows for certain noise seeds
+        # → NaN/brick audio (non-deterministic: same input, ~40% bad). fp32 is
+        # stable across all seeds. BigVGAN stays fp16 (conv-bound, verified stable).
         if self.dtype == torch.float16:
-            self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
-            self.s2mel.cfm.estimator.to(torch.float16)
-            self.s2mel.cfm.estimator_fp16_weights = True
-            self.s2mel_use_graph = True
-            print(">> GPT-AR + BigVGAN + S2Mel-DiT cast to fp16 (mixed precision)")
-            print(">> S2Mel-DiT: fp16-native (no cast guards) + CUDA Graph")
+            self.s2mel_use_graph = False  # fp32 DiT: graph offers little gain
+            print(">> GPT-AR + S2Mel-DiT stay fp32 (precision); BigVGAN fp16")
 
         # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
         # w2v/campplus/mel when the same ref is reused across requests (stage 5).
@@ -324,23 +327,16 @@ class WIndexTTS:
         emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
         emovec_mat_raw = self.gpt.emo_matrix_lookup(
             style, emo_vec_raw, spk_chunks, emo_chunks
-        )  # [1,1280] (normalize_emo_vec applied inside; NOT through emo_layer)
+        )  # [1,1280] (raw weights, no normalize; NOT through emo_layer)
         # conformer path: emovec_audio from spk's own audio (alpha=1, pure spk)
         gpt_dtype = self.gpt.emovec_layer.weight.dtype
         emovec_audio = self.gpt.get_emovec(spk_cond.to(gpt_dtype))  # [1,1280] (through emo_layer)
-        # compute normalize_emo_vec weights to get the (1-sum) scalar
-        bias = torch.tensor(
-            [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
-            device=self.device, dtype=torch.float32,
-        )
-        wv = emo_vec_raw * bias
-        s = wv.sum()
-        if s > 0.8:
-            wv = wv * (0.8 / s)
-        complement = float((1.0 - wv.sum()).clamp(min=0.0))
-        # emovec_mat needs emo_layer projection to match emovec_audio's space
-        emovec_mat = self.gpt.emo_layer(emovec_mat_raw.to(gpt_dtype))
-        return emovec_mat + complement * emovec_audio
+        # official line 769: complement = 1 - sum(RAW weight_vector), clamped >= 0
+        complement = float((1.0 - emo_vec_raw.sum()).clamp(min=0.0))
+        # emovec_mat is used RAW (no emo_layer) — matches official: the matrix
+        # (feat2.pt) is already in target space; only emovec_audio (conformer)
+        # passes through emovec_layer+emo_layer inside get_emovec.
+        return emovec_mat_raw.to(gpt_dtype) + complement * emovec_audio
 
     @torch.no_grad()
     def build_emo_vec_full(
@@ -386,21 +382,11 @@ class WIndexTTS:
         emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
         emovec_mat = self.gpt.emo_matrix_lookup(
             style, emo_vec_raw, spk_chunks, emo_chunks
-        )  # [1,1280] (normalize_emo_vec inside; not yet through emo_layer)
-        # normalize_emo_vec already applied in emo_matrix_lookup; compute the
-        # (1 - sum(weight)) scalar the same way the official does.
-        bias = torch.tensor(
-            [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
-            device=self.device, dtype=torch.float32,
-        )
-        wv = emo_vec_raw * bias
-        s = wv.sum()
-        if s > 0.8:
-            wv = wv * (0.8 / s)
-        complement = float((1.0 - wv.sum()).clamp(min=0.0))
-        # emovec_mat needs emo_layer projection to match emovec_audio's space
-        emovec_mat = self.gpt.emo_layer(emovec_mat.to(gpt_dtype))
-        return emovec_mat + complement * emovec_audio
+        )  # [1,1280] (raw weights, no normalize)
+        # official line 769: complement = 1 - sum(RAW weight_vector), clamped >= 0
+        complement = float((1.0 - emo_vec_raw.sum()).clamp(min=0.0))
+        # emovec_mat used RAW (no emo_layer) — matches official.
+        return emovec_mat.to(gpt_dtype) + complement * emovec_audio
 
     # ------------------------------------------------------------------
     # main entry point

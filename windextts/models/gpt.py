@@ -471,18 +471,14 @@ class UnifiedVoice(nn.Module):
         Returns:
             emovec_mat [1,1280]: sum_i emo_vec[i] * emo_matrix[chunk_i][idx_i],
             where idx_i = argmax cosine(style, spk_matrix[chunk_i]).
+
+        NOTE: the official infer_v2_5.py uses the RAW emo_vector here (line 668,
+        678) — normalize_emo_vec is defined but NEVER called in the matrix path.
+        Applying bias/cap here was a bug that corrupted emo_vec direction
+        (cosine ~0 vs official) → 'brick' audio for high single-emotion weights.
         """
         device = style.device
-        # normalize_emo_vec (infer_v2_5.py:491-504): apply per-emotion bias,
-        # then scale down if total > 0.8.
-        bias = torch.tensor(
-            [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625],
-            device=device, dtype=torch.float32,
-        )
-        wv = emo_vec.float().to(device) * bias
-        s = wv.sum()
-        if s > 0.8:
-            wv = wv * (0.8 / s)
+        wv = emo_vec.float().to(device)  # raw weights, no normalize (matches official)
         indices = []
         for chunk in spk_matrix:
             sims = F.cosine_similarity(style.float(), chunk.to(device).float(), dim=1)
