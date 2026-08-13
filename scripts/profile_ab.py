@@ -7,7 +7,7 @@ Optionally pairs with a profiler trace capture (--trace) for the diff
 explanation.
 
 Config flags (composable):
-  --steps N          CFM Euler steps (default 15)
+  --steps N          CFM Euler steps (default 12)
   --bf16 / --fp32    DiT compute dtype (default: follow warmup = bf16 autocast)
   --graph / --eager  DiT CUDA-graph path (default eager)
   --teacache on/off  TeaCache (default on)
@@ -115,7 +115,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", default="baseline", help="config A label")
     ap.add_argument("--b", default="opt", help="config B label")
-    ap.add_argument("--steps", type=int, default=15)
+    ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--graph", action="store_true")

@@ -1,0 +1,155 @@
+{
+  "runId": "c26107ea",
+  "agent": "doc-reader",
+  "task": "Read and summarize the vLLM-Omni diffusion performance optimization skill at /root/vllm-omni/.claude/skills/diffusion-perf-opt/. Read SKILL.md fully, then skim scripts/trace_analyzer.py and any files in references/ and agents/.\n\nGoal: Extract methodology specifically for profiling DIFFUSION model inference (this is directly relevant — my S2Mel-CFM stage is a 12-25 step DiT flow-matching solver, similar workload to image diffusion).\n\nReturn specifically:\n1. How they profile a diffusion/flow-matching solver (per-step profiling? whole-loop? CUDA graph considerations?)\n2. What they identify as typical diffusion bottlenecks (the DiT forward, the Euler loop overhead, the CFG double-forward, etc.)\n3. Any metrics or thresholds they use to decide an optimization helps vs hurts\n4. How trace_analyzer.py parses the trace — what it looks for, what report it generates\n5. Any \"pitfalls\" or \"why an optimization that looks fast is actually slow\" guidance (this is important to me — I've seen CUDA Graph make my vocoder SLOWER and need to understand why)\n\nQuote concrete details (function names, metric keys, threshold values). Mode: read-only, do not edit.",
+  "exitCode": 0,
+  "usage": {
+    "input": 10402,
+    "output": 4291,
+    "cacheRead": 32000,
+    "cacheWrite": 0,
+    "cost": 0,
+    "turns": 4
+  },
+  "model": "newapi/deepseek-v4-flash:low",
+  "attemptedModels": [
+    "newapi/deepseek-v4-flash:low"
+  ],
+  "modelAttempts": [
+    {
+      "model": "newapi/deepseek-v4-flash:low",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 10402,
+        "output": 4291,
+        "cacheRead": 32000,
+        "cacheWrite": 0,
+        "cost": 0,
+        "turns": 4
+      }
+    }
+  ],
+  "durationMs": 41979,
+  "toolCount": 6,
+  "launchContractDigest": "c25507e5d94d78bad43ffa47181c9cdf2fe88974e86ae1a08e1ef0bc95d49684",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:51a9b93ec8cd5030"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:51a9b93ec8cd5030"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only task wording"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only task wording"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "All 5 requested questions answered with concrete file/function/metric references: profiling = whole-loop stage timing (vae.encode/diffuse/vae.decode via --log-stats + --enable-diffusion-pipeline-profiler) kept separate from diagnostic torch-profiler operator/shape and host-stack traces; bottlenecks = DiT self-attention/FFN, CFG double-forward (CFG=2 x USP=world/2 vs CFG=1 x USP=world), Euler/scheduler coefficient gaps, empty_cache/sync stalls; metrics/thresholds = gpu_span_s/busy_union_s/idle_union_s/idle_pct/GAP, --min-gap-ms 5 (host 1), --topn 20, >=3 measured repeats, quality gate SSIM/PSNR/LPIPS/cos/MAE/MSE + flicker + seed stability; analyzer = scripts/trace_analyzer.py GPU_CATS={\"kernel\",\"gpu_memcpy\",\"gpu_memset\"}, CPU_CATS={\"python_function\",\"user_annotation\",\"cpu_op\",\"cuda_runtime\",\"cuda_driver\"}, merged-interval span/busy/idle, interesting_cpu filter dur>=1000us on sync/launch/memcpy names, GAP prev/next/in with 160-char truncation; pitfalls = profiler latency never a final claim, Command Buffer Full is overhead, empty_cache forces sync/idle, user_annotation NCCL overcounts nested intervals, evaluate by stage not E2E, don't rewrite operators without trace proof."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "read /root/vllm-omni/.claude/skills/diffusion-perf-opt/SKILL.md",
+          "result": "passed",
+          "summary": "Full read; extracted stages, bottlenecks, P0/P1/P2, analyzer keys, heuristics"
+        },
+        {
+          "command": "read .../scripts/trace_analyzer.py",
+          "result": "passed",
+          "summary": "Full read; parsed GPU/CPU category sets, gap/busy/idle logic, GAP report, CLI flags"
+        },
+        {
+          "command": "read .../references/optimization-playbook.md",
+          "result": "passed",
+          "summary": "Full read; scheduler fusion/cache, FA-to-LA necessity, cross-attn SP skip, output format"
+        },
+        {
+          "command": "read .../agents/openai.yaml",
+          "result": "passed",
+          "summary": "Interface metadata only; no additional methodology"
+        }
+      ],
+      "validationOutput": [
+        "All 4 files in the skill directory read in full (SKILL.md, scripts/trace_analyzer.py, references/optimization-playbook.md, agents/openai.yaml). No file was truncated or partially read."
+      ],
+      "residualRisks": [
+        "The skill is tuned for vLLM-Omni multi-GPU video/image diffusion (USP/CFG/HSDP/VAE patch parallel); the parallelism layers are largely N/A for a single-GPU S2Mel-CFM solver and should not be applied wholesale.",
+        "trace_analyzer.py explicitly does not parse shapes or attribute stream overlap; per-operator shape/backend conclusions require a separate shape audit the analyzer cannot provide.",
+        "This is read-only extraction from the skill docs; I did not run the analyzer against any WIndexTTS trace or verify the analyzer against a real trace artifact, so its exact output behavior on your torch-profiler output is unverified."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Read-only task; no files were created, modified, or staged.",
+      "reviewFindings": [
+        "no blockers: the skill provides concrete function names (empty_cache, cudaStreamSynchronize, cudaDeviceSynchronize), metric keys (idle_pct, gpu_span_s, busy_union_s, GAP, by_shape), and thresholds (min-gap-ms 5/1, topn 20, >=3 repeats) directly relevant to the S2Mel-CFM 12-25-step DiT flow-matching solver.",
+        "info: agents/openai.yaml contains only agent interface metadata (display_name, short_description, default_prompt) and contributes no profiling methodology."
+      ],
+      "manualNotes": "For the CUDA Graph vocoder regression, the skill's measurement-reliability and host/runtime layers give the diagnostic path: profiler-free A/B of the CFM solver stage with >=3 repeats and identical seed/shape/steps, plus a shape audit confirming the graph-captured kernel is on the intended fast path for the captured shapes; suspect graph-capture-time re-allocation/layout conversion and capture-vs-replay host sync differences."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": false
+    }
+  },
+  "transcriptPath": "/root/WIndexTTS/.pi/subagents/artifacts/c26107ea_doc-reader_0_transcript.jsonl",
+  "timestamp": 1786602650146
+}

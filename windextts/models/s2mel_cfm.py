@@ -138,11 +138,22 @@ class S2MelCFM(nn.Module):
         est = self.estimator
         if getattr(est, "teacache_enabled", False):
             est._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
-        # bf16 autocast for the estimator forward (vLLM-Omni strategy): Euler
-        # state stays fp32; only the DiT forward runs reduced-precision, halving
-        # GEMM cost and restoring flash-attention eligibility.
+        # Reduced-precision DiT forward strategies. Two modes:
+        #   - estimator_autocast_dtype: wraps each op in torch.autocast (per-op
+        #     dtype-policy dispatch). Numerically safe for fp16 (10 mantissa
+        #     bits) but the per-op dispatch cost EXCEEDS the kernel speedup at
+        #     batch=1, so it is net-SLOWER than fp32 eager (profiler-free A/B).
+        #   - estimator_fp16_weights: cast DiT params to fp16 ONCE, then cast
+        #     only the estimator input->fp16 and output->fp32 per call. Pure
+        #     fp16 cuBLAS kernels with just 2 cast ops (no per-op policy query),
+        #     so it captures the real 2-4x GEMM speedup.
         ac_dtype = getattr(self, "estimator_autocast_dtype", None)
+        fp16_w = getattr(self, "estimator_fp16_weights", False)
         def _run_estimator(*a, **kw):
+            if fp16_w:
+                a16 = tuple(ai.to(torch.float16) if torch.is_tensor(ai) and ai.is_floating_point() else ai for ai in a)
+                kw16 = {k: (v.to(torch.float16) if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in kw.items()}
+                return est(*a16, **kw16).float()
             if ac_dtype is None:
                 return est(*a, **kw)
             with torch.autocast(a[0].device.type, dtype=ac_dtype):
@@ -247,7 +258,7 @@ class S2MelCFM(nn.Module):
             prompt_padded = prompt
 
         # cache lookup keyed by BUCKETED shape (not exact T)
-        key = (B, C, T, prompt_len, dtype, cfg, n_steps)
+        key = (B, C, T, prompt_len, dtype, cfg, n_steps, getattr(self, "estimator_fp16_weights", False))
         cache = self._graph_cache.get(key)
 
         # set up prompt_x + zero x's prompt region (on bucketed tensors)
@@ -273,9 +284,18 @@ class S2MelCFM(nn.Module):
             t_buf = t_span[0].clone()
             dt_buf = torch.tensor(dt_val, device=device, dtype=dtype)
             s_t = torch.cat([t_buf.unsqueeze(0), t_buf.unsqueeze(0)], dim=0)
+            # fp16-weights mode: estimator params are fp16, so all estimator
+            # inputs must be fp16 (graph captures fixed dtype). Euler state
+            # (x_buf) stays fp32 for accuracy; only the estimator call is fp16.
+            fp16w = getattr(self, "estimator_fp16_weights", False)
+            if fp16w:
+                s_prompt_x = s_prompt_x.half()
+                s_style = s_style.half()
+                s_mu = s_mu.half()
+                s_t = s_t.half()
             torch.cuda.synchronize()
             for _ in range(3):  # warmup
-                sd = self.estimator(s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
+                sd = self.estimator(s_x.half() if fp16w else s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
                 dphi, cfg_dphi = sd.chunk(2, dim=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
             torch.cuda.synchronize()
@@ -284,7 +304,13 @@ class S2MelCFM(nn.Module):
             x_buf = x.clone()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                sd = self.estimator(s_x_buf, s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
+                # fp16 mode: cast s_x_buf to fp16 for the estimator (it lives
+                # fp32 for the replay loop's copy_(cat([x,x])) simplicity).
+                if fp16w:
+                    sd = self.estimator(s_x_buf.half(), s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
+                    dphi = sd.float()
+                else:
+                    sd = self.estimator(s_x_buf, s_prompt_x, x_lens_s, s_t_buf, s_style, s_mu)
                 dphi, cfg_dphi = sd.chunk(2, dim=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
                 x_buf.copy_(x_buf + dt_buf * dphi)
@@ -292,13 +318,16 @@ class S2MelCFM(nn.Module):
             cache = dict(
                 graph=graph, s_x_buf=s_x_buf, s_t_buf=s_t_buf, x_buf=x_buf,
                 s_prompt_x=s_prompt_x, s_style=s_style, s_mu=s_mu, x_lens_s=x_lens_s,
+                fp16w=fp16w,
             )
             self._graph_cache[key] = cache
         else:
             # refresh per-request values into static buffers (shapes match)
-            cache["s_prompt_x"][: x.size(0)].copy_(prompt_x)
-            cache["s_style"][: style.size(0)].copy_(style)
-            cache["s_mu"][: mu.size(0)].copy_(mu)
+            fp16w = cache.get("fp16w", False)
+            tgt = torch.float16 if fp16w else cache["s_prompt_x"].dtype
+            cache["s_prompt_x"][: x.size(0)].copy_(prompt_x.to(tgt))
+            cache["s_style"][: style.size(0)].copy_(style.to(tgt))
+            cache["s_mu"][: mu.size(0)].copy_(mu.to(tgt))
             # x_lens_s is the cached static buffer; set it to true len
             cache["x_lens_s"].fill_(T_true)
 

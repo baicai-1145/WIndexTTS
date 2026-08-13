@@ -472,7 +472,9 @@ class TimestepEmbedder(nn.Module):
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.frequency_embedding_size % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+        # cast back to t's dtype so downstream Linear (which may be fp16 under
+        # estimator_fp16_weights mode) does not hit a dtype mismatch.
+        return embedding.to(t.dtype) if t.dtype != torch.float32 else embedding
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.timestep_embedding(t))
