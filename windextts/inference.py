@@ -199,7 +199,7 @@ class WIndexTTS:
             )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
             self.s2mel.cfm.estimator.enable_teacache(thresh=0.25)
-            mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=15)
+            mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=12)
             bg_dtype = next(self.bigvgan.parameters()).dtype
             _ = self.bigvgan(mel.to(bg_dtype))
         torch.cuda.synchronize()
@@ -299,7 +299,7 @@ class WIndexTTS:
         top_k: int = 30,
         temperature: float = 0.8,
         max_mel_tokens: int = 300,
-        cfm_steps: int = 15,
+        cfm_steps: int = 12,
         cfg_rate: float = 0.7,
         teacache_thresh: float = 0.25,
     ) -> tuple[int, torch.Tensor]:
