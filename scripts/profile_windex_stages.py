@@ -189,6 +189,7 @@ def main():
 
     print(">> loading model...")
     tts = WIndexTTS(device="cuda", dtype=torch.float16)
+    tts.warmup()  # enables DiT bf16 autocast + captures GPT CUDA graph
     for _ in range(2):
         tts.infer(REF, "warmup.", "ZH", cfm_steps=args.steps)
     torch.cuda.synchronize()

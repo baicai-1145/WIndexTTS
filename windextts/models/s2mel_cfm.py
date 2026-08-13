@@ -56,7 +56,10 @@ class S2MelCFM(nn.Module):
         self.estimator = estimator
         self.in_channels = in_channels
         self.sigma_min = sigma_min
-        self._graph_cache: dict = {}  # keyed by (x.shape, prompt_len, dtype, cfg, n_steps)
+        self._graph_cache: dict = {}  # keyed by (B,C,T_bucket,prompt_len,dtype,cfg,n_steps)
+        # mel-frame bucketing for the graph path: round T up to this multiple
+        # so different text lengths reuse one captured graph (max a few graphs).
+        self._GRAPH_BUCKET = 64
 
     @torch.no_grad()
     def inference(
@@ -206,34 +209,47 @@ class S2MelCFM(nn.Module):
     ) -> torch.Tensor:
         """CUDA-Graph-captured Euler solver (same math as solve_euler).
 
-        The 25-step loop body has fully static shapes (x/prompt/mu/style don't
-        change shape, only values), so we capture one step into a CUDAGraph and
-        replay it ``len(t_span)-1`` times. Sampling RNG (multinomial) is absent
-        here (CFM is deterministic given x0 noise), so the whole loop is
-        graph-capturable.
+        The step loop body has static shapes per capture, so we capture one
+        step into a CUDAGraph and replay it ``len(t_span)-1`` times. CFM is
+        deterministic (no sampling RNG), so the whole loop is graph-capturable.
 
-        Per-step buffers (stacked cond/uncond, t) are pre-allocated once and
-        updated in-place via copy_; the graph reads/writes only static tensors.
+        Length bucketing: x is padded up to the nearest bucket (multiple of
+        ``_GRAPH_BUCKET`` frames) so different text lengths reuse the same
+        captured graph (avoids per-request re-capture, the prior failure mode).
+        Output is sliced back to the true length afterwards.
         """
         prompt_len = prompt.size(-1)
+        B, C, T_true = x.shape
         device = x.device
         dtype = x.dtype
         n_steps = len(t_span) - 1
         dt_val = (t_span[1] - t_span[0]).item()  # constant (linspace)
         cfg = float(inference_cfg_rate)
 
-        # cache lookup (capture cost paid only on first call per shape)
-        key = (tuple(x.shape), prompt_len, dtype, cfg, n_steps)
+        # round T up to a bucket so similar lengths reuse one graph
+        bucket = self._GRAPH_BUCKET
+        T = ((T_true + bucket - 1) // bucket) * bucket
+        if T != T_true:
+            # pad x, prompt, mu to bucket T (tail content irrelevant — sliced off)
+            pad = T - T_true
+            x = torch.nn.functional.pad(x, (0, pad))
+            prompt_padded = torch.nn.functional.pad(prompt, (0, pad))
+            mu = torch.nn.functional.pad(mu.transpose(1, 2), (0, pad)).transpose(1, 2)
+        else:
+            prompt_padded = prompt
+
+        # cache lookup keyed by BUCKETED shape (not exact T)
+        key = (B, C, T, prompt_len, dtype, cfg, n_steps)
         cache = self._graph_cache.get(key)
 
-        # set up prompt_x + zero x's prompt region (same as solve_euler)
+        # set up prompt_x + zero x's prompt region (on bucketed tensors)
         prompt_x = torch.zeros_like(x)
-        prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+        prompt_x[..., :prompt_len] = prompt_padded[..., :prompt_len]
         x[..., :prompt_len] = 0
-        x_lens_s = torch.cat([x_lens, x_lens], dim=0) if x_lens is not None else None
+        x_lens_b = torch.LongTensor([T]).to(device)  # use bucketed len for attention mask
+        x_lens_s = torch.cat([x_lens_b, x_lens_b], dim=0)
 
         if cache is None:
-            # ---- first call: pre-allocate buffers + warmup + capture ----
             zero_prompt_x = torch.zeros_like(prompt_x)
             zero_style = torch.zeros_like(style)
             zero_mu = torch.zeros_like(mu)
@@ -245,12 +261,11 @@ class S2MelCFM(nn.Module):
             dt_buf = torch.tensor(dt_val, device=device, dtype=dtype)
             s_t = torch.cat([t_buf.unsqueeze(0), t_buf.unsqueeze(0)], dim=0)
             torch.cuda.synchronize()
-            for _ in range(3):  # warmup (primes cudnn autotune, allocs)
+            for _ in range(3):  # warmup
                 sd = self.estimator(s_x, s_prompt_x, x_lens_s, s_t, s_style, s_mu)
                 dphi, cfg_dphi = sd.chunk(2, dim=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
             torch.cuda.synchronize()
-            # static buffers the graph reads/writes
             s_x_buf = s_x.clone()
             s_t_buf = s_t.clone()
             x_buf = x.clone()
@@ -284,7 +299,8 @@ class S2MelCFM(nn.Module):
             s_t_buf.copy_(torch.cat([t_val.unsqueeze(0), t_val.unsqueeze(0)], dim=0))
             g.replay()
             x.copy_(x_buf)
-        return x
+        # slice bucketed result back to the true (un-padded) length
+        return x[:, :, :T_true]
 
 
 class S2Mel(nn.Module):
