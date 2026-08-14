@@ -45,25 +45,114 @@ parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the
 parser.add_argument("--fp16", action="store_true", default=True, help="Use fp16 (mixed precision)")
 parser.add_argument("--no_fp16", dest="fp16", action="store_false", help="Disable fp16")
 parser.add_argument("--ref", type=str, default=None, help="Default reference audio path")
-parser.add_argument("--w4a16", action="store_true", default=False, help="Enable W4A16 INT4 weight quantization for GPT (requires torchao)")
-parser.add_argument("--low_vram", action="store_true", default=False, help="Low-VRAM mode (for 3-4GB GPUs): w2v-bert streamed to CPU between refs, greedy decode only (no beam graph). Measured ~2.4GB steady vs ~4.2GB default.")
+parser.add_argument("--w4a16", action="store_true", default=False, help="Start in W4A16 mode (GPT INT4; requires torchao). The engine can be re-switched at runtime from the UI.")
+parser.add_argument("--low_vram", action="store_true", default=False, help="Start in low-VRAM mode (3-4GB GPUs): w2v-bert streamed to CPU, beam3 KV bucket capped. Measured ~2.9GB steady. Switchable at runtime from the UI.")
 cmd_args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
-# Build the TTS engine (fp16 by default; the fast path)
-# ---------------------------------------------------------------------------
-dtype = torch.float16 if cmd_args.fp16 else torch.float32
-print(f">> Loading WIndexTTS (weights_dir={cmd_args.model_dir}, dtype={dtype})...")
-tts = WIndexTTS(weights_dir=cmd_args.model_dir, device="cuda", dtype=dtype, enable_w4a16=cmd_args.w4a16, low_vram=cmd_args.low_vram)
-tts.warmup()
-print(">> WIndexTTS ready.")
-
-
-# ---------------------------------------------------------------------------
-# Concurrency: serialise synthesis calls. The CUDA Graphs + KV caches are
-# single-session; overlapping requests would corrupt shared state.
+# Engine management — runtime-switchable precision (W4A16 / fp16 / fp32)
+#
+# The three modes have different weight dtypes, so switching means a full
+# engine rebuild (weight reload + graph re-capture, ~30-60s). The rebuild and
+# synthesize share one lock: an in-flight synthesis blocks the rebuild, and
+# synthesis during a rebuild is rejected with a warning.
 # ---------------------------------------------------------------------------
 _infer_lock = threading.Lock()
+
+_PRECISION_CHOICES = [
+    ("W4A16 (最快 · GPT INT4 量化)", "w4a16"),
+    ("fp16 (推荐 · 速度/精度平衡)", "fp16"),
+    ("fp32 (最高精度 · 基准)", "fp32"),
+]
+_MODE_NAMES = {"w4a16": "W4A16", "fp16": "fp16", "fp32": "fp32"}
+
+_engine = {"tts": None, "mode": None, "low_vram": None, "building": False}
+
+
+def _initial_mode() -> str:
+    if cmd_args.w4a16:
+        return "w4a16"
+    return "fp16" if cmd_args.fp16 else "fp32"
+
+
+def _build_engine(mode: str, low_vram: bool) -> WIndexTTS:
+    dtype = torch.float32 if mode == "fp32" else torch.float16
+    if mode == "w4a16":
+        try:
+            import torchao  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError("W4A16 需要 torchao (pip install torchao)") from e
+    print(f">> Loading WIndexTTS (mode={_MODE_NAMES[mode]}, dtype={dtype}, low_vram={low_vram})...")
+    t = WIndexTTS(
+        weights_dir=cmd_args.model_dir, device="cuda", dtype=dtype,
+        enable_w4a16=(mode == "w4a16"), low_vram=low_vram,
+    )
+    t.warmup()
+    return t
+
+
+def engine_status_text() -> str:
+    if _engine["building"]:
+        return "⏳ 引擎重建中，请稍候..."
+    if _engine["tts"] is None:
+        return "❌ 引擎未加载"
+    free_b, total_b = torch.cuda.mem_get_info()
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    lv = "开" if _engine["low_vram"] else "关"
+    return (
+        f"当前引擎: {_MODE_NAMES[_engine['mode']]} · low_vram={lv}\n"
+        f"显存: 已分配 {alloc:.2f}GB / 保留 {reserved:.2f}GB · GPU 剩余 {free_b / 1e9:.2f}GB"
+    )
+
+
+def apply_engine_config(precision, low_vram, progress=gr.Progress()):
+    """Rebuild the engine with the requested precision / low_vram setting."""
+    if _engine["building"]:
+        gr.Warning("引擎正在重建中，请等待完成")
+        return engine_status_text()
+    if precision == _engine["mode"] and bool(low_vram) == bool(_engine["low_vram"]):
+        return engine_status_text()  # nothing to change
+
+    _engine["building"] = True
+    try:
+        progress(0.1, desc=f"等待合成队列并释放旧引擎 ({_MODE_NAMES[precision]})...")
+        acquired = _infer_lock.acquire(timeout=300)
+        if not acquired:
+            gr.Warning("有合成任务长时间未结束，重建取消")
+            return engine_status_text()
+        try:
+            old = _engine["tts"]
+            _engine["tts"] = None
+            del old
+            torch.cuda.empty_cache()
+            progress(0.3, desc="加载权重 + 捕获 CUDA Graph (~30-60s)...")
+            _engine["tts"] = _build_engine(precision, bool(low_vram))
+            _engine["mode"] = precision
+            _engine["low_vram"] = bool(low_vram)
+            progress(0.95, desc="完成")
+        finally:
+            _infer_lock.release()
+        gr.Info(f"引擎已切换: {_MODE_NAMES[precision]} (low_vram={'开' if low_vram else '关'})")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        gr.Warning(f"引擎重建失败: {e} —— 回退到启动配置")
+        try:
+            _engine["tts"] = _build_engine(_initial_mode(), cmd_args.low_vram)
+            _engine["mode"] = _initial_mode()
+            _engine["low_vram"] = cmd_args.low_vram
+        except Exception:
+            _engine["tts"] = None
+    finally:
+        _engine["building"] = False
+    return engine_status_text()
+
+
+_engine["tts"] = _build_engine(_initial_mode(), cmd_args.low_vram)
+_engine["mode"] = _initial_mode()
+_engine["low_vram"] = cmd_args.low_vram
+print(">> WIndexTTS ready.")
 
 # ---------------------------------------------------------------------------
 # Inference handler — bridges the Gradio UI to WIndexTTS.infer()
@@ -116,11 +205,18 @@ def synthesize(
         emo_text_arg = emo_text if emo_text else None
 
     progress(0.2, desc="合成中...")
+    if _engine["building"]:
+        gr.Warning("引擎重建中，请稍候再试")
+        return None
     acquired = _infer_lock.acquire(timeout=300)
     if not acquired:
         gr.Warning("合成队列繁忙，请稍后重试")
         return None
     try:
+        tts = _engine["tts"]
+        if tts is None:
+            gr.Warning("引擎未加载")
+            return None
         t0 = time.perf_counter()
         sr, audio = tts.infer(
             spk_audio_prompt=ref_path,
@@ -183,6 +279,26 @@ with gr.Blocks(
     )
 
     with gr.Tab("音频生成"):
+        # --- engine config: runtime precision switch (W4A16 / fp16 / fp32) ---
+        with gr.Accordion("引擎配置 (精度切换)", open=True):
+            with gr.Row():
+                precision_radio = gr.Radio(
+                    label="精度模式", choices=_PRECISION_CHOICES, value=_initial_mode(),
+                )
+                with gr.Column(scale=1):
+                    low_vram_cb = gr.Checkbox(
+                        label="低显存模式 (3-4GB 显卡; 保持 beam3, 稳态 ~2.9GB)",
+                        value=cmd_args.low_vram,
+                    )
+                    apply_btn = gr.Button("应用配置 (重建引擎)", variant="secondary")
+            engine_status = gr.Textbox(
+                label="引擎状态", value=engine_status_text(), lines=2, interactive=False,
+            )
+            apply_btn.click(
+                apply_engine_config, inputs=[precision_radio, low_vram_cb],
+                outputs=[engine_status], api_name="apply_engine",
+            )
+
         # --- reference audio + text input ---
         with gr.Row(equal_height=False):
             with gr.Column(scale=1):
