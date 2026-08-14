@@ -30,9 +30,11 @@ dependencies = [
 dev = ["pytest>=8.0", "pytest-xdist"]
 webui = ["gradio>=4.0"]
 quant = ["torchao>=0.5"]  # W4A16 INT4 GPT quantization (optional accelerator)
+server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2"]  # HTTP API (/v1/audio/speech)
 
 [project.scripts]
 windextts = "windextts.cli:main"
+windextts-server = "windextts.server:main"
 
 [tool.setuptools.packages.find]
 include = ["windextts*"]
