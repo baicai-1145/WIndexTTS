@@ -296,24 +296,32 @@ class WIndexTTS:
             emo = self.build_emo_vec(style, spk)
             conds = self.gpt.build_conds_latent(style, emo)
         tt = torch.tensor([[1, 2, 3, 1]], device=dev, dtype=torch.int)
+        # low_vram bucket alignment: a full-length segment (120 text tokens incl.
+        # stop) + 390 max mel tokens + 8 slack → max_seq 576, the same bucket the
+        # capped runtime requests will hit.
+        tt_long = torch.ones(1, 120, device=dev, dtype=torch.int)
         from windextts.frontend.tokenizer import lang_to_token
         lang = torch.LongTensor([lang_to_token("ZH")]).to(dev)
         with torch.no_grad():
             use_cg = dev != "cpu"
+            # Production path is beam3 (official quality config) — always
+            # pre-capture its graph. low_vram: only the beam3 graph, at the
+            # small bucket the capped max_mel_tokens (390) will hit at runtime
+            # (max_seq 576: 390 + 124 text/cond tokens + 8 slack). Greedy graph
+            # skipped entirely (0.09GB saved).
+            warm_tokens = 390 if self.low_vram else 720
             codes = self.gpt.generate(
-                conds, tt, lang, max_new_tokens=720, do_sample=False,
+                conds, tt_long if self.low_vram else tt, lang,
+                max_new_tokens=warm_tokens, do_sample=True,
+                top_k=30, top_p=0.8, temperature=0.8,
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
+                repetition_penalty=10.0, num_beams=3,
             )
-            # also pre-capture the beam-search graph (default production path:
-            # num_beams=3 → static batch K=3 CUDA Graph). Skipped in low_vram
-            # mode (saves the beam3 KV buffer + runtime activations ~0.6GB);
-            # beam search then runs eagerly on first use and captures then.
             if not self.low_vram:
+                # also capture the greedy graph (used by do_sample=False callers)
                 self.gpt.generate(
-                    conds, tt, lang, max_new_tokens=720, do_sample=True,
-                    top_k=30, top_p=0.8, temperature=0.8,
+                    conds, tt, lang, max_new_tokens=720, do_sample=False,
                     stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
-                    repetition_penalty=10.0, num_beams=3,
                 )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
             self.s2mel.cfm.estimator.enable_teacache(thresh=0.25)
@@ -565,6 +573,15 @@ class WIndexTTS:
         }
         if max_mel_tokens is None:
             max_mel_tokens = max_text_tokens_per_segment * _MEL_RATIO.get(lang.upper(), 14)
+        if self.low_vram:
+            # keep the runtime beam3 KV bucket small (448/576): cap mel tokens so
+            # the graph captured at warmup is reused instead of triggering a
+            # bigger capture. 390 mel tokens ≈ 7.8s audio per segment; long
+            # texts are split into more, shorter segments (ratio-coupled below).
+            max_mel_tokens = min(max_mel_tokens, 390)
+            # segment length must shrink with the mel cap (ZH ratio 13):
+            # 30 text tokens × 13 = 390 — keeps segments un-truncated.
+            max_text_tokens_per_segment = min(max_text_tokens_per_segment, 30)
 
         # --- text normalization (G2P: digits→words, punctuation, names) ---
         if text_normalization:
@@ -632,10 +649,10 @@ class WIndexTTS:
     ) -> tuple[int, torch.Tensor]:
         """Synthesize a single (already normalized, short) text segment."""
         dev = self.device
-        if self.low_vram and num_beams > 1:
-            # beam-K graph buffer + runtime activations would blow the budget;
-            # greedy on the captured single-sequence graph instead
-            num_beams = 1
+        if self.low_vram and num_beams > 3:
+            # beam3 is the official quality config and still fits the budget;
+            # only wider beams (4+) would blow it.
+            num_beams = 3
         # --- ref audio features (cached by path+mtime; stage 5 overlap/cache) ---
         import os
         cache_key = None
