@@ -57,6 +57,7 @@ server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2"]  # HTTP API (/v1/aud
 windextts = "windextts.cli:main"
 windextts-server = "windextts.server:main"
 windextts-download = "windextts.download:main"
+windextts-webui = "windextts.webui:main"
 
 [tool.setuptools.packages.find]
 include = ["windextts*"]
