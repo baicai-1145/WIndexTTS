@@ -81,38 +81,83 @@ tts.infer(ref, text, 'ZH',
 
 ## 运行
 
-需要：模型权重（`/root/IndexTTS-2.5/`）、任意参考音频 wav。
+需要：模型权重（见下）+ 任意参考音频 wav（5-15s 干净人声）。
 
-> **注**：仓库不含权重和测试音频（见 `.gitignore`）。参考音频用任意 5-15s 干净人声 wav。
+### 获取模型权重
+
+模型来自 IndexTeam 官方发布，二选一：
+
+```bash
+# HuggingFace（海外）
+pip install -U "huggingface_hub[cli]"
+hf download IndexTeam/IndexTTS-2.5 --local-dir=IndexTTS-2.5
+
+# ModelScope（国内）
+pip install modelscope
+modelscope download --model IndexTeam/IndexTTS-2.5 --local_dir IndexTTS-2.5
+```
+
+下载后把目录路径传给 `--model-dir` / `weights_dir=`，或设环境变量：
+
+```bash
+export WINDEXTTS_WEIGHTS_DIR=/path/to/IndexTTS-2.5
+```
+
+### 安装
+
+```bash
+pip install windextts                    # 核心（纯 torch，零 JIT 编译）
+pip install 'windextts[server]'         # HTTP API（/v1/audio/speech）
+pip install 'windextts[webui]'          # Gradio WebUI
+pip install 'windextts[quant]'          # W4A16 INT4 加速（可选）
+```
+
+### CLI
+
+```bash
+# 基础（fp16）
+windextts --ref voice.wav --text "你好世界" -o out.wav
+# 最快（INT4 量化）
+windextts --ref voice.wav --text "你好世界" -o out.wav --w4a16
+# 3GB 显卡（保持 beam3 质量，稳态 ~2.9GB）
+windextts --ref voice.wav --text "你好" -o out.wav --w4a16 --low-vram
+```
+
+### HTTP API（OpenAI 兼容）
+
+```bash
+windextts-server --w4a16 --port 8000 --voices default=voice.wav
+```
+
+```bash
+curl -s http://localhost:8000/v1/audio/speech \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"windextts","input":"你好世界","voice":"default"}' \
+    -o out.wav
+```
 
 ### WebUI（Gradio）
 
 ```bash
-# 安装 gradio（可选依赖）
-pip install -e ".[webui]"
-
-# 启动（默认 fp16 快速档，0.0.0.0:7860）
-python webui.py --model_dir /root/IndexTTS-2.5
-python webui.py --port 7860 --host 0.0.0.0  # 同上
-python webui.py --no_fp16                # 质量优先（fp32）
+# 仓库源码运行（webui.py 不在 pip 包内）
+git clone https://github.com/baicai-1145/WIndexTTS
+cd WIndexTTS && pip install -e ".[webui]"
+python webui.py --model_dir /path/to/IndexTTS-2.5    # 0.0.0.0:7860
 ```
 
-功能：参考音频上传、多语言（ZH/EN/JA/KO/YUE）、情感控制（向量/文本描述）、
-采样参数、性能调优（CFM 步数/TeaCache）、一键延迟基准。多个请求会自动排队
-（CUDA Graph 为单会话设计，并发用锁串行化）。
+功能：参考音频上传、精度运行时切换（W4A16/fp16/fp32）、低显存模式、多语言、
+情感控制（向量/文本/参考音频）、采样参数、性能调优、一键基准。
 
 ### Python API
 
-```bash
-# 用官方 venv（有 torch/torchaudio/tiktoken/safetensors）
-/root/index-tts/.venv/bin/python -c "
+```python
+import torch
 from windextts.inference import WIndexTTS
-tts = WIndexTTS(device='cuda')
-sr, wav = tts.infer('/path/to/ref.wav', '你好世界', 'ZH')
-"
 
-# benchmark（需准备 REF_AUDIO 指向的参考音频）
-/root/index-tts/.venv/bin/python scripts/benchmark_e2e.py all
+tts = WIndexTTS(weights_dir="/path/to/IndexTTS-2.5",
+                 device="cuda", dtype=torch.float16, enable_w4a16=True)
+tts.warmup()
+sr, wav = tts.infer("voice.wav", "你好世界", "ZH")
 ```
 
 ## 设计约束
