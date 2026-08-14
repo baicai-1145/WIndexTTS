@@ -283,8 +283,8 @@ with gr.Blocks(
     with gr.Tab("模型管理"):
         gr.Markdown(
             "### 安装 / 检查模型权重\n"
-            "模型来自 IndexTeam 官方发布（HuggingFace 或 ModelScope），共 ~10GB。\n"
-            "首次使用前需下载到本地目录，然后在该目录启动 webui（或用 `--model_dir` 指定）。"
+            "从 ModelScope 官方直链下载（IndexTeam/IndexTTS-2.5），共 ~7.5GB，"
+            "支持断点续传。首次使用前需下载到本地目录，然后用 `--model_dir` 指向它启动 webui。"
         )
         with gr.Row():
             with gr.Column():
@@ -292,53 +292,61 @@ with gr.Blocks(
                     label="下载目录", value=cmd_args.model_dir,
                     placeholder="/path/to/IndexTTS-2.5",
                 )
-                dl_source = gr.Radio(
-                    label="下载源", choices=["huggingface", "modelscope"],
-                    value="huggingface",
-                    info="国内网络选 modelscope 更快",
-                )
                 dl_skip_qwen = gr.Checkbox(
                     label="跳过 qwen0.6bemo4-merge（省 1.2GB，仅影响“情感文本描述”功能）",
                     value=False,
                 )
-                dl_btn = gr.Button("⬇ 下载模型 (~10GB)", variant="primary")
-                dl_status = gr.Textbox(label="下载状态", lines=3, interactive=False,
-                                       value="点击下载开始（可断点续传；完成后用下方按钮验证）")
+                dl_btn = gr.Button("⬇ 下载模型 (~7.5GB)", variant="primary")
+                dl_status = gr.Textbox(label="下载进度", lines=8, interactive=False,
+                                       value="点击下载开始（后台运行，断点续传；\n"
+                                             "进度自动刷新，也可看服务器控制台）")
+                dl_timer = gr.Timer(value=2)
             with gr.Column():
                 verify_dir = gr.Textbox(label="检查目录", value=cmd_args.model_dir)
                 verify_btn = gr.Button("✓ 检查完整性")
                 verify_status = gr.Textbox(label="检查结果", lines=6, interactive=False)
 
         import threading as _th
-        _dl_state = {"running": False}
+        _dl_state = {"running": False, "log": []}
 
-        def _do_download(out_dir, source, skip_qwen):
+        def _dl_hook(msg: str):
+            # keep the last 12 lines for the UI
+            _dl_state["log"] = (_dl_state["log"] + [msg])[-12:]
+
+        def _do_download(out_dir, skip_qwen):
             if _dl_state["running"]:
                 return
-            if not out_dir or not out_dir.strip():
-                return
             _dl_state["running"] = True
+            _dl_state["log"] = [f">> start -> {out_dir}"]
+            import windextts.download as _dl
+            _dl.progress_hooks.append(_dl_hook)
             try:
-                from windextts.download import download_model
-                download_model(out_dir.strip(), source=source, include_qwen=not skip_qwen)
-            except SystemExit as e:
-                print(f"[download] {e}")
-            except Exception as e:
+                _dl.download_model(out_dir, include_qwen=not skip_qwen)
+            except Exception:
                 import traceback
-                traceback.print_exc()
+                _dl_state["log"].append("✗ 下载失败:\n" + traceback.format_exc()[-800:])
             finally:
                 _dl_state["running"] = False
+                _dl_state["log"].append("■ 结束" + ("（可重新点击续传）" if any(
+                    "✗" in l or "failed" in l for l in _dl_state["log"]) else ""))
+                try:
+                    _dl.progress_hooks.remove(_dl_hook)
+                except ValueError:
+                    pass
 
-        def start_download(out_dir, source, skip_qwen):
+        def start_download(out_dir, skip_qwen):
             if _dl_state["running"]:
                 return "⏳ 已有下载任务进行中..."
             if not out_dir or not out_dir.strip():
                 return "❌ 请填写下载目录"
-            if not (source == "modelscope" or source == "huggingface"):
-                return "❌ 无效下载源"
-            _th.Thread(target=_do_download, args=(out_dir, source, skip_qwen), daemon=True).start()
-            return (f"⏳ 下载已后台启动 -> {out_dir.strip()}（源: {source}）\n"
-                    "进度请看服务器控制台输出；完成后点“检查完整性”验证。")
+            _th.Thread(target=_do_download, args=(out_dir.strip(), skip_qwen),
+                       daemon=True).start()
+            return f"⏳ 下载已后台启动 -> {out_dir.strip()}（ModelScope 直链）\n进度每 2 秒自动刷新..."
+
+        def refresh_dl_status():
+            if not _dl_state["log"]:
+                return "（尚未开始下载）"
+            return "\n".join(_dl_state["log"])
 
         def do_verify(d):
             if not d or not d.strip():
@@ -351,8 +359,9 @@ with gr.Blocks(
             lines.append("✅ 可以启动推理" if ok else "❌ 需补齐核心文件")
             return "\n".join(lines)
 
-        dl_btn.click(start_download, inputs=[dl_dir, dl_source, dl_skip_qwen], outputs=[dl_status])
+        dl_btn.click(start_download, inputs=[dl_dir, dl_skip_qwen], outputs=[dl_status])
         verify_btn.click(do_verify, inputs=[verify_dir], outputs=[verify_status])
+        dl_timer.tick(refresh_dl_status, outputs=[dl_status])
 
     with gr.Tab("音频生成"):
         # --- engine config: runtime precision switch (W4A16 / fp16 / fp32) ---

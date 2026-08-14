@@ -1,20 +1,22 @@
-"""Download IndexTTS-2.5 model weights from the official release.
+"""Download IndexTTS-2.5 model weights from ModelScope direct links.
 
-Sources (both are the official IndexTeam release):
-  - HuggingFace:  IndexTeam/IndexTTS-2.5   (via huggingface_hub, default)
-  - ModelScope:   IndexTeam/IndexTTS-2.5   (via modelscope, China-friendly)
+Zero SDK dependency (no modelscope / huggingface_hub packages) — plain HTTPS
+range-resumable downloads from the official IndexTeam release:
 
-Total download is ~10GB (gpt.pth 3.1G + hf_cache 5.2G + qwen0.6bemo4 1.2G +
-codec 580M + s2mel 396M + small files).
+    https://modelscope.cn/models/IndexTeam/IndexTTS-2.5/resolve/master/<path>
+
+Skips ~2.5GB of dead weight vs a full snapshot:
+  - hf_cache/w2v-bert-2.0/conformer_shaw.pt (2.2GB, fairseq leftover —
+    WIndexTTS uses model.safetensors, verified in Stage 1)
+  - hf_cache/semantic_codec* (169MB, config-only reference; not loaded)
 
 Usage (CLI):
-    windextts-download --out /path/to/IndexTTS-2.5          # HuggingFace
-    windextts-download --out /path/to/IndexTTS-2.5 --source modelscope
-    WINDEXTTS_WEIGHTS_DIR=/path windextts-download          # env-var target
+    windextts-download --out /path/to/IndexTTS-2.5
+    WINDEXTTS_WEIGHTS_DIR=/path windextts-download
+    windextts-download --check --out /path   # verify only
 
 API:
-    from windextts.download import download_model
-    download_model("/path/to/IndexTTS-2.5", source="huggingface")
+    from windextts.download import download_model, check_install
 """
 
 from __future__ import annotations
@@ -22,101 +24,157 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
-REPO_ID = "IndexTeam/IndexTTS-2.5"
+REPO = "IndexTeam/IndexTTS-2.5"
+BASE_URL = f"https://modelscope.cn/models/{REPO}/resolve/master"
 
-# Files that must exist for WIndexTTS to run. qwen0.6bemo4-merge (1.2GB) is
-# only needed for the emo_text path; everything else is required.
-CORE_FILES = [
-    "config.yaml",
-    "gpt.pth",
-    "codec.pth",
-    "s2mel.pth",
-    "multilingual_zh_ja_yue_char_del.tiktoken",
-    "wav2vec2bert_stats.pt",
-    "feat1.pt",
-    "feat2.pt",
-    "hf_cache/campplus_cn_common.bin",
-    "hf_cache/w2v-bert-2.0/model.safetensors",
-    "hf_cache/w2v-bert-2.0/config.json",
-    "hf_cache/bigvgan/config.json",
-    "hf_cache/bigvgan/bigvgan_generator.pt",
+# (repo-relative path, required). Order: small config files first so failures
+# happen fast, then the big weights.
+FILES: list[tuple[str, bool]] = [
+    ("config.yaml", True),
+    ("multilingual_zh_ja_yue_char_del.tiktoken", True),
+    ("wav2vec2bert_stats.pt", True),
+    ("feat1.pt", True),
+    ("feat2.pt", True),
+    ("hf_cache/w2v-bert-2.0/config.json", True),
+    ("hf_cache/w2v-bert-2.0/preprocessor_config.json", True),
+    ("hf_cache/bigvgan/config.json", True),
+    ("hf_cache/campplus_cn_common.bin", True),
+    ("hf_cache/bigvgan/bigvgan_generator.pt", True),
+    ("hf_cache/w2v-bert-2.0/model.safetensors", True),
+    ("codec.pth", True),
+    ("s2mel.pth", True),
+    ("gpt.pth", True),
+    # optional: emo_text path only (1.2GB)
+    ("qwen0.6bemo4-merge/config.json", False),
+    ("qwen0.6bemo4-merge/generation_config.json", False),
+    ("qwen0.6bemo4-merge/model.safetensors", False),
+    ("qwen0.6bemo4-merge/tokenizer.json", False),
+    ("qwen0.6bemo4-merge/tokenizer_config.json", False),
+    ("qwen0.6bemo4-merge/vocab.json", False),
+    ("qwen0.6bemo4-merge/merges.txt", False),
+    ("qwen0.6bemo4-merge/special_tokens_map.json", False),
+    ("qwen0.6bemo4-merge/added_tokens.json", False),
+    ("qwen0.6bemo4-merge/chat_template.jinja", False),
 ]
+
+CORE_FILES = [p for p, req in FILES if req]
+QWEN_MARKER = "qwen0.6bemo4-merge/model.safetensors"
+
+# progress callback registry (webui hooks in here)
+progress_hooks: list = []
+
+
+def _notify(msg: str) -> None:
+    print(msg, flush=True)
+    for h in progress_hooks:
+        try:
+            h(msg)
+        except Exception:
+            pass
 
 
 def check_install(model_dir: str | Path) -> tuple[bool, list[str], list[str]]:
-    """Return (complete, missing_core, missing_optional)."""
+    """Return (complete, missing_core, missing_optional_qwen)."""
     d = Path(model_dir)
     missing = [f for f in CORE_FILES if not (d / f).exists()]
-    missing_opt = [] if (d / "qwen0.6bemo4-merge").exists() else ["qwen0.6bemo4-merge/"]
+    missing_opt = [] if (d / QWEN_MARKER).exists() else ["qwen0.6bemo4-merge/"]
     return (not missing, missing, missing_opt)
+
+
+def _download_one(rel: str, out_dir: Path, retries: int = 3) -> None:
+    """Range-resumable single-file download with size verification."""
+    url = f"{BASE_URL}/{rel}"
+    dest = out_dir / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    for attempt in range(1, retries + 1):
+        try:
+            pos = dest.stat().st_size if dest.exists() else 0
+            req = urllib.request.Request(url)
+            if pos:
+                req.add_header("Range", f"bytes={pos}-")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                total = int(r.headers.get("Content-Length", 0)) + pos
+                if r.status == 200 and pos:
+                    # server ignored Range — restart
+                    pos = 0
+                    total = int(r.headers.get("Content-Length", 0))
+                mode = "ab" if pos else "wb"
+                done = pos
+                t0 = time.time()
+                with open(dest, mode) as f:
+                    while True:
+                        chunk = r.read(1 << 20)  # 1MB
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total and (done % (64 << 20) < (1 << 20)):  # every ~64MB
+                            speed = (done - pos) / max(time.time() - t0, 1e-6) / 1e6
+                            _notify(f"  {rel}: {done / 1e9:.2f}/{total / 1e9:.2f}GB "
+                                    f"({speed:.1f}MB/s)")
+            if total and done != total:
+                raise IOError(f"size mismatch: {done} != {total}")
+            gb = done / 1e9
+            _notify(f"  ✓ {rel}" + (f" ({gb:.2f}GB)" if gb > 0.1 else ""))
+            return
+        except Exception as e:  # noqa: BLE001 — retry any network error
+            if attempt == retries:
+                raise
+            _notify(f"  retry {attempt}/{retries} {rel}: {e}")
+            time.sleep(2 * attempt)
 
 
 def download_model(
     out_dir: str | Path,
-    source: str = "huggingface",
     include_qwen: bool = True,
+    only_missing: bool = True,
 ) -> Path:
-    """Download the full IndexTTS-2.5 release into out_dir.
-
-    source: "huggingface" (huggingface_hub) or "modelscope".
-    include_qwen: skip the 1.2GB qwen0.6bemo4-merge dir (only needed for
-        emo_text; pass False to save bandwidth).
-    Resume: both backends continue partial downloads by default.
-    """
+    """Download the release into out_dir. Resumable; skips present files."""
     out_dir = Path(out_dir).expanduser().absolute()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if source == "huggingface":
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError as e:
-            raise SystemExit(
-                "huggingface_hub not installed: pip install -U 'huggingface_hub[cli]'"
-            ) from e
-        print(f">> Downloading {REPO_ID} from HuggingFace -> {out_dir}")
-        snapshot_download(
-            repo_id=REPO_ID,
-            local_dir=str(out_dir),
-            # skip qwen if not wanted: HF patterns are regex on repo-relative paths
-            ignore_patterns=["qwen0.6bemo4-merge/*"] if not include_qwen else None,
-            max_workers=4,
-        )
-    elif source == "modelscope":
-        try:
-            from modelscope import snapshot_download
-        except ImportError as e:
-            raise SystemExit("modelscope not installed: pip install modelscope") from e
-        print(f">> Downloading {REPO_ID} from ModelScope -> {out_dir}")
-        snapshot_download(f"{REPO_ID}", local_dir=str(out_dir))
-        # modelscope has no ignore patterns; remove qwen if not wanted
-        if not include_qwen and (out_dir / "qwen0.6bemo4-merge").exists():
-            import shutil
-            shutil.rmtree(out_dir / "qwen0.6bemo4-merge")
-    else:
-        raise SystemExit(f"unknown source '{source}' (huggingface | modelscope)")
+    todo = []
+    for rel, req in FILES:
+        if not req and not include_qwen:
+            continue
+        if only_missing and (out_dir / rel).exists() and (out_dir / rel).stat().st_size > 0:
+            continue
+        todo.append(rel)
+    total_n = len(todo)
+    if not todo:
+        _notify(f">> All files present: {out_dir}")
+        return out_dir
+    _notify(f">> Downloading {total_n} file(s) -> {out_dir}")
+    for i, rel in enumerate(todo, 1):
+        _notify(f"[{i}/{total_n}]")
+        _download_one(rel, out_dir)
 
     ok, missing, _ = check_install(out_dir)
     if missing:
-        print(f"!! download finished but core files still missing: {missing}", file=sys.stderr)
+        _notify(f"!! core files still missing: {missing}")
     else:
-        print(f">> Model ready: {out_dir}")
-        print(f"   export WINDEXTTS_WEIGHTS_DIR={out_dir}")
+        _notify(f">> Model ready: {out_dir}")
+        _notify(f"   export WINDEXTTS_WEIGHTS_DIR={out_dir}")
     return out_dir
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="windextts-download",
-        description="Download IndexTTS-2.5 weights (~10GB) for WIndexTTS.",
+        description="Download IndexTTS-2.5 weights (~7.5GB) from ModelScope "
+                    "direct links (no SDK needed; resumable).",
     )
     p.add_argument("--out", default=None,
                    help="target directory (default: $WINDEXTTS_WEIGHTS_DIR)")
-    p.add_argument("--source", default="huggingface", choices=["huggingface", "modelscope"],
-                   help="download backend (default huggingface; modelscope is faster in China)")
     p.add_argument("--skip-qwen", action="store_true",
                    help="skip qwen0.6bemo4-merge (1.2GB; only needed for emo_text)")
+    p.add_argument("--force", action="store_true",
+                   help="re-download even if files exist")
     p.add_argument("--check", action="store_true",
                    help="only verify an existing directory, no download")
     args = p.parse_args(argv)
@@ -133,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  optional:      {'OK' if not missing_opt else 'missing (emo_text disabled): ' + str(missing_opt)}")
         return 0 if ok else 1
 
-    download_model(out, source=args.source, include_qwen=not args.skip_qwen)
+    download_model(out, include_qwen=not args.skip_qwen, only_missing=not args.force)
     return 0
 
 

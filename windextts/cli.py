@@ -1,9 +1,8 @@
 """WIndexTTS CLI — synthesize speech from the command line.
 
 Usage:
-    # install model weights first (~10GB, one time)
+    # install model weights first (~7.5GB, one time, resumable)
     windextts --install-model --model-dir /path/to/IndexTTS-2.5
-    windextts --install-model --model-dir ... --source modelscope  # China
 
     # basic (fp16, GPU)
     windextts --ref ref.wav --text "你好世界" -o out.wav
@@ -86,13 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--verbose", action="store_true", help="print per-run timing + VRAM")
 
-    # model install (download weights without synthesizing)
+    # model install (download weights without synthesizing) — ModelScope direct
+    # links, no SDK dependency, resumable
     p.add_argument("--install-model", action="store_true",
                    help="download model weights to --model-dir (or WINDEXTTS_WEIGHTS_DIR) "
-                        "and exit; ~10GB. Combine with --source and --skip-qwen.")
-    p.add_argument("--source", default="huggingface", choices=["huggingface", "modelscope"],
-                   help="download backend for --install-model (default huggingface; "
-                        "modelscope is faster in China)")
+                        "and exit; ~7.5GB from ModelScope direct links. Resumable. "
+                        "Combine with --skip-qwen.")
     p.add_argument("--skip-qwen", action="store_true",
                    help="with --install-model: skip qwen0.6bemo4-merge (1.2GB, only "
                         "needed for emo_text)")
@@ -110,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             print("error: --install-model needs --model-dir or WINDEXTTS_WEIGHTS_DIR",
                   file=sys.stderr)
             return 2
-        download_model(target, source=args.source, include_qwen=not args.skip_qwen)
+        download_model(target, include_qwen=not args.skip_qwen)
         return 0
 
     # --- text source ---
