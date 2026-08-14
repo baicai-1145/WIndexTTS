@@ -12,3 +12,6 @@ __pycache__/
 /out/
 # pi agent session artifacts (local-only)
 .pi/
+# local-only docs (not for remote)
+AGENTS.md
+docs/
