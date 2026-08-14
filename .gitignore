@@ -10,3 +10,5 @@ __pycache__/
 # never commit temp test tensors / dumps
 /dumps/
 /out/
+# pi agent session artifacts (local-only)
+.pi/
