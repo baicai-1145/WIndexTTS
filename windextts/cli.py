@@ -1,6 +1,10 @@
 """WIndexTTS CLI — synthesize speech from the command line.
 
 Usage:
+    # install model weights first (~10GB, one time)
+    windextts --install-model --model-dir /path/to/IndexTTS-2.5
+    windextts --install-model --model-dir ... --source modelscope  # China
+
     # basic (fp16, GPU)
     windextts --ref ref.wav --text "你好世界" -o out.wav
 
@@ -21,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -80,11 +85,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="max text tokens per segment (long texts auto-split)")
 
     p.add_argument("--verbose", action="store_true", help="print per-run timing + VRAM")
+
+    # model install (download weights without synthesizing)
+    p.add_argument("--install-model", action="store_true",
+                   help="download model weights to --model-dir (or WINDEXTTS_WEIGHTS_DIR) "
+                        "and exit; ~10GB. Combine with --source and --skip-qwen.")
+    p.add_argument("--source", default="huggingface", choices=["huggingface", "modelscope"],
+                   help="download backend for --install-model (default huggingface; "
+                        "modelscope is faster in China)")
+    p.add_argument("--skip-qwen", action="store_true",
+                   help="with --install-model: skip qwen0.6bemo4-merge (1.2GB, only "
+                        "needed for emo_text)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # --- model install mode ---
+    if args.install_model:
+        from windextts.download import download_model
+        target = args.model_dir or os.environ.get("WINDEXTTS_WEIGHTS_DIR")
+        if not target:
+            print("error: --install-model needs --model-dir or WINDEXTTS_WEIGHTS_DIR",
+                  file=sys.stderr)
+            return 2
+        download_model(target, source=args.source, include_qwen=not args.skip_qwen)
+        return 0
 
     # --- text source ---
     if args.text_file:

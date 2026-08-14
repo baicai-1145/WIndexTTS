@@ -33,6 +33,7 @@ import torchaudio
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from windextts.inference import WIndexTTS
+from windextts.download import check_install
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -277,6 +278,81 @@ with gr.Blocks(
         "# WIndexTTS — 纯 torch 加速 IndexTTS-2.5\n"
         "Windows 友好 · 零 JIT 编译 · `pip install` 即用"
     )
+
+    # --- model management tab: download / verify weights ---
+    with gr.Tab("模型管理"):
+        gr.Markdown(
+            "### 安装 / 检查模型权重\n"
+            "模型来自 IndexTeam 官方发布（HuggingFace 或 ModelScope），共 ~10GB。\n"
+            "首次使用前需下载到本地目录，然后在该目录启动 webui（或用 `--model_dir` 指定）。"
+        )
+        with gr.Row():
+            with gr.Column():
+                dl_dir = gr.Textbox(
+                    label="下载目录", value=cmd_args.model_dir,
+                    placeholder="/path/to/IndexTTS-2.5",
+                )
+                dl_source = gr.Radio(
+                    label="下载源", choices=["huggingface", "modelscope"],
+                    value="huggingface",
+                    info="国内网络选 modelscope 更快",
+                )
+                dl_skip_qwen = gr.Checkbox(
+                    label="跳过 qwen0.6bemo4-merge（省 1.2GB，仅影响“情感文本描述”功能）",
+                    value=False,
+                )
+                dl_btn = gr.Button("⬇ 下载模型 (~10GB)", variant="primary")
+                dl_status = gr.Textbox(label="下载状态", lines=3, interactive=False,
+                                       value="点击下载开始（可断点续传；完成后用下方按钮验证）")
+            with gr.Column():
+                verify_dir = gr.Textbox(label="检查目录", value=cmd_args.model_dir)
+                verify_btn = gr.Button("✓ 检查完整性")
+                verify_status = gr.Textbox(label="检查结果", lines=6, interactive=False)
+
+        import threading as _th
+        _dl_state = {"running": False}
+
+        def _do_download(out_dir, source, skip_qwen):
+            if _dl_state["running"]:
+                return
+            if not out_dir or not out_dir.strip():
+                return
+            _dl_state["running"] = True
+            try:
+                from windextts.download import download_model
+                download_model(out_dir.strip(), source=source, include_qwen=not skip_qwen)
+            except SystemExit as e:
+                print(f"[download] {e}")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+            finally:
+                _dl_state["running"] = False
+
+        def start_download(out_dir, source, skip_qwen):
+            if _dl_state["running"]:
+                return "⏳ 已有下载任务进行中..."
+            if not out_dir or not out_dir.strip():
+                return "❌ 请填写下载目录"
+            if not (source == "modelscope" or source == "huggingface"):
+                return "❌ 无效下载源"
+            _th.Thread(target=_do_download, args=(out_dir, source, skip_qwen), daemon=True).start()
+            return (f"⏳ 下载已后台启动 -> {out_dir.strip()}（源: {source}）\n"
+                    "进度请看服务器控制台输出；完成后点“检查完整性”验证。")
+
+        def do_verify(d):
+            if not d or not d.strip():
+                return "❌ 请填写目录"
+            ok, missing, missing_opt = check_install(d.strip())
+            lines = [f"目录: {d.strip()}"]
+            lines.append(f"核心文件: {'✓ 完整' if not missing else '✗ 缺失 ' + str(missing)}")
+            opt = "✓ 已安装" if not missing_opt else "- 未安装 (仅影响情感文本描述)"
+            lines.append(f"可选 (emo_text): {opt}")
+            lines.append("✅ 可以启动推理" if ok else "❌ 需补齐核心文件")
+            return "\n".join(lines)
+
+        dl_btn.click(start_download, inputs=[dl_dir, dl_source, dl_skip_qwen], outputs=[dl_status])
+        verify_btn.click(do_verify, inputs=[verify_dir], outputs=[verify_status])
 
     with gr.Tab("音频生成"):
         # --- engine config: runtime precision switch (W4A16 / fp16 / fp32) ---
