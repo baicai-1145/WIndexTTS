@@ -15,3 +15,7 @@ __pycache__/
 # local-only docs (not for remote)
 AGENTS.md
 docs/
+dist/
+*.egg-info/
+build/
+

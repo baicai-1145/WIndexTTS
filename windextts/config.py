@@ -11,6 +11,8 @@ are collected in :class:`RuntimeConstants` so they are also centralized.
 """
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -316,7 +318,7 @@ class Config:
         )
 
 
-DEFAULT_CONFIG_PATH = "/root/IndexTTS-2.5/config.yaml"
+DEFAULT_CONFIG_PATH = os.environ.get("WINDEXTTS_WEIGHTS_DIR", "/root/IndexTTS-2.5") + "/config.yaml"
 
 
 def load_default_config() -> Config:

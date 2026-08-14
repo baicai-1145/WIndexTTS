@@ -23,13 +23,16 @@ We never import ``transformers`` / ``modelscope``. Everything is plain
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import torch
 
-# Default weights root (data disk, per AGENTS.md).
-DEFAULT_WEIGHTS_DIR = Path("/root/IndexTTS-2.5")
+# Default weights root: WINDEXTTS_WEIGHTS_DIR env var wins, else the repo's
+# canonical data-disk path. Users who installed via pip pass weights_dir=
+# explicitly (or set the env var).
+DEFAULT_WEIGHTS_DIR = Path(os.environ.get("WINDEXTTS_WEIGHTS_DIR", "/root/IndexTTS-2.5"))
 
 
 class WeightLoader:

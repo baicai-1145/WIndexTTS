@@ -34,7 +34,11 @@ _FMAX = None  # config "None" string -> None
 _CENTER = False
 _CLAP = 1e-5
 
-_CACHE_DEFAULT = Path("/root/windextts_dumps/frontend.mel_basis.pt")
+# HiFiGAN mel basis (librosa slaney params, verified bit-identical to the
+# official indextts cached basis). Ships as package data (166KB) so no
+# librosa/indextts is needed at runtime.
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_CACHE_DEFAULT = _DATA_DIR / "mel_basis_hifigan.pt"
 
 
 class MelSpectrogram:

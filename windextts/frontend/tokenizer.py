@@ -227,14 +227,19 @@ def _load_ranks(vocab_path: str | Path) -> dict[bytes, int]:
 def build_tokenizer(
     name: str = "multilingual_zh_ja_yue_char_del",
     num_languages: int = 99,
-    model_dir: str = "/root/IndexTTS-2.5",
+    model_dir: str | None = None,
 ) -> tiktoken.Encoding:
     """Build the tiktoken Encoding identical to official get_encoding.
 
     Mirrors indextts/utils/tokenizer.py get_encoding() exactly:
     ranks + specials in official order -> tiktoken.Encoding(name, explicit_n_vocab,
     pat_str, mergeable_ranks, special_tokens).
+
+    model_dir defaults to the WINDEXTTS_WEIGHTS_DIR env var (or the dev-box
+    canonical path); pass explicitly or set the env var.
     """
+    if model_dir is None:
+        model_dir = os.environ.get("WINDEXTTS_WEIGHTS_DIR", "/root/IndexTTS-2.5")
     vocab_path = os.path.join(model_dir, f"{name}.tiktoken")
     ranks = _load_ranks(vocab_path)
     n_vocab = len(ranks)

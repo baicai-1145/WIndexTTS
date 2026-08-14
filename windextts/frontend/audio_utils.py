@@ -42,9 +42,12 @@ _MEL_FLOOR = 1.192092955078125e-07
 _STRIDE = 2
 _NORM_EPS = 1e-7
 
-# Cached frontend constants (mel_filters + povey window). Generated once from the
-# official SeamlessM4TFeatureExtractor (see build_frontend_cache below).
-_FRONTEND_CACHE_DEFAULT = Path("/root/windextts_dumps/frontend_cache.npz")
+# Cached frontend constants (mel_filters + povey window), generated once from the
+# official SeamlessM4TFeatureExtractor. The fairseq-derived filterbank has
+# non-standard parameters, so the constants ship as package data (168KB) —
+# no transformers dependency and no local dump needed at runtime.
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_FRONTEND_CACHE_DEFAULT = _DATA_DIR / "seamless_frontend.npz"
 
 
 def _povey_window(n: int) -> torch.Tensor:

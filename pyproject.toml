@@ -6,9 +6,25 @@ build-backend = "setuptools.build_meta"
 name = "windextts"
 version = "0.1.0"
 description = "Windows-priority, zero-JIT-compile, pure-torch accelerated inference for IndexTTS-2.5"
-requires-python = ">=3.10"
 readme = "README.md"
 license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "baicai-1145" }]
+keywords = ["tts", "text-to-speech", "index-tts", "voice-cloning", "pytorch", "cuda-graph"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # 极简依赖：核心推理零 JIT 编译依赖。
 # transformers / modelscope / librosa 禁止引入；flash_attn 不进核心推理路径。
@@ -26,6 +42,11 @@ dependencies = [
     "scipy>=1.10",   # BigVGAN 滤波器组可能需要；非神经路径
 ]
 
+[project.urls]
+Homepage = "https://github.com/baicai-1145/WIndexTTS"
+Repository = "https://github.com/baicai-1145/WIndexTTS"
+Issues = "https://github.com/baicai-1145/WIndexTTS/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-xdist"]
 webui = ["gradio>=4.0"]
@@ -38,6 +59,9 @@ windextts-server = "windextts.server:main"
 
 [tool.setuptools.packages.find]
 include = ["windextts*"]
+
+[tool.setuptools.package-data]
+windextts = ["data/*.pt", "data/*.npz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
