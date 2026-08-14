@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "windextts"
-version = "0.1.0"
+version = "0.1.1"
 description = "Windows-priority, zero-JIT-compile, pure-torch accelerated inference for IndexTTS-2.5"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -31,11 +31,12 @@ classifiers = [
 dependencies = [
     "torch>=2.4",
     "torchaudio>=2.4",
+    "torchcodec>=0.1",  # torchaudio>=2.9 default audio backend (load/save)
     "safetensors>=0.4",
     "tiktoken>=0.7",
     "jieba>=0.42",
     "cn2an>=0.5",
-    "wetext>=0.1.2",
+    "WeTextProcessing>=1.0",   # provides the `tn` text-normalizer package (pynini-based)
     "soundfile>=0.12",
     "numpy>=1.24",
     "pyyaml>=6.0",
