@@ -29,6 +29,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-xdist"]
 webui = ["gradio>=4.0"]
+quant = ["torchao>=0.5"]  # W4A16 INT4 GPT quantization (optional accelerator)
+
+[project.scripts]
+windextts = "windextts.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["windextts*"]
