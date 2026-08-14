@@ -57,11 +57,16 @@ class WIndexTTS:
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
         enable_w4a16: bool = False,
+        enable_emo_ref: bool = True,
+        low_vram: bool = False,
     ) -> None:
         self.cfg = cfg or load_default_config()
         self.device = device
         self.dtype = dtype
         self.enable_w4a16 = enable_w4a16  # W4A16 INT4 weight quantization (GPT only)
+        self.low_vram = low_vram  # skip beam3 graph capture + lazy emo_conditioning
+        # emo_ref_audio path (0.48GB); skipped at init in low_vram, lazy-loaded later
+        self.enable_emo_ref = enable_emo_ref and not low_vram
         from windextts.weights import DEFAULT_WEIGHTS_DIR
         self.weights = WeightLoader(weights_dir or DEFAULT_WEIGHTS_DIR)
 
@@ -115,9 +120,9 @@ class WIndexTTS:
 
         # GPT-AR (UnifiedVoice)
         self.gpt = UnifiedVoice().to(dev)
-        # Build + load emo_conditioning (160M) for the emo_ref_audio path.
-        # This adds ~1.2GB to the GPT footprint but enables reference-audio
-        # emotion extraction (official emo_audio_prompt feature).
+        # emo_conditioning (160M) is needed on EVERY path (even calm default
+        # mixes conformer emovec_audio), so it stays loaded. low_vram only skips
+        # the beam3 graph capture; emo_ref lazy-load is not possible.
         self.gpt.build_emo_conditioning()
         self.gpt.emo_conditioning_encoder = self.gpt.emo_conditioning_encoder.to(dev)
         self.gpt.emo_perceiver_encoder = self.gpt.emo_perceiver_encoder.to(dev)
@@ -300,13 +305,16 @@ class WIndexTTS:
                 stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
             )
             # also pre-capture the beam-search graph (default production path:
-            # num_beams=3 → static batch K=3 CUDA Graph)
-            self.gpt.generate(
-                conds, tt, lang, max_new_tokens=720, do_sample=True,
-                top_k=30, top_p=0.8, temperature=0.8,
-                stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
-                repetition_penalty=10.0, num_beams=3,
-            )
+            # num_beams=3 → static batch K=3 CUDA Graph). Skipped in low_vram
+            # mode (saves the beam3 KV buffer + runtime activations ~0.6GB);
+            # beam search then runs eagerly on first use and captures then.
+            if not self.low_vram:
+                self.gpt.generate(
+                    conds, tt, lang, max_new_tokens=720, do_sample=True,
+                    top_k=30, top_p=0.8, temperature=0.8,
+                    stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
+                    repetition_penalty=10.0, num_beams=3,
+                )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
             self.s2mel.cfm.estimator.enable_teacache(thresh=0.25)
             mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=12)
@@ -354,14 +362,28 @@ class WIndexTTS:
 
     @torch.no_grad()
     def extract_spk_cond(self, audio_16k: torch.Tensor) -> torch.Tensor:
-        """w2v-bert hidden_states[17] normalized → [B, T, 1024]."""
+        """w2v-bert hidden_states[17] normalized → [B, T, 1024].
+
+        In low_vram mode the w2v-bert weights live on CPU between calls and are
+        streamed to GPU only while a reference audio needs encoding (~0.5s for
+        the 1.16GB fp16 copy over PCIe). Same-ref synthesis hits _ref_cache and
+        never touches w2v at all.
+        """
+        if self.low_vram and next(self.w2v_bert.parameters()).device.type == "cpu":
+            self.w2v_bert.to(self.device)  # stream back for this prefill
         inp = self.featurizer(audio_16k.to(self.device))
         am = torch.ones(inp.shape[:2], dtype=torch.int32, device=self.device)
         # match w2v-bert weight dtype (fp16 on the fast path) to avoid mixed-dtype
         # errors in the first feature_projection LayerNorm.
         wb_dtype = self.w2v_bert.feature_projection.layer_norm.weight.dtype
         feat = self.w2v_bert(inp.to(wb_dtype), am, return_layer=17)
-        return (feat - self.w2v_mean) / self.w2v_std
+        out = (feat - self.w2v_mean) / self.w2v_std
+        if self.low_vram:
+            # free the 1.16GB w2v weights immediately; streamed back on the
+            # next different-reference synthesis (same-ref hits _ref_cache)
+            self.w2v_bert.to("cpu")
+            torch.cuda.empty_cache()
+        return out
 
     @torch.no_grad()
     def extract_style(self, audio_16k: torch.Tensor) -> torch.Tensor:
@@ -610,6 +632,10 @@ class WIndexTTS:
     ) -> tuple[int, torch.Tensor]:
         """Synthesize a single (already normalized, short) text segment."""
         dev = self.device
+        if self.low_vram and num_beams > 1:
+            # beam-K graph buffer + runtime activations would blow the budget;
+            # greedy on the captured single-sequence graph instead
+            num_beams = 1
         # --- ref audio features (cached by path+mtime; stage 5 overlap/cache) ---
         import os
         cache_key = None
