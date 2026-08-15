@@ -100,8 +100,12 @@ class WIndexTTS:
         self.w2v_bert.load_official(w.load_w2v_bert())
         self.w2v_bert.eval()
         mean, var = w.load_w2v_stats()
+        # official (infer_v2_5.py:179): std = sqrt(var). The stats file stores
+        # VARIANCE — using it directly as std shrinks the normalization scale
+        # by ~3x, which scaled every w2v feature and shifted all downstream
+        # conds (spk_cond_emb, conds_latent) away from official.
         self.w2v_mean = mean.to(dev)
-        self.w2v_std = var.to(dev)
+        self.w2v_std = torch.sqrt(var).to(dev)
 
         # CAMPPlus
         self.campplus = CAMPPlus(feat_dim=80, embedding_size=192).to(dev)
@@ -165,6 +169,11 @@ class WIndexTTS:
         # the flattened weight goes along with the cast.
 
         print(f">> WIndexTTS loaded all modules on {dev}")
+        # S2Mel CUDA Graph also for fp32: verified bit-identical to the eager
+        # full-step path (same seed/codes -> HF ratio equal to 6 decimals) and
+        # faster than eager; eager+TeaCache was the quality-artifact path.
+        self.s2mel_use_graph = True
+
         # apply per-module precision overrides (mixed-precision fast paths)
         # All three modules run fp16 — verified stable (0/30 brick in stress
         # test across multiple texts/seeds) with CUDA Graph enabled.
@@ -379,8 +388,12 @@ class WIndexTTS:
         """
         if self.low_vram and next(self.w2v_bert.parameters()).device.type == "cpu":
             self.w2v_bert.to(self.device)  # stream back for this prefill
-        inp = self.featurizer(audio_16k.to(self.device))
-        am = torch.ones(inp.shape[:2], dtype=torch.int32, device=self.device)
+        inp, am = self.featurizer(audio_16k.to(self.device), return_mask=True)
+        # am: official semantics — stacked tail frame containing a padded row
+        # gets mask 0 (transformers indices % stride == 1 rule). Passing the
+        # correct mask matters: w2v-bert's masked positions alter the conformer
+        # attention and hence hidden_states[17] for EVERY frame (observed
+        # maxdiff ~11 with all-ones mask vs official).
         # match w2v-bert weight dtype (fp16 on the fast path) to avoid mixed-dtype
         # errors in the first feature_projection LayerNorm.
         wb_dtype = self.w2v_bert.feature_projection.layer_norm.weight.dtype
@@ -447,23 +460,29 @@ class WIndexTTS:
     ) -> torch.Tensor:
         """Unified emo_vec [1,1280] assembly covering all three control modes.
 
-        Mirrors infer_v2_5.py:672-778 priority: emo_ref_path (conformer) >
-        emo_vector (matrix) > calm default.
+        Mirrors infer_v2_5.py:757-768: the conformer path ALWAYS runs first
+        (emovec = merge_emovec(spk_cond, emo_cond_emb, alpha), where emo_cond_emb
+        defaults to the spk reference's own w2v features); the matrix lookup is
+        only MIXED IN when the user explicitly passes emo_vector.
 
-        - emo_ref_path given: emovec_audio = merge_emovec(spk, emo_ref, alpha)
-          via the 160M conformer. If emo_vector also given, add the matrix
-          correction: emovec_mat + (1-sum(w))*emovec_audio (official line 764).
-          Otherwise emovec_audio alone is the final emo_vec.
-        - emo_ref_path None: pure matrix path (build_emo_vec).
+        - emo_ref_path given: emo_cond from that audio's w2v features.
+        - else: emo_cond = spk_cond (official uses the spk reference as the
+          emotion reference by default — infer_v2_5.py:692 with
+          emo_audio_prompt=spk_audio_prompt).
+        - emo_vector given: emovec = emovec_mat + (1-sum(w)) * emovec_conformer.
+        - emo_vector None: emovec = emovec_conformer (pure conformer, official
+          default; previously we fell back to a calm matrix lookup, which
+          diverged from official conds_latent and shifted the whole GPT
+          trajectory).
         """
+        # --- conformer path: ALWAYS runs (official default) ---
         if emo_ref_path is None:
-            return self.build_emo_vec(style, spk_cond, emo_vector)
-
-        # --- conformer path: extract emo_cond_emb from the reference audio ---
-        import torchaudio as _ta
-        emo_audio, emo_sr = self._load_audio(emo_ref_path, REF_MAX_SECONDS)
-        emo_16k = _ta.transforms.Resample(emo_sr, REF_SR_W2V)(emo_audio)
-        emo_cond = self.extract_spk_cond(emo_16k)  # [1,T,1024]
+            emo_cond = spk_cond  # official: spk reference doubles as emo reference
+        else:
+            import torchaudio as _ta
+            emo_audio, emo_sr = self._load_audio(emo_ref_path, REF_MAX_SECONDS)
+            emo_16k = _ta.transforms.Resample(emo_sr, REF_SR_W2V)(emo_audio)
+            emo_cond = self.extract_spk_cond(emo_16k)  # [1,T,1024]
 
         # cast to GPT dtype (conformer runs in fp16 on the fast path)
         gpt_dtype = self.gpt.emovec_layer.weight.dtype
@@ -506,9 +525,9 @@ class WIndexTTS:
         top_k: int = 30,
         temperature: float = 0.8,
         max_mel_tokens: int | None = None,
-        cfm_steps: int = 12,
+        cfm_steps: int = 15,
         cfg_rate: float = 0.7,
-        teacache_thresh: float = 0.25,
+        teacache_thresh: float = 0.0,
         text_normalization: bool = True,
         max_text_tokens_per_segment: int = 120,
         interval_silence_ms: int = 200,
@@ -715,9 +734,14 @@ class WIndexTTS:
         s_infer = self.codec.decode(codes)  # [1, 2*T, 1024]
 
         # --- S2Mel-CFM → mel (TeaCache: skip redundant DiT steps) ---
+        # Explicit enable/disable per call — the old lazy check left
+        # teacache_enabled sticky after a prior enable, so thresh=0 requests
+        # silently kept skipping steps (HF-energy artifacts).
         est = self.s2mel.cfm.estimator
-        if teacache_thresh > 0 and not getattr(est, "teacache_enabled", False):
+        if teacache_thresh > 0:
             est.enable_teacache(thresh=teacache_thresh)
+        elif getattr(est, "teacache_enabled", False):
+            est.disable_teacache()
         mel = self.s2mel.inference(
             spk_cond, s_infer, ref_mel, style,
             duration_factor=duration_factor, n_timesteps=cfm_steps,
@@ -732,6 +756,91 @@ class WIndexTTS:
         audio_out = self.bigvgan(mel.to(bg_dtype))  # [1, 1, T_audio]
         audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
         return OUTPUT_SR, audio_out
+
+    def infer_from_codes(
+        self,
+        spk_audio_prompt: str,
+        text: str,
+        lang: str,
+        codes: torch.Tensor,
+        cfm_steps: int = 15,
+        cfg_rate: float = 0.7,
+        teacache_thresh: float = 0.0,
+        duration_factor: float = 1.0,
+        use_graph: bool | None = None,
+    ) -> tuple[int, torch.Tensor]:
+        """Synthesize audio from externally supplied GPT mel codes.
+
+        Diagnostic seam: skips win GPT decode entirely (codes come from
+        outside — e.g. official IndexTTS), then runs the win downstream
+        (codec.decode → S2Mel-CFM → BigVGAN). Used for A/B isolation of the
+        GPT stage from the rest of the pipeline.
+
+        Args:
+            codes: [1, T] or [T] int tensor, WITHOUT the stop token
+                (stop token, if present at the end, is stripped).
+        Returns:
+            (sample_rate, audio [samples,])
+        """
+        dev = self.device
+        if codes.dim() == 1:
+            codes = codes.unsqueeze(0)
+        codes = codes.to(dev).long()
+        if codes[0, -1].item() == self.cfg.gpt.stop_mel_token:
+            codes = codes[:, :-1]
+
+        with torch.no_grad():
+            # --- ref audio features (same path as _infer_single) ---
+            import os
+        cache_key = None
+        try:
+            cache_key = (spk_audio_prompt, os.path.getmtime(spk_audio_prompt))
+        except OSError:
+            pass
+        with torch.no_grad():
+            cached = self._ref_cache.get(cache_key) if cache_key else None
+            if cached is None:
+                audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
+                a16 = torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)
+                a22 = torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(dev).float()
+                spk_cond = self.extract_spk_cond(a16)
+                style = self.extract_style(a16)
+                ref_mel = self.mel_fn(a22)
+                if cache_key is not None:
+                    self._ref_cache[cache_key] = (spk_cond, style, ref_mel)
+            else:
+                spk_cond, style, ref_mel = cached
+
+            # --- text tokens (needed for spk conditioning path consistency) ---
+            lang_prefix = f"<|{lang.lower()}|> "
+            toks = self.tokenizer.encode(lang_prefix + text, allowed_special="all")
+            text_tokens = torch.IntTensor(toks).unsqueeze(0).to(dev)
+            text_tokens = F.pad(text_tokens, (0, 1), value=1)  # stop_text
+            emo_vec = self.build_emo_vec_full(style, spk_cond, None, None, 1.0)
+            conds_latent = self.gpt.build_conds_latent(style, emo_vec)
+
+            # --- codec.decode → S_infer ---
+            s_infer = self.codec.decode(codes)  # [1, 2*T, 256]
+
+            # --- S2Mel-CFM → mel (explicit teacache toggle, see _infer_single) ---
+            est = self.s2mel.cfm.estimator
+            if teacache_thresh > 0:
+                est.enable_teacache(thresh=teacache_thresh)
+            elif getattr(est, "teacache_enabled", False):
+                est.disable_teacache()
+            mel = self.s2mel.inference(
+                spk_cond, s_infer, ref_mel, style,
+                duration_factor=duration_factor, n_timesteps=cfm_steps,
+                inference_cfg_rate=cfg_rate,
+                use_graph=(getattr(self, "s2mel_use_graph", False)
+                           if use_graph is None else use_graph),
+            )
+
+            # --- BigVGAN → audio ---
+            bg_dtype = next(self.bigvgan.parameters()).dtype
+            audio_out = self.bigvgan(mel.to(bg_dtype))
+            audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
+            return OUTPUT_SR, audio_out
 
 if __name__ == "__main__":
     # smoke: end-to-end inference (requires GPT AR generate to be implemented)

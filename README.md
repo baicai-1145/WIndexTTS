@@ -62,7 +62,7 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 
 ```
 GPT-AR beam3 (CUDA Graph 静态 batch K=3)          ~490ms  ~62%  ← eager beam3 1464ms → 3.0x
-S2Mel-CFM (CUDA Graph, 12步；graph 与 TeaCache 互斥)  ~137ms  ~17%  ← fp16 DiT + graph（R12/R13）
+S2Mel-CFM (CUDA Graph, 15步；graph 与 TeaCache 互斥)  ~165ms  ~17%  ← fp16 DiT + graph（TeaCache 经校准+听感验证不可用，默认禁用）
 BigVGAN (fp16 + remove_weight_norm)                ~59ms   ~8%
 codec + 前端 + Python 设置                          ~25ms   ~3%
 ─────────────────────────────────────────────────────────
@@ -108,8 +108,8 @@ tts = WIndexTTS(weights_dir=..., device="cuda", dtype=torch.float16,  # fp16 最
 tts.warmup()  # 预捕获 CUDA Graph，把 ~1s 冷启动成本移出首请求
 tts.infer(ref, text, 'ZH',
     num_beams=3,          # 默认官方质量档；1 = greedy 极速（最快）
-    cfm_steps=12,         # CFM 欧拉步（25=最高质量，10=最快）
-    teacache_thresh=0.25, # 0=禁用，0.4=更激进跳步
+    cfm_steps=15,         # CFM 欧拉步（15=听感无损下限；12=极速，音节末尾呼吸处轻微变差；25=最高）
+    teacache_thresh=0.0,  # 0=禁用（默认，听感验证结论：任何有效跳步率均可感知劣化；graph 全量步已是最优）
     cfg_rate=0.7,         # CFG 强度（0.3=快10%，0.0=最快无引导）
 )
 ```

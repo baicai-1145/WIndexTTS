@@ -463,8 +463,8 @@ with gr.Blocks(
                 "- **TeaCache 阈值**：DiT 跳步缓存阈值，越高越快（0=禁用，默认 0.25）\n"
             )
             with gr.Row():
-                cfm_steps = gr.Slider(label="CFM 步数", minimum=6, maximum=25, value=12, step=1)
-                teacache_thresh = gr.Slider(label="TeaCache 阈值", minimum=0.0, maximum=0.5, value=0.25, step=0.05)
+                cfm_steps = gr.Slider(label="CFM 步数", minimum=6, maximum=25, value=15, step=1)
+                teacache_thresh = gr.Slider(label="TeaCache 阈值（0=禁用，有损）", minimum=0.0, maximum=0.5, value=0.0, step=0.05)
 
         # --- wire up the generate button ---
         gen_button.click(

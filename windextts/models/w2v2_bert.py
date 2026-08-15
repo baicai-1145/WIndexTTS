@@ -305,9 +305,15 @@ class Wav2Vec2BertConformer(nn.Module):
         if return_layer == 0:
             return h
 
-        # additive attention mask (HF Encoder:491-499) + boolean conv mask
+        # additive attention mask (HF Encoder:491-499) + boolean conv mask.
+        # HF zeroes masked positions' hidden states BEFORE the encoder layers
+        # (modeling_wav2vec2_bert.py:494-495). Omitting this leaks unmasked
+        # features of padded frames into attention outputs — observed ~11.0
+        # maxdiff on hidden_states[17] when the featurizer pads an odd tail
+        # frame (mask tail = [1,1,0]).
         attn_mask, conv_mask = None, None
         if attention_mask is not None:
+            h = h.masked_fill(~attention_mask.bool().unsqueeze(-1), 0.0)
             attn_mask = (1.0 - attention_mask[:, None, None, :].to(dtype=h.dtype)) * torch.finfo(h.dtype).min
             attn_mask = attn_mask.expand(-1, 1, attention_mask.shape[1], attention_mask.shape[1])
             conv_mask = attention_mask

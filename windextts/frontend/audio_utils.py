@@ -104,15 +104,18 @@ class SeamlessM4TFeaturizer:
     # ----- the core transform -----
 
     @torch.no_grad()
-    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+    def __call__(self, waveform: torch.Tensor, return_mask: bool = False):
         """Compute input_features from a 16kHz mono waveform.
 
         Args:
             waveform: [B, N] or [N] float tensor, 16kHz mono audio in [-1, 1].
+            return_mask: also return the official-semantics attention mask
+                (stacked frames whose second member was padding_value=1 padded
+                get mask 0 — transformers' `indices % stride == 1` rule).
 
         Returns:
             input_features [B, T, 160] float32, where T = (num_frames // stride)
-            and num_frames = 1 + floor((N - 400)/160).
+            and num_frames = 1 + floor((N - 400)/160); odd tails are zero-padded to a multiple of stride (official pad_to_multiple_of=2).
         """
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
@@ -150,13 +153,30 @@ class SeamlessM4TFeaturizer:
         var = mel.var(dim=1, unbiased=True, keepdim=True)  # unbiased=ddof=1
         mel = (mel - mean) / torch.sqrt(var + _NORM_EPS)
 
-        # stride-2 frame stacking: [B, T, 80] -> [B, T//2, 160]
+        # stride-2 frame stacking: [B, T, 80] -> [B, ceil(T/2), 160]
+        # Official (transformers SeamlessM4TFeatureExtractor) pads the fbank
+        # frames to a multiple of `stride` with padding_value=1.0 (official
+        # preprocessor_config.json — log-mel floor, emulating a silent frame)
+        # BEFORE stacking — the last stacked pair is (real_frame, ones).
+        # We previously DROPPED the odd tail frame (floor division), losing
+        # one frame vs official (e.g. 133 vs 132 for a 15s ref) — this shifted
+        # every downstream conds (spk_cond_emb, conds_latent) and the whole
+        # GPT trajectory.
         T = mel.shape[1]
         rem = T % _STRIDE
+        was_padded = rem != 0
         if rem:
-            mel = mel[:, : T - rem, :]
-        mel = mel.reshape(B, T // _STRIDE, _N_MELS * _STRIDE)
-        return mel.to(self.dtype)
+            pad = torch.full((B, _STRIDE - rem, mel.shape[2]), 1.0,
+                             dtype=mel.dtype, device=mel.device)
+            mel = torch.cat([mel, pad], dim=1)
+            T = mel.shape[1]
+        mel = mel.reshape(B, T // _STRIDE, _N_MELS * _STRIDE).to(self.dtype)
+        if return_mask:
+            mask = torch.ones(B, T // _STRIDE, dtype=torch.int32, device=self.device)
+            if was_padded:
+                mask[:, -1] = 0  # stacked frame containing the padded row
+            return mel, mask
+        return mel
 
     # ----- one-time cache build from the official extractor -----
 
