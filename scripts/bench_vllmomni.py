@@ -27,10 +27,10 @@ from vllm_omni.model_executor.models.indextts2.prompt_utils import (  # noqa: E4
 MODEL = "/root/IndexTTS-2.5"
 REF_AUDIO = "/root/WIndexTTS/test.wav"
 TEXTS = [
-    "大家好，这是一个测试。",
-    "今天天气真不错。",
-    "人工智能正在改变世界。",
-    "语音合成技术发展迅速。",
+    "周末的清晨，阳光透过窗帘洒进房间，带来一丝温暖的气息。",
+    "这款新产品采用了全新的设计理念，性能提升了百分之三十。",
+    "随着科技的不断进步，人们的生活方式发生了翻天覆地的变化，处处都能感受到智能化带来的便利。",
+    "她站在山顶，望着远处的云海，心里涌起一阵难以言喻的感动。",
 ]
 
 
