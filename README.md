@@ -30,34 +30,42 @@ pip install windextts
 
 **已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。
 核心推理纯 torch、零 JIT 编译依赖，端到端推理 + 多轮加速优化完成，
-A10G 上比官方 bf16 快 **2.7x**（比 fp32 快 3.1x）。
+A10G 上默认档（beam3 官方质量）约 0.96s、极速档约 0.72s（最快 0.48s）——
+比官方快约 2 倍，最快延迟追平 vLLM-Omni fast。
 
 能力：CLI / OpenAI 兼容 HTTP API / Gradio WebUI / Python API 四入口；
 W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
 多语言、情感控制（向量/文本/参考音频）。
 
-### 性能（A10G 24GB，4 段中文，稳态）
+### 性能（A10G 24GB，同协议实测：warmup + 4 段中文）
 
 | 引擎 | 均值 | 最快 | RTF | 说明 |
 |---|---|---|---|---|
-| **WIndexTTS** | **0.67s** | **0.59s** | **5.75x** | fp16 GPT+BigVGAN, 15步CFM+TeaCache, 紧凑KV buffer |
-| 官方 bf16 | 1.81s | 1.75s | — | transformers + HF generate |
-| 官方 fp32 | 2.06s | 1.91s | — | 默认精度 |
+| **WIndexTTS**（fp16 greedy 极速） | **0.72s** | **0.48s** | **7.9x** | S2Mel CUDA Graph（fp16 DiT）+ 12 步 |
+| **WIndexTTS**（fp16 beam3 默认） | 0.96s | 0.64s | 6.0x | R14 CUDA-Graph beam search（官方质量档） |
+| vLLM-Omni fast（参照） | 0.51s | 0.47s | — | FlashInfer/Triton 全 graph（R14 记录） |
+| 官方 accel+bf16 | 1.13s | 1.09s | — | 官方 CUDA Graph 加速版（R14 记录） |
+| 官方 bf16 | 1.89s | 1.67s | — | transformers + HF generate |
+| 官方 fp32 | 1.74s | 1.65s | — | 默认精度 |
 
-**WIndexTTS 在零编译依赖下比官方 bf16 快 2.7x、比官方 fp32 快 3.1x。**
+**零编译依赖下：默认档比官方 fp32 快 ~1.8x、比官方 bf16 快 ~2.0x；极速档最快 0.48s（比官方快 ~3.4x），最快延迟追平 vLLM-Omni fast（0.47s）。**
 
-### 各阶段拆解（优化后）
+> WIndexTTS / 官方 fp32 / 官方 bf16 三行是今日同环境同协议实测；vLLM-Omni fast 与官方 accel
+> 为 docs/PERFORMANCE.md 的 R14 记录（该文档为仓库本地文件，未随远端发布）。
+
+### 各阶段拆解（R14 记录，beam3 默认档）
 
 ```
-GPT-AR(fp16+graph+紧凑buffer)  ~150ms  ~40%  ← 内存带宽受限（纯torch fp16 上限）
-S2Mel-CFM(15步+tc)            ~175ms  ~37%  ← TeaCache 跳过冗余步骤 + 减少欧拉步数
-BigVGAN(fp16)                  ~58ms  ~15%  ← cosine 0.9998
-codec+前端+设置                ~50ms  ~8%
-──────────────────────────────────────────
-E2E 稳态                       ~0.67s       median 0.66s, min 0.59s
+GPT-AR beam3 (CUDA Graph 静态 batch K=3)          ~490ms  ~62%  ← eager beam3 1464ms → 3.0x
+S2Mel-CFM (CUDA Graph, 12步；graph 与 TeaCache 互斥)  ~137ms  ~17%  ← fp16 DiT + graph（R12/R13）
+BigVGAN (fp16 + remove_weight_norm)                ~59ms   ~8%
+codec + 前端 + Python 设置                          ~25ms   ~3%
+─────────────────────────────────────────────────────────
+E2E beam3 默认档（今日实测）                       mean 0.96s / min 0.64s
+E2E greedy 极速档（今日实测）                      mean 0.72s / min 0.48s
 ```
 
-### 加速轮次
+### 加速轮次（R1-R14 精选）
 
 | 轮次 | 技术 | 效果 | 质量 |
 |---|---|---|---|
@@ -65,26 +73,38 @@ E2E 稳态                       ~0.67s       median 0.66s, min 0.59s
 | R2 | fp16 GPT-AR（混合精度） | GPT 430→245ms (1.77x) | greedy 78/78 精确 |
 | R3 | fp16 BigVGAN | 89→58ms (1.53x) | cosine 0.9998 |
 | R4 | CFM 欧拉步 25→15 | S2Mel 251→177ms | cosine 0.998 |
-| R5 | 紧凑 KV buffer（max_mel_tokens 1000→300） | GPT 184→124ms (1.48x) | 无截断（实测 68-110 codes） |
+| R5 | 紧凑 KV buffer（max_mel_tokens 1000→300） | GPT 184→124ms (1.48x) | 无截断 |
+| R8 | TeaCache 阈值 0.15→0.25 | S2Mel 185→165ms | cosine 0.999 |
+| R9 | CFM 步数 15→12 | S2Mel 168→137ms | cosine 0.9995 |
+| R12 | **S2Mel CUDA Graph 修复并启用**（dt_buf GC + freqs_cis rebuild 两个根因 bug） | eager 488→graph 442ms | 0/75 板砖，21/21 对齐 |
+| R13 | **fp16-native DiT**（移除 .float() 精度守卫） | S2Mel 433→400ms | cosine 0.9997 |
+| R14 | **CUDA-Graph beam search**（静态 batch K=3，无 KV 重排） | eager beam3 1464→~490ms，e2e 1.4→0.65s | 9/10 seed 位级一致 |
 
-### 未采用的方案及原因
+### 未采用/已回退的方案及原因
 
 - **bf16 GPT**：7-bit 尾数不够，greedy 仅 27% 匹配（fp16 的 10-bit 足够，100%）
-- **torch.compile GPT**：与混合精度不兼容（dtype 报错）
-- **GPT INT8 量化**：torchao/bitsandbytes 未安装（零依赖原则）
-- **S2Mel CUDA Graph（全序列）**：T=1045 时 DiT 注意力中间量占用 ~22GB，A10G OOM
-- **S2Mel fp16**：DiT forward 有多处 fp32 内部构造，侵入性大，TeaCache 已减半
-- **Flash attention 解码**：不支持 seqlen_q≠seqlen_k 的 is_causal（解码场景 Q=1,K=90）
-- **流水线 stream overlap**：各阶段串行依赖（每阶段需上阶段输出），单请求无可重叠独立工作
+- **torch.compile GPT**：与混合精度不兼容（dtype 报错）；**torch.compile S2Mel**：TeaCache 动态状态触发持续重编译，慢 14x
+- **GPT INT8 量化**：torchao/bitsandbytes 未安装（零外部依赖原则）
+- **BigVGAN CUDA Graph**：纯 torch conv 实测 0.89x 反而变慢，且 fp16 引入数值偏差
+- **bf16 DiT autocast**：autocast dispatch 开销在 batch=1 下净变慢 32ms（profiler-free A/B）
+- **Flash attention 解码**：不支持 seqlen_q≠seqlen_k 的 is_causal（解码场景 Q=1,K≈90）
+- **流水线 stream overlap**：各阶段串行依赖，单请求无可重叠独立工作
+- **CFG=0**：可省 ~50ms 但偏离训练分布，保留为可调参数
+
+> S2Mel CUDA Graph / fp16 DiT / beam3 Graph 曾被判定不可行，R12-R14 已逐一攻克启用，
+> 根因分析与数值证据见仓库内 docs/PERFORMANCE.md（本地文件，未随远端发布）。
 
 ### 可调参数（质量/速度权衡）
 
 ```python
+tts = WIndexTTS(weights_dir=..., device="cuda", dtype=torch.float16)  # fp16 最快；默认 fp32 保对齐
+
+tts.warmup()  # 预捕获 CUDA Graph，把 ~1s 冷启动成本移出首请求
 tts.infer(ref, text, 'ZH',
-    dtype=torch.float16,      # fp16 GPT+BigVGAN（默认 fp32 保对齐）
-    cfm_steps=15,             # CFM 欧拉步（25=最高质量，10=最快）
-    teacache_thresh=0.15,     # 0=禁用，0.25=更激进跳步
-    cfg_rate=0.7,             # CFG 强度（0.3=快10%，0.0=最快无引导）
+    num_beams=3,          # 默认官方质量档；1 = greedy 极速（最快）
+    cfm_steps=12,         # CFM 欧拉步（25=最高质量，10=最快）
+    teacache_thresh=0.25, # 0=禁用，0.4=更激进跳步
+    cfg_rate=0.7,         # CFG 强度（0.3=快10%，0.0=最快无引导）
 )
 ```
 
@@ -102,7 +122,8 @@ tts.infer(ref, text, 'ZH',
 ### 已知限制
 
 - **emo audio 项**：用 emovec_mat only（省略 merge_emovec conformer 的 (1-sum)*audio 校正项）
-- **CFM CUDA Graph**：全序列显存不足，默认 eager + TeaCache
+- **S2Mel CUDA Graph 与 TeaCache 互斥**：graph 路径自动禁用 TeaCache（data-dependent 分支无法 capture）；
+  eager + TeaCache 作为备选路径保留
 
 ## 运行
 
