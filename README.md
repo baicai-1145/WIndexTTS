@@ -70,12 +70,12 @@ fp32 档瓶颈：GEMM 计算密度（GPT-AR 984ms 占 64%），graph 等手段�
 
 | 轮次 | 技术 | 效果 | 质量 |
 |---|---|---|---|
-| R1 | ~~TeaCache（S2Mel DiT 步骤跳过）~~（已回退，见下） | S2Mel 465→247ms (1.88x) | mel cosine 0.98 |
+| R1 | ~~TeaCache（S2Mel DiT 步骤跳过）~~（已回退；代码已在 v0.2.1 移除） | S2Mel 465→247ms (1.88x) | mel cosine 0.98 |
 | R2 | fp16 GPT-AR（混合精度） | GPT 430→245ms (1.77x) | greedy 78/78 精确 |
 | R3 | fp16 BigVGAN | 89→58ms (1.53x) | cosine 0.9998 |
 | R4 | CFM 欧拉步 25→15 | S2Mel 251→177ms | cosine 0.998 |
 | R5 | 紧凑 KV buffer（max_mel_tokens 1000→300） | GPT 184→124ms (1.48x) | 无截断 |
-| R8 | ~~TeaCache 阈值 0.15→0.25~~（已回退） | S2Mel 185→165ms | cosine 0.999 |
+| R8 | ~~TeaCache 阈值 0.15→0.25~~（已回退；代码已在 v0.2.1 移除） | S2Mel 185→165ms | cosine 0.999 |
 | R9 | CFM 步数 15→12 | S2Mel 168→137ms | cosine 0.9995 |
 | R12 | **S2Mel CUDA Graph 修复并启用**（dt_buf GC + freqs_cis rebuild 两个根因 bug） | eager 488→graph 442ms | 0/75 板砖，21/21 对齐 |
 | R13 | **fp16-native DiT**（移除 .float() 精度守卫） | S2Mel 433→400ms | cosine 0.9997 |

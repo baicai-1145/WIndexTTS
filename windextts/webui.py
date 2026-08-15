@@ -178,7 +178,6 @@ def synthesize(
     temperature,
     # perf knobs (WIndexTTS extensions vs official)
     cfm_steps,
-    teacache_thresh,
     progress=gr.Progress(),
 ):
     """Run WIndexTTS.infer() from UI inputs; return output audio path."""
@@ -233,7 +232,6 @@ def synthesize(
             top_k=int(top_k),
             temperature=float(temperature),
             cfm_steps=int(cfm_steps),
-            teacache_thresh=float(teacache_thresh),
             text_normalization=bool(text_normalization),
             max_text_tokens_per_segment=int(max_text_tokens_per_segment),
         )
@@ -460,11 +458,9 @@ with gr.Blocks(
             gr.Markdown(
                 "以下参数控制推理速度/质量权衡（默认值已调优为最佳速度-质量平衡）：\n"
                 "- **CFM 步数**：S2Mel Flow Matching 求解步数，越少越快（官方 25，默认 12，最低 ~8）\n"
-                "- **TeaCache 阈值**：DiT 跳步缓存阈值，越高越快（0=禁用，默认 0.25）\n"
             )
             with gr.Row():
                 cfm_steps = gr.Slider(label="CFM 步数", minimum=6, maximum=25, value=15, step=1)
-                teacache_thresh = gr.Slider(label="TeaCache 阈值（0=禁用，有损）", minimum=0.0, maximum=0.5, value=0.0, step=0.05)
 
         # --- wire up the generate button ---
         gen_button.click(
@@ -475,7 +471,7 @@ with gr.Blocks(
                 emo_control, emo_upload, emo_weight,
                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, emo_text,
                 do_sample, top_p, top_k, temperature,
-                cfm_steps, teacache_thresh,
+                cfm_steps,
             ],
             outputs=output_audio,
         )

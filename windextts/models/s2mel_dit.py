@@ -540,11 +540,6 @@ class DiT(nn.Module):
         self.transformer_style_condition = cfg.style_condition
         self.final_layer_type = cfg.final_layer_type
 
-        # TeaCache state (vLLM-Omni-style step skipping for diffusion)
-        self.teacache_enabled = False
-        self.teacache_thresh = 0.0
-        self.teacache_coef = None  # polynomial rescaling coefficients (see TEACACHE_COEF)
-        self._tc_state = None  # per-call reset
 
         # Transformer (gpt_fast ModelArgs, block_size hardcoded 16384 in official)
         self.transformer = Transformer(
@@ -614,38 +609,6 @@ class DiT(nn.Module):
 
     def setup_caches(self, max_batch_size: int, max_seq_length: int) -> None:
         self.transformer.setup_caches(max_batch_size, max_seq_length, use_kv_cache=False)
-
-    # TeaCache polynomial coefficients calibrated for THIS DiT (polyfit on
-    # 384 (rel_in, rel_out) pairs, 8 texts x 2 seeds x 25 steps, mean|err|=0.009).
-    # Maps first-block adaLN-modulated input distance to transformer OUTPUT
-    # distance, so the accumulation threshold budgets output drift (vLLM-Omni
-    # semantics — every model there ships calibrated coefficients; running
-    # without them under-skips and was the root cause of the HF artifacts).
-    # rel_in range 0.04-0.12 -> rel_out 0.06-0.52 (output drifts 1.5-4x input).
-    TEACACHE_COEF = [9.99331138e+04, -3.15841389e+04, 3.64869469e+03,
-                     -1.78388002e+02, 3.19084245e+00]
-
-    def enable_teacache(self, thresh: float = 0.25, coef=None) -> None:
-        """Enable TeaCache step-skipping (vLLM-Omni style).
-
-        thresh: budget on accumulated OUTPUT-drift (after polynomial rescale).
-          Listening-verified (2024-08 calibration round): 0.10 (36% skip,
-          LSD 4.4dB) is AUDIBLY degraded; 0.05 never accumulates past budget
-          (= no skipping, no speedup). There is no useful operating point for
-          this audio DiT — keep teacache disabled (default 0) and rely on the
-          CUDA-Graph full-step path, which is also vLLM-Omni's choice for
-          IndexTTS2 (they do not enable TeaCache for this model).
-        coef: polynomial rescaling coefficients (highest degree first). Defaults
-          to the calibrated TEACACHE_COEF.
-        """
-        self.teacache_enabled = True
-        self.teacache_thresh = thresh
-        self.teacache_coef = list(self.TEACACHE_COEF) if coef is None else coef
-        self._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
-
-    def disable_teacache(self) -> None:
-        self.teacache_enabled = False
-        self._tc_state = None
 
     def precast_linear_bf16(self) -> int:
         """Cast only Linear/Conv1d weights to bf16 (vLLM-Omni strategy).
@@ -717,46 +680,10 @@ class DiT(nn.Module):
                                max_length=x_in.size(1)).to(x.device).unsqueeze(1)  # [B,1,T]
         input_pos = self.input_pos[: x_in.size(1)]
         x_mask_expanded = x_mask[:, None, :].repeat(1, 1, x_in.size(1), 1) if not self.is_causal else None
-        # --- TeaCache: skip transformer when consecutive-step inputs are similar ---
         n_prefix = int(self.time_as_token) + int(self.style_as_token)
-        x_in_core = x_in[:, n_prefix:] if n_prefix else x_in  # residual base (core only)
-        do_full = True
-        if self.teacache_enabled:
-            st = self._tc_state
-            # Monitor signal (vLLM-Omni semantics): first-block adaLN-modulated
-            # hidden states — includes the timestep embedding, so consecutive-
-            # step distances grow fast enough to trigger recomputes. The old
-            # monitor (x_in_core, t stripped) under-estimated late-step drift
-            # (80% skip at thresh=0.25) -> HF-energy harshness artifacts.
-            probe = self.transformer.layers[0].attention_norm(x_in, t1.unsqueeze(1))
-            if n_prefix:
-                probe = probe[:, n_prefix:]
-            if st["cnt"] == 0:
-                st["accum"] = 0.0
-            elif st["prev_core"] is not None:
-                rel = ((probe - st["prev_core"]).abs().mean() /
-                       (st["prev_core"].abs().mean() + 1e-8)).cpu().item()
-                # polynomial evaluation (coeffs highest-degree first), no numpy dep
-                scaled = (sum(c * rel ** i for i, c in enumerate(reversed(self.teacache_coef)))
-                          if self.teacache_coef is not None else rel)
-                st["accum"] += abs(scaled)
-                if st["accum"] < self.teacache_thresh and st["prev_residual"] is not None:
-                    do_full = False
-                else:
-                    st["accum"] = 0.0
-            st["prev_core"] = probe.detach()
-        if do_full:
-            x_res_full = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)  # [B, T_full, D]
-            # strip tokens to get core output
-            x_res = x_res_full[:, n_prefix:] if n_prefix else x_res_full
-            if self.teacache_enabled:
-                self._tc_state["prev_residual"] = (x_res - x_in_core).detach()
-                self._tc_state["cnt"] += 1
-        else:
-            # FAST PATH: reuse cached core residual
-            x_res = x_in_core + self._tc_state["prev_residual"]
-            self._tc_state["cnt"] += 1
-        # (x_res is already core-only; no further stripping needed)
+        x_in_core = x_in[:, n_prefix:] if n_prefix else x_in
+        x_res_full = self.transformer(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)  # [B, T_full, D]
+        x_res = x_res_full[:, n_prefix:] if n_prefix else x_res_full
 
         if self.long_skip_connection:
             x_res = self.skip_linear(torch.cat([x_res, x], dim=-1))

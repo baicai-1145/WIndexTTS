@@ -66,10 +66,7 @@ def profile_stages(tts) -> dict:
                              do_sample=False, stop_token=8193, use_cuda_graph=True)
     codes = codes[:, :-1] if codes[0, -1] == 8193 else codes
     s = tts.codec.decode(codes)
-    # enable teacache (matches infer() default) for fair S2Mel profiling
     est = tts.s2mel.cfm.estimator
-    if not getattr(est, "teacache_enabled", False):
-        est.enable_teacache(thresh=0.15)
     e["s2mel"] = bench(lambda: tts.s2mel.inference(spk, s, refmel, style, n_timesteps=15))
     mel = tts.s2mel.inference(spk, s, refmel, style)
     mel_voc = mel.to(next(tts.bigvgan.parameters()).dtype)

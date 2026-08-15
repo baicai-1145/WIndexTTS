@@ -85,8 +85,7 @@ class S2MelCFM(nn.Module):
             n_timesteps: Euler steps (default 25).
             temperature: noise scale.
             inference_cfg_rate: classifier-free guidance rate (default 0.7).
-            use_graph: if True, use CUDA-Graph-captured Euler loop (faster,
-                but incompatible with TeaCache — disables it for this call).
+            use_graph: if True, use CUDA-Graph-captured Euler loop (faster).
         Returns:
             mel [B, 80, T] including the prompt region (caller strips it).
         """
@@ -110,17 +109,9 @@ class S2MelCFM(nn.Module):
         z = torch.randn([B, self.in_channels, T], device=device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=mu.dtype)
         if use_graph:
-            # graph path requires the estimator forward to be capture-safe;
-            # TeaCache's data-dependent branching is incompatible, so bypass it.
-            est = self.estimator
-            tc_was = getattr(est, "teacache_enabled", False)
-            est.teacache_enabled = False
-            try:
-                return self.solve_euler_graph(
-                    z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate
-                )
-            finally:
-                est.teacache_enabled = tc_was
+            return self.solve_euler_graph(
+                z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate
+            )
         return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
 
     def solve_euler(
@@ -136,13 +127,8 @@ class S2MelCFM(nn.Module):
     ) -> torch.Tensor:
         """Fixed-step Euler ODE solver with classifier-free guidance.
 
-        Replicates flow_matching.py:57-111 exactly. When the estimator has
-        TeaCache enabled, redundant DiT forwards are skipped (vLLM-Omni style).
+        Replicates flow_matching.py:57-111 exactly.
         """
-        # reset TeaCache state for this solve (cond + uncond branches)
-        est = self.estimator
-        if getattr(est, "teacache_enabled", False):
-            est._tc_state = {"cnt": 0, "prev_core": None, "prev_residual": None, "accum": 0.0}
         # Reduced-precision DiT forward strategies. Two modes:
         #   - estimator_autocast_dtype: wraps each op in torch.autocast (per-op
         #     dtype-policy dispatch). Numerically safe for fp16 (10 mantissa
@@ -154,6 +140,7 @@ class S2MelCFM(nn.Module):
         #     so it captures the real 2-4x GEMM speedup.
         ac_dtype = getattr(self, "estimator_autocast_dtype", None)
         fp16_w = getattr(self, "estimator_fp16_weights", False)
+        est = self.estimator
         def _run_estimator(*a, **kw):
             if fp16_w:
                 a16 = tuple(ai.to(torch.float16) if torch.is_tensor(ai) and ai.is_floating_point() else ai for ai in a)

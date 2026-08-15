@@ -76,8 +76,6 @@ def build_parser() -> argparse.ArgumentParser:
     # perf knobs
     p.add_argument("--cfm-steps", type=int, default=12,
                    help="S2Mel CFM Euler steps (official 25, default 12)")
-    p.add_argument("--teacache", type=float, default=0.25,
-                   help="TeaCache threshold (0=off, default 0.25)")
     p.add_argument("--no-normalize", action="store_true",
                    help="skip text normalization (G2P digits/punctuation)")
     p.add_argument("--segment-tokens", type=int, default=120,
@@ -168,7 +166,6 @@ def main(argv: list[str] | None = None) -> int:
         top_k=args.top_k,
         temperature=args.temperature,
         cfm_steps=args.cfm_steps,
-        teacache_thresh=args.teacache,
         text_normalization=not args.no_normalize,
         max_text_tokens_per_segment=args.segment_tokens,
         num_beams=1 if args.greedy else 3,

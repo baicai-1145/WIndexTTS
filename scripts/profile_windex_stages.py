@@ -111,7 +111,6 @@ def main():
 
     # ---- per-stage: capture boundary tensors from one real infer ----
     print("\n>> caching intermediates for per-stage isolation...")
-    tts.s2mel.cfm.estimator.enable_teacache(thresh=0.15)
     cache = {}
     orig_gpt_gen = tts.gpt.generate
     orig_s2mel = tts.s2mel.inference

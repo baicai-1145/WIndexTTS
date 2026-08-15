@@ -12,7 +12,7 @@ Mirrors the vLLM-Omni (audex) serving surface:
              "language": "ZH", "duration_factor": 1.0,
              "emo_vector": [8 floats] | "emo_text": "..." | "emo_ref_audio": b64,
              "do_sample": true, "top_p": 0.8, "top_k": 30, "temperature": 0.8,
-             "cfm_steps": 12, "teacache_thresh": 0.25, "num_beams": 3,
+             "cfm_steps": 12, "num_beams": 3,
              "max_text_tokens_per_segment": 120, "text_normalization": true
          }}
 
@@ -175,7 +175,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             top_k=int(ep.get("top_k", 30)),
             temperature=float(ep.get("temperature", 0.8)),
             cfm_steps=int(ep.get("cfm_steps", 15)),
-            teacache_thresh=float(ep.get("teacache_thresh", 0.0)),
             text_normalization=bool(ep.get("text_normalization", True)),
             max_text_tokens_per_segment=int(ep.get("max_text_tokens_per_segment", 120)),
             num_beams=int(ep.get("num_beams", 3)),

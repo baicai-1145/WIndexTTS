@@ -171,7 +171,7 @@ class WIndexTTS:
         print(f">> WIndexTTS loaded all modules on {dev}")
         # S2Mel CUDA Graph also for fp32: verified bit-identical to the eager
         # full-step path (same seed/codes -> HF ratio equal to 6 decimals) and
-        # faster than eager; eager+TeaCache was the quality-artifact path.
+        # faster than eager.
         self.s2mel_use_graph = True
 
         # apply per-module precision overrides (mixed-precision fast paths)
@@ -339,7 +339,6 @@ class WIndexTTS:
                     stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
                 )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
-            self.s2mel.cfm.estimator.enable_teacache(thresh=0.25)
             mel = self.s2mel.inference(spk, s, refmel, style, n_timesteps=12)
             bg_dtype = next(self.bigvgan.parameters()).dtype
             _ = self.bigvgan(mel.to(bg_dtype))
@@ -533,7 +532,6 @@ class WIndexTTS:
         max_mel_tokens: int | None = None,
         cfm_steps: int = 15,
         cfg_rate: float = 0.7,
-        teacache_thresh: float = 0.0,
         text_normalization: bool = True,
         max_text_tokens_per_segment: int = 120,
         interval_silence_ms: int = 200,
@@ -646,7 +644,7 @@ class WIndexTTS:
                 spk_audio_prompt, segments[0], lang, emo_vector,
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
-                _seg_mel_cap(segments[0]), cfm_steps, cfg_rate, teacache_thresh,
+                _seg_mel_cap(segments[0]), cfm_steps, cfg_rate,
                 repetition_penalty, num_beams,
             )
 
@@ -657,7 +655,7 @@ class WIndexTTS:
                 spk_audio_prompt, seg, lang, emo_vector,
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
-                _seg_mel_cap(seg), cfm_steps, cfg_rate, teacache_thresh,
+                _seg_mel_cap(seg), cfm_steps, cfg_rate,
                 repetition_penalty, num_beams,
             )
             wavs.append(wav)
@@ -685,7 +683,6 @@ class WIndexTTS:
         max_mel_tokens: int,
         cfm_steps: int,
         cfg_rate: float,
-        teacache_thresh: float,
         repetition_penalty: float = 10.0,
         num_beams: int = 3,
     ) -> tuple[int, torch.Tensor]:
@@ -756,15 +753,7 @@ class WIndexTTS:
         # --- codec.decode → S_infer ---
         s_infer = self.codec.decode(codes)  # [1, 2*T, 1024]
 
-        # --- S2Mel-CFM → mel (TeaCache: skip redundant DiT steps) ---
-        # Explicit enable/disable per call — the old lazy check left
-        # teacache_enabled sticky after a prior enable, so thresh=0 requests
-        # silently kept skipping steps (HF-energy artifacts).
-        est = self.s2mel.cfm.estimator
-        if teacache_thresh > 0:
-            est.enable_teacache(thresh=teacache_thresh)
-        elif getattr(est, "teacache_enabled", False):
-            est.disable_teacache()
+        # --- S2Mel-CFM → mel ---
         mel = self.s2mel.inference(
             spk_cond, s_infer, ref_mel, style,
             duration_factor=duration_factor, n_timesteps=cfm_steps,
@@ -788,7 +777,6 @@ class WIndexTTS:
         codes: torch.Tensor,
         cfm_steps: int = 15,
         cfg_rate: float = 0.7,
-        teacache_thresh: float = 0.0,
         duration_factor: float = 1.0,
         use_graph: bool | None = None,
     ) -> tuple[int, torch.Tensor]:
@@ -845,12 +833,7 @@ class WIndexTTS:
             # --- codec.decode → S_infer ---
             s_infer = self.codec.decode(codes)  # [1, 2*T, 256]
 
-            # --- S2Mel-CFM → mel (explicit teacache toggle, see _infer_single) ---
-            est = self.s2mel.cfm.estimator
-            if teacache_thresh > 0:
-                est.enable_teacache(thresh=teacache_thresh)
-            elif getattr(est, "teacache_enabled", False):
-                est.disable_teacache()
+            # --- S2Mel-CFM → mel ---
             mel = self.s2mel.inference(
                 spk_cond, s_infer, ref_mel, style,
                 duration_factor=duration_factor, n_timesteps=cfm_steps,

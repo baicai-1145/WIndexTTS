@@ -10,7 +10,6 @@ Config flags (composable):
   --steps N          CFM Euler steps (default 12)
   --bf16 / --fp32    DiT compute dtype (default: follow warmup = bf16 autocast)
   --graph / --eager  DiT CUDA-graph path (default eager)
-  --teacache on/off  TeaCache (default on)
 
 Usage:
   /root/index-tts/.venv/bin/python scripts/profile_ab.py \
@@ -58,8 +57,6 @@ def make_config(args) -> dict:
         cfg["graph"] = True
     if args.eager:
         cfg["graph"] = False
-    if args.teacache is not None:
-        cfg["teacache"] = args.teacache
     return cfg
 
 
@@ -70,10 +67,6 @@ def apply_config(tts, cfg: dict) -> None:
     else:
         tts.s2mel.cfm.estimator_autocast_dtype = None
     tts.s2mel_use_graph = bool(cfg.get("graph", False))
-    tc = cfg.get("teacache", True)
-    tts.s2mel.cfm.estimator.enable_teacache(thresh=0.15) if tc else (
-        setattr(tts.s2mel.cfm.estimator, "teacache_enabled", False))
-    tts.s2mel.cfm.estimator.teacache_enabled = bool(tc)
 
 
 def measure(tts, cfg: dict, repeats: int) -> dict:
@@ -120,7 +113,6 @@ def main():
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--graph", action="store_true")
     ap.add_argument("--eager", action="store_true")
-    ap.add_argument("--teacache", type=int, default=None, choices=[0, 1])
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--trace", action="store_true",
                     help="also capture a profiler trace per config")
