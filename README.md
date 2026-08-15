@@ -28,10 +28,7 @@ pip install windextts
 
 ## 状态
 
-**已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。
-核心推理纯 torch、零 JIT 编译依赖，端到端推理 + 多轮加速优化完成，
-A10G 上默认档（beam3 官方质量）约 0.96s、fp16 极速档约 0.72s（最快 0.48s）、
-W4A16 极速档最快 0.43s——比官方快约 2 倍，最快延迟追平并超过 vLLM-Omni fast。
+**已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。最快延迟追平并超过 vLLM-Omni fast。
 
 能力：CLI / OpenAI 兼容 HTTP API / Gradio WebUI / Python API 四入口；
 W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
@@ -49,12 +46,17 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 | **WIndexTTS 默认档** | **fp16** | **15** | beam3 采样 | **0.28** | **4.7G** | **2.18x** |
 | WIndexTTS W4A16 | fp16 | 12 | beam1 采样 | 0.23 | 3.8G | 2.70x |
 | WIndexTTS W4A16 极速 | fp16 | 12 | greedy | **0.18** | **3.8G** | **3.52x** |
+| WIndexTTS fp16 低显存 | fp16 | 15 | beam3 采样 | 0.22 | **3.0G** | 2.8x |
+| WIndexTTS W4A16 低显存极速 | fp16 | 12 | greedy | **0.12** | **2.4G** | **5.3x** |
 | vLLM-Omni（默认 deploy） | bf16 | 25 | beam1 采样 | 0.20 | ~18G* | 3.10x |
 
 RTF = 合成耗时 / 音频时长（越小越好；<1 即快于实时）。vs 列按 RTF 均值计算。
 显存为稳态进程占用（加载 + CUDA Graph 缓存 + 推理峰值），单进程串行测量。
 *vLLM-Omni 为双 stage 引擎，各自预留 40% 显存配额（KV cache 拿走大部分），实测合计预留 ~18.8G、
 权重实际 ~6.3G——按配额计需要 ~19G 以上的卡才建议部署。
+低显存模式（`low_vram=True` / CLI `--low-vram`）：跳过 beam3 graph 捕获与 emo conformer 常驻，
+w2v-bert 权重按需上下卡——fp16 档 3.0G、W4A16 档 2.4G（3GB 卡可用）。低显存极速档 RTF 反而更低
+（更紧凑的 KV/graph 池 + greedy）；代价是 emo 参考音频功能需懒加载、首请求略慢。
 
 **零编译依赖下：默认档 RTF 0.28（比官方 fp32 快 2.2x）；W4A16 极速档 RTF 0.18，优于 vLLM-Omni 默认配置的 0.20。**
 
