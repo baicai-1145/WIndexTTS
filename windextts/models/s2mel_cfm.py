@@ -14,10 +14,8 @@ import torch.nn as nn
 from windextts.models.length_regulator import InterpolateRegulator
 from windextts.models.s2mel_dit import DiT
 
-__all__ = ["S2MelCFM", "S2Mel"]
-
 class S2MelCFM(nn.Module):
-    """CFM wrapper: DiT estimator + Euler ODE solver with CFG."""
+    # CFM wrapper: DiT estimator + Euler ODE solver with CFG.
 
     def __init__(self, estimator: DiT, in_channels: int = 80, sigma_min: float = 1e-6):
         super().__init__()
@@ -219,7 +217,7 @@ class S2MelCFM(nn.Module):
 
 
 class S2Mel(nn.Module):
-    """Full S2Mel: length_regulator + CFM(DiT). gpt_layer not loaded (config off)."""
+    # Full S2Mel: length_regulator + CFM(DiT). gpt_layer not loaded (config off).
 
     def __init__(self, length_regulator: InterpolateRegulator, cfm: S2MelCFM):
         super().__init__()
@@ -227,7 +225,7 @@ class S2Mel(nn.Module):
         self.cfm = cfm
 
     def length_regulate(self, spk_cond, s_infer, ref_mel, duration_factor=1.0):
-        """(prompt_condition, cond, cat_condition). Mirrors infer_v2_5.py:651-862."""
+        # (prompt_condition, cond, cat_condition). Mirrors infer_v2_5.py:651-862.
         device = spk_cond.device
         ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
         prompt_condition = self.length_regulator(
@@ -253,36 +251,3 @@ class S2Mel(nn.Module):
             use_graph=use_graph,
         )
         return vc[:, :, ref_mel.size(-1):]  # strip prompt region
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/root/WIndexTTS")
-    import torch
-    from windextts.config import load_default_config
-    from windextts.models.length_regulator import InterpolateRegulator
-    from windextts.models.s2mel_dit import DiT
-    from windextts.weights import WeightLoader
-
-    DUMPS, dev = "/root/windextts_dumps", "cuda"
-    net = WeightLoader().load_s2mel()
-    cfg = load_default_config()
-    lr = InterpolateRegulator(cfg.s2mel.length_reg.channels, cfg.s2mel.length_reg.sampling_ratios,
-                              cfg.s2mel.length_reg.is_discrete, cfg.s2mel.length_reg.in_channels,
-                              cfg.s2mel.length_reg.content_codebook_size)
-    lr.load_official(net["length_regulator"])
-    dit = DiT().to(dev).eval()
-    dit.load_official(net["cfm"])
-    s2mel = S2Mel(lr.to(dev).eval(), S2MelCFM(dit, cfg.s2mel.dit.in_channels).to(dev).eval()).eval()
-
-    spk_cond = torch.load(f"{DUMPS}/gpt.spk_cond_w2v.pt", weights_only=False).to(dev)
-    s_infer = torch.load(f"{DUMPS}/s2mel.S_infer.pt", weights_only=False).to(dev)
-    ref_mel = torch.load(f"{DUMPS}/s2mel.ref_mel.pt", weights_only=False).to(dev)
-    style = torch.load(f"{DUMPS}/s2mel.style.pt", weights_only=False).to(dev)
-    torch.cuda.manual_seed(123)
-    out = s2mel.inference(spk_cond, s_infer, ref_mel, style, duration_factor=1.0)
-    ref = torch.load(f"{DUMPS}/s2mel.cfm_output_mel_seed123.pt", weights_only=False).to(dev)
-    diff = (out.float() - ref.float()).abs().max().item()
-    print(f"end-to-end mel {tuple(out.shape)} max_abs_diff={diff:.3e} "
-          f"allclose={torch.allclose(out.float(), ref.float(), atol=1e-3, rtol=1e-3)}")
-    print("SMOKE", "OK" if diff < 1e-2 else "FAIL")
