@@ -4,8 +4,8 @@ forward(x, ylens, n_quantizers, f0) -> (out*mask, ylens, None, None, None):
   content_in_proj(1024→512) → F.interpolate(nearest) to ylens.max() →
   4×(Conv1d3+GroupNorm1+Mish) + Conv1d1 → mask*transpose. Numerics vs official:
   GroupNorm(1,512) NOT LayerNorm (same keys, different math), nn.Mish,
-  nearest-interpolate never 'linear'. embedding/mask_token exist for strict ckpt
-  load (discrete path unused at inference).
+  nearest-interpolate never 'linear'. embedding/mask_token/extra_codebooks stay
+  for strict ckpt load (discrete/multi-codebook paths deleted — train-only).
 """
 import torch
 import torch.nn as nn
@@ -58,20 +58,7 @@ class InterpolateRegulator(nn.Module):
             raise RuntimeError(f"loading InterpolateRegulator: missing={missing} unexpected={unexpected}")
 
     def forward(self, x, ylens=None, n_quantizers=None, f0=None):
-        # (train-only token dropout folded into the discrete branch; eval keeps all)
-        if self.is_discrete:
-            if self.n_codebooks > 1:
-                assert x.ndim == 3
-                nqt = torch.ones(x.shape[0], device=x.device) * (self.n_codebooks if n_quantizers is None else n_quantizers)
-                if self.training:
-                    drop = torch.randint(1, self.n_codebooks + 1, (x.shape[0],))
-                    nqt[: int(x.shape[0] * self.quantizer_dropout)] = drop[: int(x.shape[0] * self.quantizer_dropout)]
-                x = self.embedding(x[:, 0]) + sum((nqt > i + 1)[..., None, None] * emb(x[:, i + 1])
-                                                  for i, emb in enumerate(self.extra_codebooks))
-            else:
-                x = self.embedding(x[:, 0] if x.ndim == 3 else x)
-        else:
-            x = self.content_in_proj(x)
+        x = self.content_in_proj(x)
         mask = sequence_mask(ylens).unsqueeze(-1)  # [B, ylens.max, 1]
         if self.interpolate:
             x = F.interpolate(x.transpose(1, 2).contiguous(), size=int(ylens.max()), mode="nearest")
@@ -82,22 +69,3 @@ class InterpolateRegulator(nn.Module):
         if self.f0_condition:
             raise NotImplementedError("f0_condition not exercised by IndexTTS-2.5")
         return self.model(x).transpose(1, 2).contiguous() * mask, ylens, None, None, None
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/root/WIndexTTS")
-    from windextts.weights import WeightLoader
-
-    dev = "cuda"
-    sd = WeightLoader().load_s2mel()["length_regulator"]
-    m = InterpolateRegulator(channels=512, sampling_ratios=[1, 1, 1, 1], is_discrete=False,
-                             in_channels=1024, codebook_size=2048).to(dev).eval()
-    m.load_official(sd)
-    S = torch.load("/root/windextts_dumps/s2mel.S_infer.pt", weights_only=False).to(dev)
-    with torch.no_grad():
-        out = m(S, ylens=torch.LongTensor([int(S.shape[1] * 1.72)]).to(dev), n_quantizers=3)[0]
-    ref = torch.load("/root/windextts_dumps/s2mel.cond.pt", weights_only=False).to(dev)
-    d = (out.float() - ref.float()).abs().max().item()
-    print(f"[LR] {tuple(out.shape)} max_diff={d:.3e} allclose={torch.allclose(out.float(), ref.float(), atol=1e-4, rtol=1e-3)}")
-    print("SMOKE", "OK" if d < 1e-4 else "FAIL")

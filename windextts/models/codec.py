@@ -8,7 +8,7 @@
 #   - FVQ in/out_project are classic weight_norm Conv1d(1x1) -> keys weight_g/weight_v
 #   - decode_latents L2-normalizes encodings+codebook, argmax(-dist); z_q raw emb,
 #     straight-through z_e+(z_q-z_e).detach()
-#   - quantize() does NOT clip odd T (forward does); down s2 maps 303->152
+#   - quantize() does NOT clip odd T; down s2 maps 303->152
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -67,11 +67,7 @@ class FactorizedVectorQuantize(nn.Module):
     def forward(self, z):
         z_e = self.in_project(z)  # [B, codebook_dim, T]
         z_q, indices = self.decode_latents(z_e)
-        if self.training:
-            commit_loss = F.mse_loss(z_e, z_q.detach(), reduction="none").mean([1, 2]) * self.commitment
-            codebook_loss = F.mse_loss(z_q, z_e.detach(), reduction="none").mean([1, 2]) * self.codebook_loss_weight
-        else:
-            commit_loss = codebook_loss = torch.zeros(z.shape[0], device=z.device)
+        commit_loss = codebook_loss = torch.zeros(z.shape[0], device=z.device)
         z_q = z_e + (z_q - z_e).detach()  # straight-through
         return self.out_project(z_q), commit_loss, codebook_loss, indices, z_e
 
@@ -107,16 +103,10 @@ class ResidualVQ(nn.Module):
     def forward(self, z, n_quantizers=None):
         if n_quantizers is None:
             n_quantizers = self.num_quantizers
-        if self.training:
-            n_quantizers = torch.ones((z.shape[0],)) * self.num_quantizers + 1
-            dropout = torch.randint(1, self.num_quantizers + 1, (z.shape[0],))
-            n_dropout = int(z.shape[0] * self.quantizer_dropout)
-            n_quantizers[:n_dropout] = dropout[:n_dropout]
-            n_quantizers = n_quantizers.to(z.device)
         quantized_out, residual = 0.0, z
         all_commit, all_codebook, all_indices, all_quantized = [], [], [], []
         for i, quantizer in enumerate(self.quantizers):
-            if not self.training and i >= n_quantizers:
+            if i >= n_quantizers:
                 break
             z_q_i, commit_loss_i, codebook_loss_i, indices_i, _ = quantizer(residual)
             mask = torch.full((z.shape[0],), i, device=z.device) < n_quantizers
@@ -154,20 +144,9 @@ class EnhancedCodec(nn.Module):
             commitment=0.15, codebook_loss_weight=1.0, use_l2_normlize=True,
         )
 
-    # training/reconstruction path: clips odd trailing frame on input+target
-    def forward(self, x):
-        if x.size(1) % 2:
-            x = x[:, :-1, :]
-        feat = x
-        if hasattr(self, "down"):
-            x = F.gelu(self.down(x.transpose(1, 2))).transpose(1, 2)
-        x = self.encoder(x.transpose(1, 2)).transpose(1, 2)
-        quantized_out, all_indices, all_commit, all_codebook, _ = self.quantizer(x)
-        x = self.decoder(quantized_out)
-        if hasattr(self, "down"):
-            x = self.up(F.interpolate(x.transpose(1, 2), scale_factor=2, mode="nearest")).transpose(1, 2)
-        return x, (all_codebook + all_commit).mean(), all_indices, F.mse_loss(x, feat)
-
+    # quantize()/decode() are the only paths used at inference (reconstruction
+    # forward is train-only and deleted). quantize() does NOT clip odd T; down
+    # s2 maps 303->152.
     def quantize(self, x):
         """x [B,T,D] -> (codes [B,T//2] i64 (squeezed if B==1), feat [B,T//2,D]); no odd clip (unlike forward)."""
         if hasattr(self, "down"):
@@ -193,21 +172,3 @@ class EnhancedCodec(nn.Module):
                 f"codec strict load failed: missing={missing[:8]}... unexpected={unexpected[:8]}..."
             )
         self.eval()
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/root/WIndexTTS")
-    from windextts.weights import WeightLoader
-
-    m = EnhancedCodec()
-    m.load_official(WeightLoader().load_codec())
-    print(f"loaded {sum(p.numel() for p in m.parameters())/1e6:.1f}M params, strict OK (243 keys)")
-    x = torch.randn(1, 303, 1024)
-    with torch.no_grad():
-        codes, feat = m.quantize(x)
-        rec = m.decode(codes)
-    print(f"quantize: codes {tuple(codes.shape)} {codes.dtype} range {codes.min().item()}-{codes.max().item()}")
-    print(f"quantize: feat {tuple(feat.shape)}")
-    print(f"decode:   rec  {tuple(rec.shape)}")
-    print("SMOKE OK")

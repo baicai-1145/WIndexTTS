@@ -84,9 +84,3 @@ def build_tokenizer(
     )
 
 
-if __name__ == "__main__":
-    import torch
-    enc = build_tokenizer()
-    toks = enc.encode("<|zh|> 欢迎大家来体验indextts2。", allowed_special="all")
-    ref = torch.load("/root/windextts_dumps/frontend.tokens_zh.pt", weights_only=False).tolist()
-    print("tokens:", toks, "| match dump:", toks == ref, "| decode:", enc.decode(toks)[:50])

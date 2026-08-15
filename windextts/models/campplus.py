@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint as cp
 from collections import OrderedDict
 from torch import nn
 
@@ -8,11 +7,11 @@ from torch import nn
 def get_nonlinear(config_str, channels):
     nonlinear = nn.Sequential()
     for name in config_str.split("-"):
-        if name == "relu": nonlinear.add_module("relu", nn.ReLU(inplace=True))
-        elif name == "prelu": nonlinear.add_module("prelu", nn.PReLU(channels))
-        elif name == "batchnorm": nonlinear.add_module("batchnorm", nn.BatchNorm1d(channels))
-        elif name == "batchnorm_": nonlinear.add_module("batchnorm", nn.BatchNorm1d(channels, affine=False))
+        if name == "relu": m = nn.ReLU(inplace=True)
+        elif name == "prelu": m = nn.PReLU(channels)
+        elif name == "batchnorm" or name == "batchnorm_": m = nn.BatchNorm1d(channels, affine=(name == "batchnorm"))
         else: raise ValueError(f"Unexpected module ({name}).")
+        nonlinear.add_module("batchnorm" if name == "batchnorm_" else name, m)
     return nonlinear
 
 
@@ -60,34 +59,26 @@ class CAMLayer(nn.Module):
 
 
 class CAMDenseTDNNLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, bn_channels, kernel_size, stride=1, dilation=1, bias=False, config_str="batchnorm-relu", memory_efficient=False):
+    def __init__(self, in_channels, out_channels, bn_channels, kernel_size, stride=1, dilation=1, bias=False, config_str="batchnorm-relu"):
         super().__init__()
         assert kernel_size % 2 == 1, f"Expect equal paddings, but got even kernel size ({kernel_size})"
         padding = (kernel_size - 1) // 2 * dilation  # same-padding contract
-        self.memory_efficient = memory_efficient
         self.nonlinear1 = get_nonlinear(config_str, in_channels)
         self.linear1 = nn.Conv1d(in_channels, bn_channels, 1, bias=False)
         self.nonlinear2 = get_nonlinear(config_str, bn_channels)
         self.cam_layer = CAMLayer(bn_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=bias)
 
-    def bn_function(self, x): return self.linear1(self.nonlinear1(x))
-
     def forward(self, x):
-        if self.training and self.memory_efficient:
-            x = cp.checkpoint(self.bn_function, x)
-        else:
-            x = self.bn_function(x)
-        return self.cam_layer(self.nonlinear2(x))
+        return self.cam_layer(self.nonlinear2(self.linear1(self.nonlinear1(x))))
 
 
 class CAMDenseTDNNBlock(nn.ModuleList):
-    def __init__(self, num_layers, in_channels, out_channels, bn_channels, kernel_size, stride=1, dilation=1, bias=False, config_str="batchnorm-relu", memory_efficient=False):
+    def __init__(self, num_layers, in_channels, out_channels, bn_channels, kernel_size, stride=1, dilation=1, bias=False, config_str="batchnorm-relu"):
         super().__init__()
         for i in range(num_layers):
             self.add_module(f"tdnnd{i + 1}", CAMDenseTDNNLayer(
                 in_channels + i * out_channels, out_channels, bn_channels, kernel_size,
-                stride=stride, dilation=dilation, bias=bias, config_str=config_str,
-                memory_efficient=memory_efficient))
+                stride=stride, dilation=dilation, bias=bias, config_str=config_str))
 
     def forward(self, x):
         for layer in self: x = torch.cat([x, layer(x)], dim=1)
@@ -170,7 +161,7 @@ class FCM(nn.Module):
 
 class CAMPPlus(nn.Module):
     def __init__(self, feat_dim=80, embedding_size=192, growth_rate=32, bn_size=4,
-                 init_channels=128, config_str="batchnorm-relu", memory_efficient=True):
+                 init_channels=128, config_str="batchnorm-relu"):
         super().__init__()
         self.head = FCM(feat_dim=feat_dim)
         channels = self.head.out_channels
@@ -180,7 +171,7 @@ class CAMPPlus(nn.Module):
         for i, (num_layers, kernel_size, dilation) in enumerate(zip((12, 24, 16), (3, 3, 3), (1, 2, 2))):
             block = CAMDenseTDNNBlock(num_layers=num_layers, in_channels=channels, out_channels=growth_rate,
                                       bn_channels=bn_size * growth_rate, kernel_size=kernel_size, dilation=dilation,
-                                      config_str=config_str, memory_efficient=memory_efficient)
+                                      config_str=config_str)
             self.xvector.add_module(f"block{i + 1}", block)
             channels += num_layers * growth_rate
             self.xvector.add_module(f"transit{i + 1}", TransitLayer(channels, channels // 2, bias=False, config_str=config_str))

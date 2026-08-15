@@ -105,21 +105,3 @@ class Wav2Vec2BertConformer(nn.Module):
         return all_hs if all_hs is not None else h
 
 
-if __name__ == "__main__":
-    import sys; sys.path.insert(0, "/root/WIndexTTS")
-    import torchaudio
-    from transformers import Wav2Vec2BertModel
-    from windextts.frontend.audio_utils import SeamlessM4TFeaturizer
-    from windextts.weights import WeightLoader
-    dev = "cuda"
-    m = Wav2Vec2BertConformer().to(dev); m.load_official(WeightLoader().load_w2v_bert()); m.eval()
-    fe = SeamlessM4TFeaturizer(device=dev)
-    audio, sr = torchaudio.load("/root/WIndexTTS/test.wav")
-    a16 = torchaudio.transforms.Resample(sr, 16000)(audio).to(dev)
-    inp = fe(a16); am = torch.ones(inp.shape[:2], dtype=torch.int32, device=dev)
-    with torch.no_grad(): out = m(inp, am, return_layer=17)
-    off = Wav2Vec2BertModel.from_pretrained("/root/IndexTTS-2.5/hf_cache/w2v-bert-2.0", local_files_only=True).to(dev).eval()
-    with torch.no_grad(): ref = off(input_features=inp, attention_mask=am, output_hidden_states=True).hidden_states[17]
-    d = (out.float() - ref.float()).abs().max().item()
-    print(f"params {sum(p.numel() for p in m.parameters())/1e6:.1f}M, hidden[17] max_abs_diff={d:.3e}")
-    print("SMOKE", "OK" if d < 1e-3 else "FAIL")

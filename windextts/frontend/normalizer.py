@@ -214,11 +214,3 @@ class TextNormalizer:
         with open(glossary_path, "w", encoding="utf-8") as f:
             yaml.dump(self.term_glossary, f, allow_unicode=True, default_flow_style=False)
 
-if __name__ == "__main__":
-    norm = TextNormalizer()
-    for t in ["我有123本书", "3.14%的利润", "2024年1月1日", "你好world", "GPT-5的参数",
-              "IT行业薪资", "我叫张三", "晕XUAN4是一种GAN3觉", "受不liao3你了",
-              "GPT-5-Nano 是 GPT-5 模型家族中最小且速度最快的变体",
-              "克里斯托弗·诺兰执导了《盗梦空间》", "约瑟夫·高登-莱维特",
-              "I love you!", "See you at 8:00 AM", "This sales for 2.5% off, only $12.5."]:
-        print(f"{t!r} -> {norm.normalize(t)!r}")

@@ -71,17 +71,3 @@ def split_text_by_punctuation(text, max_chars=40):
     return segments
 
 
-if __name__ == "__main__":
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from windextts.frontend.tokenizer import build_tokenizer
-
-    enc = lambda s: build_tokenizer().encode(s, allowed_special="all")  # noqa: E731
-    long = "这是第一句话。这是第二句话，它比较长用来测试分段。第三句！最后一句。"
-    print("== by_tokens (20) ==")
-    print([f"{s}({len(enc(s))})" for s in split_text_by_tokens(long, enc, 20)])
-    print("== by_punct (12) ==")
-    print([f"{s!r}" for s in split_text_by_punctuation(long, 12)])
-    very_long = "人工智能正在改变世界的方方面面" * 10
-    segs = split_text_by_tokens(very_long, enc, 8)
-    print(f"== force-split: {len(segs)} segs, all<=8: {all(len(enc(s)) <= 8 for s in segs)}")

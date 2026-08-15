@@ -174,18 +174,3 @@ class BigVGAN(nn.Module):
             raise RuntimeError(f"BigVGAN load mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
 
 
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/root/WIndexTTS")
-    from windextts.weights import WeightLoader
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    m = BigVGAN(BigVGANConfig())
-    m.load_official(WeightLoader().load_bigvgan())
-    m = m.to(dev).eval()
-    ref_in = torch.load("/root/windextts_dumps/bigvgan.input_mel.pt", weights_only=False).to(dev)
-    ref_out = torch.load("/root/windextts_dumps/bigvgan.output_wav.pt", weights_only=False).to(dev)
-    with torch.no_grad():
-        out = m(ref_in)
-    diff = (out.float() - ref_out.float()).abs().max().item()
-    print(f"[BigVGAN] params={sum(p.numel() for p in m.parameters())/1e6:.1f}M shape={tuple(out.shape)} "
-          f"max_abs_diff={diff:.3e} allclose={torch.allclose(out.float(), ref_out.float(), atol=1e-3, rtol=1e-3)}")

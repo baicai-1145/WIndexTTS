@@ -66,18 +66,3 @@ def build_mel_basis_cache(out_path=None):
     return out
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.path.insert(0, "/root/WIndexTTS")
-    if not _DATA.exists():
-        build_mel_basis_cache()
-
-    mel_fn = MelSpectrogram(device="cuda")
-    audio22 = torch.load("/root/windextts_dumps/frontend.audio_22k.pt", weights_only=False).to("cuda")
-    ref = torch.load("/root/windextts_dumps/frontend.mel_fn_output.pt", weights_only=False)
-    out = mel_fn(audio22)
-    assert out.shape == ref.shape
-    diff = (out.float().cpu() - ref.float().cpu()).abs().max().item()
-    print(f"mel_fn out {tuple(out.shape)} max_abs_diff = {diff:.3e}")
-    print("SMOKE", "OK" if diff < 1e-3 else "FAIL")

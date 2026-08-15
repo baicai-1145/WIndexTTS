@@ -95,25 +95,3 @@ class SeamlessM4TFeaturizer:
         return out
 
 
-if __name__ == "__main__":
-    import sys
-    import torchaudio
-
-    if not _FRONTEND_CACHE_DEFAULT.exists():
-        SeamlessM4TFeaturizer.build_cache()
-    ref_path = Path("/root/windextts_dumps/w2v.input_features.pt")
-    if not ref_path.exists():
-        print(f"reference dump not found at {ref_path}; run "
-              f"scripts/dump_indextts_tensors.py --stages w2v first")
-        sys.exit(1)
-    ref = torch.load(ref_path, weights_only=False).cpu()
-    audio, sr = torchaudio.load("/root/WIndexTTS/test.wav")
-    audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-    out = SeamlessM4TFeaturizer()(audio_16k)
-    assert out.shape == ref.shape
-    # f64 compare: official dump is f32; near-zero-variance bins can differ in
-    # the last f32 bit (~0.025 at a few elements); true accuracy ~1e-6 in f64.
-    diff = (out.double() - ref.double()).abs().max().item()
-    print(f"out {tuple(out.shape)} vs ref {tuple(ref.shape)}")
-    print(f"max_abs_diff vs float32 dump = {diff:.3e} (incl. f32 truncation noise)")
-    print("SMOKE", "OK" if diff < 1e-3 else "FAIL")

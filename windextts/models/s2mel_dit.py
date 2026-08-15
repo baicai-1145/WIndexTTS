@@ -300,7 +300,6 @@ class DiT(nn.Module):
         self.content_mask_embedder = nn.Embedding(1, D)
         self.skip_linear = nn.Linear(D + 80, D)
         self.cond_x_merge_linear = nn.Linear(80 + 80 + 512 + 192, D)  # x|prompt_x|cond|style = 864
-        self.class_dropout_prob = 0.1
 
     def load_official(self, sd):
         remapped = {k[len("estimator."):]: v for k, v in sd.items() if k.startswith("estimator.")}
@@ -311,25 +310,12 @@ class DiT(nn.Module):
     def setup_caches(self, max_batch_size, max_seq_length):
         self.transformer.setup_caches(max_batch_size, max_seq_length, use_kv_cache=False)
 
-    def precast_linear_bf16(self):
-        # vLLM-Omni strategy: Linear/Conv1d weights -> bf16 (flash-attn eligible),
-        # LayerNorm/embeddings stay fp32. Returns param count cast.
-        n = 0
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv1d)):
-                for p in m.parameters(recurse=False):
-                    p.data = p.data.to(torch.bfloat16)
-                    n += p.numel()
-        return n
-
-    def forward(self, x, prompt_x, x_lens, t, style, cond, mask_content=False):
+    def forward(self, x, prompt_x, x_lens, t, style, cond):
         # x/prompt_x [B,80,T] -> [B,T,80]; cond [B,T,512] -> [B,T,D]
         B, _, T = x.size()
         t1 = self.t_embedder(t)                       # [B, D]
         x, prompt_x, cond = x.transpose(1, 2), prompt_x.transpose(1, 2), self.cond_projection(cond)
         x_in = torch.cat([x, prompt_x, cond, style[:, None].expand(B, T, 192)], -1)  # [B,T,864]
-        if (self.training and torch.rand(1) < self.class_dropout_prob) or (not self.training and mask_content):
-            x_in[..., 80:] = x_in[..., 80:] * 0       # classifier-free guidance dropout of cond+style
         x_in = self.cond_x_merge_linear(x_in)         # [B, T, D]
         x_mask = sequence_mask(x_lens, x_in.size(1)).to(x.device).unsqueeze(1)  # [B,1,T]
         x_mask_expanded = x_mask[:, None].expand(-1, 1, x_in.size(1), -1)  # [B,1,T,T] key-mask broadcast
