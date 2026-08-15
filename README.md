@@ -28,7 +28,13 @@ pip install windextts
 
 ## 状态
 
-**端到端推理 + 多轮加速优化完成**，纯 torch，比官方 bf16 快 **2.4x**。
+**已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。
+核心推理纯 torch、零 JIT 编译依赖，端到端推理 + 多轮加速优化完成，
+A10G 上比官方 bf16 快 **2.7x**（比 fp32 快 3.1x）。
+
+能力：CLI / OpenAI 兼容 HTTP API / Gradio WebUI / Python API 四入口；
+W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
+多语言、情感控制（向量/文本/参考音频）。
 
 ### 性能（A10G 24GB，4 段中文，稳态）
 
@@ -95,7 +101,6 @@ tts.infer(ref, text, 'ZH',
 
 ### 已知限制
 
-- **文本归一化**：第一版接受已处理文本；jieba/cn2an 中文归一化待补（非神经，独立任务）
 - **emo audio 项**：用 emovec_mat only（省略 merge_emovec conformer 的 (1-sum)*audio 校正项）
 - **CFM CUDA Graph**：全序列显存不足，默认 eager + TeaCache
 
@@ -159,10 +164,12 @@ curl -s http://localhost:8000/v1/audio/speech \
 ### WebUI（Gradio）
 
 ```bash
-# 仓库源码运行（webui.py 不在 pip 包内）
-git clone https://github.com/baicai-1145/WIndexTTS
-cd WIndexTTS && pip install -e ".[webui]"
-python webui.py --model_dir /path/to/IndexTTS-2.5    # 0.0.0.0:7860
+# 任意环境（wheel 内置 webui，四个入口点均可 pip 安装）
+pip install 'windextts[webui]'
+windextts-webui --model_dir /path/to/IndexTTS-2.5    # 0.0.0.0:7860
+
+# 或仓库源码运行
+python webui.py --model_dir /path/to/IndexTTS-2.5
 ```
 
 功能：参考音频上传、精度运行时切换（W4A16/fp16/fp32）、低显存模式、多语言、
@@ -179,11 +186,3 @@ tts = WIndexTTS(weights_dir="/path/to/IndexTTS-2.5",
 tts.warmup()
 sr, wav = tts.infer("voice.wav", "你好世界", "ZH")
 ```
-
-## 设计约束
-
-见 [AGENTS.md](./AGENTS.md)。核心铁律：
-
-- **纯 torch，零 JIT 编译**：核心推理路径在无 C/C++/CUDA 编译器的 Windows 上必须能跑。
-- **不依赖 index-tts / transformers / modelscope**：所有 `nn.Module` 自己写，权重只用 `torch.load` + `safetensors`。
-- **接缝魔数不可臆造**：唯一正确性标准是与官方输出 `torch.allclose(atol=1e-4, rtol=1e-3)`。
