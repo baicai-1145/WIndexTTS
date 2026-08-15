@@ -10,16 +10,10 @@ fp32 + non-null mask (flash rejects mask, cudnn rejects fp32+mask, torch 2.8).
 """
 from __future__ import annotations
 
-import math
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-
-__all__ = ["UnifiedVoice"]
-
 
 class Conv1D(nn.Linear):
     # HF Conv1D: weight [in,out], y = x@W. Subclassing nn.Linear (weights

@@ -186,42 +186,18 @@ class WIndexTTS:
         return self._qwen_emo
 
     def _apply_w4a16(self, group_size: int = 128) -> None:
-        """Quantize GPT transformer body nn.Linear weights to INT4 (W4A16).
-
-        Uses torchao int4_weight_only (tinygemm kernel, bf16 activations).
-        GPT-AR greedy codes are identical in bf16 vs fp16 (verified 101/101),
-        so the bf16 cast is lossless; INT4 adds small quantization error.
-        DiT/BigVGAN are NOT quantized (kept fp16).
-
-        Optional dependency: torchao. If unavailable, logs and no-ops.
-        """
+        # INT4 (W4A16) on the GPT body + mel_head via torchao tinygemm (bf16
+        # activations). GPT-AR greedy codes are identical in bf16 vs fp16
+        # (verified 101/101); INT4 adds small quantization error. Optional dep.
         try:
             from torchao.quantization import int4_weight_only, quantize_
         except ImportError:
             print(">> W4A16: torchao not installed, skipping quantization")
             return
-        import torch.nn as nn_torch
-        nn_lin = nn_torch.Linear
-        # Quantize all nn.Linear in the GPT transformer body (gpt.gpt.h.*.c_attn/
-        # c_proj/c_fc, plus emo/spk projections if Linear).
-        n_before = sum(1 for m in self.gpt.gpt.modules() if isinstance(m, nn_lin))
-        quantize_(
-            self.gpt.gpt,
-            int4_weight_only(group_size=group_size),
-            filter_fn=lambda mod, _fqn: isinstance(mod, nn_lin),
-        )
-        # Also quantize the lm_head (mel_head) and emo/spk Linear if present.
-        for attr in ("mel_head", "final_norm"):
-            pass  # final_norm is LayerNorm (skip); mel_head quantized below
-        if isinstance(self.gpt.mel_head, nn_lin):
-            quantize_(
-                self.gpt.mel_head,
-                int4_weight_only(group_size=group_size),
-                filter_fn=lambda mod, _fqn: isinstance(mod, nn_lin),
-            )
-        n_after = sum(1 for m in self.gpt.gpt.modules()
-                      if isinstance(m, nn_lin) and "Int4" in type(getattr(m.weight, "__class__", type(None))).__name__)
-        print(f">> W4A16: quantized GPT body ({n_before} nn.Linear, int4 tinygemm, group={group_size})")
+        quantize_(self.gpt.gpt, int4_weight_only(group_size=group_size),
+                  filter_fn=lambda m, _: isinstance(m, torch.nn.Linear))
+        quantize_(self.gpt.mel_head, int4_weight_only(group_size=group_size))
+        print(f">> W4A16: quantized GPT body + mel_head (int4 tinygemm, group={group_size})")
 
     def warmup(self):
         # Pre-capture CUDA Graphs + prime cuDNN autotune (shifts ~1s cold-start
@@ -276,26 +252,25 @@ class WIndexTTS:
             _ = self.bigvgan(mel.to(bg_dtype))
         torch.cuda.synchronize()
 
+    def _lazy(self, attr, factory):
+        if getattr(self, attr) is None:
+            setattr(self, attr, factory())
+        return getattr(self, attr)
+
     @property
     def featurizer(self):
-        if self._featurizer is None:
-            from windextts.frontend.audio_utils import SeamlessM4TFeaturizer
-            self._featurizer = SeamlessM4TFeaturizer(device=self.device)
-        return self._featurizer
+        from windextts.frontend.audio_utils import SeamlessM4TFeaturizer
+        return self._lazy("_featurizer", lambda: SeamlessM4TFeaturizer(device=self.device))
 
     @property
     def mel_fn(self):
-        if self._mel_fn is None:
-            from windextts.frontend.mel import MelSpectrogram
-            self._mel_fn = MelSpectrogram(device=self.device)
-        return self._mel_fn
+        from windextts.frontend.mel import MelSpectrogram
+        return self._lazy("_mel_fn", lambda: MelSpectrogram(device=self.device))
 
     @property
     def tokenizer(self):
-        if self._tokenizer is None:
-            from windextts.frontend.tokenizer import build_tokenizer
-            self._tokenizer = build_tokenizer(model_dir=str(self.weights.dir))
-        return self._tokenizer
+        from windextts.frontend.tokenizer import build_tokenizer
+        return self._lazy("_tokenizer", lambda: build_tokenizer(model_dir=str(self.weights.dir)))
 
     def _load_audio(self, path, max_seconds=REF_MAX_SECONDS):
         audio, sr = torchaudio.load(path)
@@ -325,6 +300,12 @@ class WIndexTTS:
         f = torchaudio.compliance.kaldi.fbank(audio_16k.to(self.device), num_mel_bins=80, dither=0, sample_frequency=REF_SR_W2V)
         return self.campplus((f - f.mean(0, keepdim=True)).unsqueeze(0))
 
+    def _mat_lookup(self, style, emo_vector):
+        w = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        mat = self.gpt.emo_matrix_lookup(
+            style, w, torch.split(self.spk_matrix, self.emo_num), torch.split(self.emo_matrix, self.emo_num))
+        return w, mat
+
     def build_emo_vec(self, style, spk_cond, emo_vector=None):
         # matrix+conformer blend (infer_v2_5.py:757-764):
         #   emovec = emovec_mat(RAW w) + (1 - sum(RAW w)) * get_emovec(spk)
@@ -332,10 +313,8 @@ class WIndexTTS:
         # base characteristics -> 'brick' audio at high single-emotion weights.
         if emo_vector is None:
             emo_vector = [0, 0, 0, 0, 0, 0, 0, 1.0]  # calm default
-        w = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        w, mat = self._mat_lookup(style, emo_vector)
         dt = self.gpt.emovec_layer.weight.dtype
-        mat = self.gpt.emo_matrix_lookup(
-            style, w, torch.split(self.spk_matrix, self.emo_num), torch.split(self.emo_matrix, self.emo_num))
         # matrix path stays RAW (feat2.pt is already in target space); only the
         # conformer emovec passes through emovec_layer+emo_layer (in get_emovec)
         return mat.to(dt) + float((1.0 - w.sum()).clamp(min=0.0)) * self.gpt.get_emovec(spk_cond.to(dt))
@@ -358,9 +337,7 @@ class WIndexTTS:
         emovec_audio = self.gpt.merge_emovec(spk_cond.to(dt), emo_cond.to(dt), alpha=emo_alpha)
         if emo_vector is None:
             return emovec_audio
-        w = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
-        mat = self.gpt.emo_matrix_lookup(
-            style, w, torch.split(self.spk_matrix, self.emo_num), torch.split(self.emo_matrix, self.emo_num))
+        w, mat = self._mat_lookup(style, emo_vector)
         return mat.to(dt) + float((1.0 - w.sum()).clamp(min=0.0)) * emovec_audio
 
     # ------------------------------------------------------------------
@@ -381,14 +358,7 @@ class WIndexTTS:
               cfg_rate=0.7, text_normalization=True, max_text_tokens_per_segment=120,
               interval_silence_ms=200, repetition_penalty=10.0, num_beams=3):
         dev = self.device
-
-        # text→mel ratio per language, MEASURED (Tatoeba 50 sents × 99 langs,
-        # greedy): ceil(median×2) capped 14 — see scripts/measure_lang_ratios.py.
-        # Script-family grouping visible: South Asian 4-6x, CJK/syllabic 6-12x,
-        # Cyrillic 8-10x, Latin 11-14x. Unmeasured fall back to 14 (safest).
-        _MEL_RATIO = dict(
-            (k, int(v)) for k, v in (p.split(":") for p in _MEL_RATIO_STR.split())
-        )
+        _MEL_RATIO = dict((k, int(v)) for k, v in (p.split(":") for p in _MEL_RATIO_STR.split()))
         if self.low_vram:
             # 390 mel tokens ≈ 7.8s/segment; budget shrinks to match (ZH 13:
             # 30 text × 13 = 390) so the warmup-captured beam3 bucket (576) is
@@ -437,24 +407,14 @@ class WIndexTTS:
                 repetition_penalty, num_beams,
             )
 
-        # multi-segment: synthesize each, join with silence
-        wavs = []
-        for seg in segments:
-            sr, wav = self._infer_single(
-                spk_audio_prompt, seg, lang, emo_vector,
-                emo_ref_path, emo_alpha,
-                duration_factor, do_sample, top_p, top_k, temperature,
-                _seg_mel_cap(seg), cfm_steps, cfg_rate,
-                repetition_penalty, num_beams,
-            )
-            wavs.append(wav)
+        # multi-segment: synthesize each, join with interval silence
+        wavs = [self._infer_single(
+            spk_audio_prompt, seg, lang, emo_vector, emo_ref_path, emo_alpha,
+            duration_factor, do_sample, top_p, top_k, temperature,
+            _seg_mel_cap(seg), cfm_steps, cfg_rate, repetition_penalty, num_beams)[1]
+            for seg in segments]
         silence = torch.zeros(int(OUTPUT_SR * interval_silence_ms / 1000))
-        parts = []
-        for i, w in enumerate(wavs):
-            parts.append(w)
-            if i < len(wavs) - 1:
-                parts.append(silence)
-        return OUTPUT_SR, torch.cat(parts)
+        return OUTPUT_SR, torch.cat(sum(([w, silence] for w in wavs[:-1]), []) + [wavs[-1]])
 
     def _ref_features(self, spk_audio_prompt):
         # (spk_cond, style, ref_mel) from cache or fresh extraction
