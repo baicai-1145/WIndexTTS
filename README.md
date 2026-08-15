@@ -50,31 +50,7 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 | WIndexTTS W4A16 低显存极速 | fp16 | 12 | greedy | **0.12** | **2.9G** | **5.3x** |
 | vLLM-Omni（默认 deploy） | bf16 | 25 | beam1 采样 | 0.20 | ~18G* | 3.10x |
 
-RTF = 合成耗时 / 音频时长（越小越好；<1 即快于实时）。vs 列按 RTF 均值计算。
-显存为稳态进程占用（加载 + CUDA Graph 缓存 + 推理峰值），单进程串行测量。
-*vLLM-Omni 为双 stage 引擎，各自预留 40% 显存配额（KV cache 拿走大部分），实测合计预留 ~18.8G、
-权重实际 ~6.3G——按配额计需要 ~19G 以上的卡才建议部署。
-低显存模式（`low_vram=True` / CLI `--low-vram`）：跳过 beam3 graph 捕获与 emo conformer 常驻，
-w2v-bert 权重按需上下卡——fp16 档 3.0G、W4A16 档 2.4G（3GB 卡可用）。低显存极速档 RTF 反而更低
-（更紧凑的 KV/graph 池 + greedy）；代价是 emo 参考音频功能需懒加载、首请求略慢。
-
-**零编译依赖下：默认档 RTF 0.24（比官方 fp32 快 2.6x）；W4A16 极速档 RTF 0.14、低显存极速档 0.12，均优于 vLLM-Omni 默认配置的 0.20。**
-
-> 显存注：win 各档显存较上一版略升（+0.4-0.7G）——GPT graph KV 池现按每段实际 token 数推导
->（池超配修复后每步 attention 扫描变短，速度提升）；graph 池按最大请求桶常驻。
-
-> 协议说明：本轮为长文本统一协议（音频 5.3-8.7s），与早期短句协议（~4s 成音）数字不可直接比较。
-> vLLM-Omni 为其默认 `indextts2_5.yaml` deploy 配置（beam1 采样 25 步 bf16+compile，DiT graph 关）；
-> 早期记录的 0.51s 均值来自手动开启 graph 的调优配置，非默认。
-> fp32@25 档（1.17x）为与官方逐位对齐的保真档：fp32 GEMM 计算密度是瓶颈（GPT-AR 984ms 占 64%），
-> 加速手段只消调度开销；要速度请下台阶到 fp16（GEMM 2x）。
->
-> ⚠️ **greedy（beam1+argmax）对效果影响较大**：无采样的确定性解码韵律机械拖沓、语速系统性偏慢（codes 显著多于
-> beam3 采样档），听感劣化程度远超 fp16/W4A16/12步等有损加速项。极速档若在意质量，建议用 `num_beams=1,
-> do_sample=True`（速度接近 greedy，保留采样自然度）；beam3+采样为官方质量档。
->
-> **W4A16 为有损加速档**：INT4 舍入使 mel codes 与 fp16/官方从首个 token 起即不同（波形 cosine
-> ~0.02，不满足数值对齐标准），但人工试听正常、自然度可用；追求与官方逐位一致请用 fp16/fp32。
+> ⚠️ **greedy（beam1+argmax）对效果影响较大**
 
 ### 各阶段拆解（fp16 beam3 @15步，短句协议；fp32 对照见括号）
 
@@ -105,24 +81,6 @@ fp32 档瓶颈：GEMM 计算密度（GPT-AR 984ms 占 64%），graph 等手段�
 | R13 | **fp16-native DiT**（移除 .float() 精度守卫） | S2Mel 433→400ms | cosine 0.9997 |
 | R14 | **CUDA-Graph beam search**（静态 batch K=3，无 KV 重排） | eager beam3 1464→~490ms，e2e 1.4→0.65s | 9/10 seed 位级一致 |
 
-### 未采用/已回退的方案及原因
-
-- **bf16 GPT**：7-bit 尾数不够，greedy 仅 27% 匹配（fp16 的 10-bit 足够，100%）
-- **torch.compile GPT**：与混合精度不兼容（dtype 报错）；**torch.compile S2Mel**：慢 14x
-- **TeaCache（已回退）**：曾作为 R1/R8 加速项；根因排查（监测信号缺 timestep + 无校准系数，跳步率 80%）
-  后按 vLLM-Omni 语义重实现并校准多项式系数，但听感验证仍不达标（36% 跳步即 4.4dB LSD 可感知劣化），
-  任何有效跳步率均可听出，而收益仅 ~9%——默认禁用，CUDA Graph 全量步为最优路径（vLLM-Omni 对
-  IndexTTS2 也未启用 TeaCache）
-- **GPT INT8 量化**：torchao/bitsandbytes 未安装（零外部依赖原则）
-- **BigVGAN CUDA Graph**：纯 torch conv 实测 0.89x 反而变慢，且 fp16 引入数值偏差
-- **bf16 DiT autocast**：autocast dispatch 开销在 batch=1 下净变慢 32ms（profiler-free A/B）
-- **Flash attention 解码**：不支持 seqlen_q≠seqlen_k 的 is_causal（解码场景 Q=1,K≈90）
-- **流水线 stream overlap**：各阶段串行依赖，单请求无可重叠独立工作
-- **CFG=0**：可省 ~50ms 但偏离训练分布，保留为可调参数
-
-> S2Mel CUDA Graph / fp16 DiT / beam3 Graph 曾被判定不可行，R12-R14 已逐一攻克启用，
-> 根因分析与数值证据见仓库内 docs/PERFORMANCE.md（本地文件，未随远端发布）。
-
 ### 可调参数（质量/速度权衡）
 
 ```python
@@ -137,21 +95,6 @@ tts.infer(ref, text, 'ZH',
     cfg_rate=0.7,         # CFG 强度（0.3=快10%，0.0=最快无引导）
 )
 ```
-
-### 实现历史（阶段 1-5）
-
-- ✅ **阶段1**：全部神经模块纯 torch 重写并数值对齐（diff=0.0~9.5e-7）
-  - w2v-bert(580M) / CAMPPlus / EnhancedCodec / GPT-AR / S2Mel-DiT(98M) / CFM / BigVGAN / LengthRegulator
-- ✅ **阶段2**：端到端流水线 `WIndexTTS.infer()` 跑通
-  - 前端：tiktoken tokenizer（6/6 精确）/ HiFiGAN mel（9.5e-7）/ SeamlessM4T featurizer
-- ✅ **阶段3**：GPT-AR decode 引擎（KV cache）替代 HF generate，greedy 49/49 精确
-- ✅ **阶段3b**：GPT-AR CUDA Graph，2.28x 加速，logits 逐位一致
-- ✅ **阶段4**：S2Mel CFM CUDA Graph（小序列验证，现为生产路径）
-- ✅ **阶段5**：参考音频特征缓存 + 加速优化循环（fp16/减步，详见上方加速轮次表）
-
-### 已知限制
-
-- **emo audio 项**：用 emovec_mat only（省略 merge_emovec conformer 的 (1-sum)*audio 校正项）
 
 ## 运行
 
