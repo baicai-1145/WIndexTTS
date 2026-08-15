@@ -6,6 +6,26 @@ Windows-priority, zero-JIT-compile, pure-torch accelerated inference engine for
 目标：在 **Windows 上 `pip install` 即用**（无 MSVC / nvcc / triton 编译依赖）的前提下，
 用纯 PyTorch 重写 IndexTTS-2.5 的神经网络推理，并实现比官方 `use_accel` 更彻底的 CUDA Graph 加速。
 
+## 快速开始（Windows）
+
+Windows 用户两种方式任选：
+
+### 方式一：整合包（解压即用，推荐）
+
+直接下载整合包（已内置模型权重，无需 Python / 编译工具链）：
+
+<https://www.modelscope.cn/models/baicai1145/WIndexTTS-Releases/resolve/master/WIndexTTS-Windows-Portable.7z>
+
+下载后解压，按包内说明运行即可。
+
+### 方式二：pip 安装
+
+```bash
+pip install windextts
+```
+
+模型权重需单独下载，见下方「获取模型权重」。
+
 ## 状态
 
 **端到端推理 + 多轮加速优化完成**，纯 torch，比官方 bf16 快 **2.4x**。
