@@ -344,6 +344,25 @@ class UnifiedVoice(nn.Module):
     # samplers from one prefill, cumulative log-prob winner (official semantics;
     # graph variant keeps a FIXED K batch — EOS beams keep feeding stop).
     # Returns codes [B, T_gen] (stop token included when produced).
+    # Shared prefill for all four decode paths: prepare inputs, append
+    # start_mel emb + mel pos, run the body, return (S, attention_mask, kvs,
+    # first-step logits [1,V]).
+    def _prefill(self, conditional_latents, text_inputs, langs):
+        ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
+        S = embeds.shape[1]  # conds+text, BEFORE start_mel
+        last = self.mel_embedding(ids[:, S:])
+        emb = torch.cat([embeds, last + self.mel_pos_embedding(last)], 1)  # [B,S+1,dim]
+        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
+        return S, attention_mask, kvs, self.mel_head(self.final_norm(hidden))[:, -1]
+
+    def _eager_step(self, next_id, step, attention_mask, kvs, mdtype, K_sel=None):
+        # eager decode of one token: mel_embedding + mel pos step+2 (header note)
+        nid = next_id if K_sel is None else next_id[K_sel]
+        e = self.mel_embedding(nid.unsqueeze(-1)) + self.mel_pos_embedding.get_fixed_embedding(step + 2, next_id.device)
+        attention_mask = torch.cat([attention_mask, torch.ones(attention_mask.shape[0], 1, dtype=attention_mask.dtype, device=next_id.device)], -1)
+        hidden, kvs = self.gpt(inputs_embeds=e, attention_mask=self._build_decode_mask(attention_mask, mdtype), past_key_values=kvs)
+        return attention_mask, kvs, self.mel_head(self.final_norm(hidden))[:, -1]
+
     def generate(self, conditional_latents, text_inputs, langs=None, max_new_tokens=500,
                  do_sample=False, top_k=30, top_p=0.8, temperature=0.8, stop_token=None,
                  use_cuda_graph=False, repetition_penalty=1.0, num_beams=1):
@@ -357,44 +376,25 @@ class UnifiedVoice(nn.Module):
         mdtype = next(self.parameters()).dtype
         if conditional_latents.dtype != mdtype:
             conditional_latents = conditional_latents.to(mdtype)
-        if use_cuda_graph and num_beams > 1:
-            return self._generate_beam_graph(
-                conditional_latents, text_inputs, langs, max_new_tokens,
-                do_sample, top_k, top_p, temperature, stop_token,
-                num_beams, repetition_penalty,
-            )
-        if use_cuda_graph and num_beams <= 1:
-            return self._generate_cuda_graph(
-                conditional_latents, text_inputs, langs, max_new_tokens,
-                do_sample, top_k, top_p, temperature, stop_token,
-                repetition_penalty=repetition_penalty,
-            )
+        a = (conditional_latents, text_inputs, langs, max_new_tokens,
+             do_sample, top_k, top_p, temperature, stop_token)
+        if use_cuda_graph:
+            if num_beams > 1:
+                return self._generate_beam_graph(*a, num_beams, repetition_penalty)
+            return self._generate_cuda_graph(*a, repetition_penalty=repetition_penalty)
         if num_beams > 1:
-            return self._generate_beam_search(
-                conditional_latents, text_inputs, langs, max_new_tokens,
-                do_sample, top_k, top_p, temperature, stop_token,
-                num_beams, repetition_penalty,
-            )
+            return self._generate_beam_search(*a, num_beams, repetition_penalty)
         device = conditional_latents.device
-        ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
-        S = embeds.shape[1]  # conds+text, BEFORE start_mel
-        last = self.mel_embedding(ids[:, S:])
-        emb = torch.cat([embeds, last + self.mel_pos_embedding(last)], 1)  # [B,S+1,dim]
-        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
-        cur_logits = self.mel_head(self.final_norm(hidden))[:, -1]  # [B,V] first mel code
+        S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
 
-        codes, gen_ids = [], torch.empty(ids.size(0), 0, dtype=torch.long, device=device)
+        codes, gen_ids = [], torch.empty(1, 0, dtype=torch.long, device=device)
         for step in range(max_new_tokens):
             next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature, gen_ids, repetition_penalty)
             codes.append(next_id)
             gen_ids = torch.cat([gen_ids, next_id.unsqueeze(1)], 1)
             if next_id.item() == stop_token:
                 break
-            # decode emb: mel_embedding(token) + mel pos step+2 (see header note)
-            e = self.mel_embedding(next_id.unsqueeze(-1)) + self.mel_pos_embedding.get_fixed_embedding(step + 2, device)
-            attention_mask = torch.cat([attention_mask, torch.ones(attention_mask.shape[0], 1, dtype=attention_mask.dtype, device=device)], -1)
-            hidden, kvs = self.gpt(inputs_embeds=e, attention_mask=self._build_decode_mask(attention_mask, mdtype), past_key_values=kvs)
-            cur_logits = self.mel_head(self.final_norm(hidden))[:, -1]
+            attention_mask, kvs, cur_logits = self._eager_step(next_id, step, attention_mask, kvs, mdtype)
         return torch.stack(codes, 1)  # [B, T_gen]
 
     # HF generate num_beams>1 semantics (official: beams=3, rep=10.0, sampled).
@@ -406,15 +406,10 @@ class UnifiedVoice(nn.Module):
                               repetition_penalty=1.0):
         device = conditional_latents.device
         mdtype = next(self.parameters()).dtype
-        ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
-        S = embeds.shape[1]
-        last = self.mel_embedding(ids[:, S:])
-        emb = torch.cat([embeds, last + self.mel_pos_embedding(last)], 1)
-        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
-        logits = self.mel_head(self.final_norm(hidden))
+        S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
 
         K = num_beams
-        cur_logits = logits[:, -1].expand(K, -1).contiguous()  # [K,V]
+        cur_logits = cur_logits.expand(K, -1).contiguous()  # [K,V]
         kvs = [(k.expand(K, -1, -1, -1).contiguous(), v.expand(K, -1, -1, -1).contiguous()) for k, v in kvs]
         attention_mask = attention_mask.expand(K, -1).contiguous()
         beam_scores = torch.zeros(K, dtype=torch.float32, device=device)
@@ -440,11 +435,7 @@ class UnifiedVoice(nn.Module):
             cur_logits = cur_logits[keep]
             kvs = [(k[keep], v[keep]) for k, v in kvs]
             attention_mask = attention_mask[keep]
-
-            e = self.mel_embedding(next_id[keep].unsqueeze(-1)) + self.mel_pos_embedding.get_fixed_embedding(step + 2, device)
-            attention_mask = torch.cat([attention_mask, torch.ones(attention_mask.shape[0], 1, dtype=attention_mask.dtype, device=device)], -1)
-            hidden, kvs = self.gpt(inputs_embeds=e, attention_mask=self._build_decode_mask(attention_mask, mdtype), past_key_values=kvs)
-            cur_logits = self.mel_head(self.final_norm(hidden))[:, -1]
+            attention_mask, kvs, cur_logits = self._eager_step(next_id, step, attention_mask, kvs, mdtype, K_sel=keep)
 
         if finished:
             return torch.tensor([max(finished, key=lambda x: x[0])[1]], dtype=torch.long, device=device)
@@ -460,15 +451,10 @@ class UnifiedVoice(nn.Module):
         mdtype = next(self.parameters()).dtype
         if device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("use_cuda_graph=True requires CUDA")
-        ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
-        S0 = embeds.shape[1]
-        last = self.mel_embedding(ids[:, S0:])
-        emb = torch.cat([embeds, last + self.mel_pos_embedding(last)], 1)
-        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
-        logits = self.mel_head(self.final_norm(hidden))
+        S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
 
         K = num_beams
-        S = S0 + 1  # prefill token count (KV buffer positions 0..S-1)
+        S = S + 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
         raw_seq = S + max_new_tokens + 8
         max_seq = ((raw_seq + 63) // 64) * 64
@@ -485,7 +471,7 @@ class UnifiedVoice(nn.Module):
             v_buf[:, :, :S, :].copy_(v.expand(K, -1, -1, -1))
 
         min_dt = torch.finfo(mask_buf.dtype).min
-        cur_logits = logits[:, -1, :].expand(K, -1).contiguous().float()  # [K,V]
+        cur_logits = cur_logits.expand(K, -1).contiguous().float()  # [K,V]
         beam_scores = torch.zeros(K, dtype=torch.float32, device=device)
         gen_ids = torch.empty(K, 0, dtype=torch.long, device=device)
         finished: list[tuple[float, list[int]]] = []
@@ -571,14 +557,8 @@ class UnifiedVoice(nn.Module):
         mdtype = next(self.parameters()).dtype
         if device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("use_cuda_graph=True requires CUDA")
-        ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
-        S0 = embeds.shape[1]
-        last = self.mel_embedding(ids[:, S0:])
-        emb = torch.cat([embeds, last + self.mel_pos_embedding(last)], 1)
-        hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
-        logits = self.mel_head(self.final_norm(hidden))
-
-        S = S0 + 1  # prefill token count (KV buffer positions 0..S-1)
+        S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
+        S += 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
         # bucket max_seq to 64 so similar text lengths reuse the graph
         max_seq = ((S + max_new_tokens + 8 + 63) // 64) * 64
@@ -593,8 +573,8 @@ class UnifiedVoice(nn.Module):
             v_buf[:, :, :S].copy_(v)
 
         min_dt = torch.finfo(mask_buf.dtype).min
-        codes, cur_logits = [], logits[:, -1]
-        gen_ids = torch.empty(ids.size(0), 0, dtype=torch.long, device=device)
+        codes = []
+        gen_ids = torch.empty(1, 0, dtype=torch.long, device=device)
         for step in range(max_new_tokens):
             next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature, gen_ids, repetition_penalty)
             codes.append(next_id)
@@ -612,26 +592,3 @@ class UnifiedVoice(nn.Module):
 
     def forward(self, *a, **kw):
         raise NotImplementedError("use prefill_logits_from_inputs / generate")
-
-
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/root/WIndexTTS")
-    from windextts.weights import WeightLoader
-
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    m = UnifiedVoice()
-    m.load_official(WeightLoader().load_gpt())
-    m.eval().to(dev)
-    print(f"[GPT] params: {sum(p.numel() for p in m.parameters())/1e6:.1f}M")
-
-    d = "/root/windextts_dumps"
-    conds = torch.load(f"{d}/gpt.conds_latent.pt", weights_only=False).to(dev)
-    tt = torch.load(f"{d}/gpt.text_tokens_short.pt", weights_only=False).to(dev)
-    lang = torch.load(f"{d}/gpt.lang.pt", weights_only=False).to(dev)
-    ref = torch.load(f"{d}/gpt.prefill_logits.pt", weights_only=False).to(dev)
-    with torch.no_grad():
-        logits = m.prefill_logits_from_inputs(conds, tt, lang)
-    diff = (logits.float() - ref.float()).abs().max().item()
-    print(f"prefill logits max_abs_diff = {diff:.3e}")
-    print("SMOKE", "OK" if diff < 1e-3 else "FAIL")
