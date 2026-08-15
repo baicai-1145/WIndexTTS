@@ -448,21 +448,11 @@ class UnifiedVoice(nn.Module):
         S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
 
         K = num_beams
-        S = S + 1  # prefill token count (KV buffer positions 0..S-1)
+        S += 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
-        raw_seq = S + max_new_tokens + 8
-        max_seq = ((raw_seq + 63) // 64) * 64
-        cache_key = (K, max_seq, mdtype)
-        cache = self._beam_graph_cache.get(cache_key)
-        if cache is None:
-            cache = self._capture_graph(K, max_seq)
-            self._beam_graph_cache[cache_key] = cache
+        max_seq = ((S + max_new_tokens + 8 + 63) // 64) * 64  # bucket to 64
+        cache = self._get_graph(self._beam_graph_cache, (K, max_seq, mdtype), K, max_seq, kvs, S, K=K)
         g, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf = cache
-
-        # copy prefill KVs into the front of the static buffers (K replicates)
-        for (k, v), (k_buf, v_buf) in zip(kvs, kv_bufs):
-            k_buf[:, :, :S, :].copy_(k.expand(K, -1, -1, -1))
-            v_buf[:, :, :S, :].copy_(v.expand(K, -1, -1, -1))
 
         min_dt = torch.finfo(mask_buf.dtype).min
         cur_logits = cur_logits.expand(K, -1).contiguous().float()  # [K,V]
@@ -477,9 +467,8 @@ class UnifiedVoice(nn.Module):
                 cur_logits, do_sample, top_k, top_p, temperature,
                 generated_ids=gen_ids, repetition_penalty=repetition_penalty,
             )  # [K]
-            tok_lp = F.log_softmax(cur_logits, dim=-1).gather(
-                1, next_id.unsqueeze(1)
-            ).squeeze(1)  # [K]
+            # _sample mutated cur_logits in place (penalty+warpers) — score under it
+            tok_lp = F.log_softmax(cur_logits, -1).gather(1, next_id.unsqueeze(1)).squeeze(1)
             cand_score = beam_scores + tok_lp  # [K] fp32
 
             is_eos = (next_id == stop_token) & ~done  # newly finished beams
@@ -519,6 +508,19 @@ class UnifiedVoice(nn.Module):
         hidden, _ = self.gpt(inputs_embeds=emb, attention_mask=mask_buf, kv_bufs=kv_bufs, kv_pos=kv_pos_buf)
         logits_buf.copy_(self.mel_head(self.final_norm(hidden))[:, 0])
 
+    def _get_graph(self, cache_dict, cache_key, B, max_seq, kvs, S, K=None):
+        # capture-or-reuse + copy prefill KVs into the static buffers' front
+        cache = cache_dict.get(cache_key)
+        if cache is None:
+            cache = self._capture_graph(B, max_seq)
+            cache_dict[cache_key] = cache
+        for (k, v), (k_buf, v_buf) in zip(kvs, cache[1]):
+            if K is not None:  # beam: replicate prefill KVs across the K rows
+                k, v = k.expand(K, -1, -1, -1), v.expand(K, -1, -1, -1)
+            k_buf[:, :, :S].copy_(k)
+            v_buf[:, :, :S].copy_(v)
+        return cache
+
     def _capture_graph(self, B, max_seq):
         # returns (graph, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf)
         p = next(self.parameters())
@@ -554,17 +556,9 @@ class UnifiedVoice(nn.Module):
         S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
         S += 1  # prefill token count (KV buffer positions 0..S-1)
         pad_len = int((attention_mask[0] == 0).sum().item())
-        # bucket max_seq to 64 so similar text lengths reuse the graph
-        max_seq = ((S + max_new_tokens + 8 + 63) // 64) * 64
-        cache_key = (max_seq, mdtype)
-        cache = self._graph_cache.get(cache_key)
-        if cache is None:
-            cache = self._capture_graph(1, max_seq)
-            self._graph_cache[cache_key] = cache
+        max_seq = ((S + max_new_tokens + 8 + 63) // 64) * 64  # bucket to 64
+        cache = self._get_graph(self._graph_cache, (max_seq, mdtype), 1, max_seq, kvs, S)
         g, kv_bufs, input_id_buf, pos_buf, kv_pos_buf, mask_buf, logits_buf = cache
-        for (k, v), (k_buf, v_buf) in zip(kvs, kv_bufs):
-            k_buf[:, :, :S].copy_(k)
-            v_buf[:, :, :S].copy_(v)
 
         min_dt = torch.finfo(mask_buf.dtype).min
         codes = []
