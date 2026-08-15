@@ -106,7 +106,8 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward(self, x, rope_cos, rope_sin, mask=None, kv_cache=None, cache_pos=0, cache_pos_is_tensor=False):
         h = x + self.self_attn(self.input_layernorm(x), rope_cos, rope_sin, mask, kv_cache, cache_pos, cache_pos_is_tensor)
-        return h + self.mlp.down_proj(F.silu(self.mlp.gate_proj(h)) * self.mlp.up_proj(h))
+        p = self.post_attention_layernorm(h)
+        return h + self.mlp.down_proj(F.silu(self.mlp.gate_proj(p)) * self.mlp.up_proj(p))
 
 
 class Qwen3ForCausalLM(nn.Module):

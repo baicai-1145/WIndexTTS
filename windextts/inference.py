@@ -45,44 +45,21 @@ REF_MAX_SECONDS = 15.0
 
 
 class WIndexTTS:
-    """Pure-torch IndexTTS-2.5 inference pipeline.
-
-    Construct once (loads all weights + modules), then call ``infer()`` per request.
-    """
-
-    def __init__(
-        self,
-        cfg: Config | None = None,
-        weights_dir: str | Path = None,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.float32,
-        enable_w4a16: bool = False,
-        enable_emo_ref: bool = True,
-        low_vram: bool = False,
-    ) -> None:
+    # Pure-torch IndexTTS-2.5 pipeline: construct once, then infer() per request.
+    def __init__(self, cfg=None, weights_dir=None, device="cuda", dtype=torch.float32,
+                 enable_w4a16=False, enable_emo_ref=True, low_vram=False):
         self.cfg = cfg or load_default_config()
-        self.device = device
-        self.dtype = dtype
-        self.enable_w4a16 = enable_w4a16  # W4A16 INT4 weight quantization (GPT only)
-        self.low_vram = low_vram  # skip beam3 graph capture + lazy emo_conditioning
-        # emo_ref_audio path (0.48GB); skipped at init in low_vram, lazy-loaded later
+        self.device, self.dtype = device, dtype
+        self.enable_w4a16 = enable_w4a16  # W4A16 INT4 quantization (GPT only)
+        self.low_vram = low_vram
         self.enable_emo_ref = enable_emo_ref and not low_vram
         from windextts.weights import DEFAULT_WEIGHTS_DIR
         self.weights = WeightLoader(weights_dir or DEFAULT_WEIGHTS_DIR)
-
-        # lazy-built frontend caches (built on first use if missing)
-        self._featurizer = None
-        self._mel_fn = None
-        self._tokenizer = None
-        self.w2v_use_autocast = False  # set True when w2v-bert runs in fp16 (LayerNorm fp32 fallback)
-
+        self._featurizer = self._mel_fn = self._tokenizer = None
+        self.w2v_use_autocast = False  # True when w2v-bert runs fp16
         self._load_modules()
 
-    # ------------------------------------------------------------------
-    # model loading
-    # ------------------------------------------------------------------
-
-    def _load_modules(self) -> None:
+    def _load_modules(self):
         from windextts.models.bigvgan import BigVGAN, BigVGANConfig
         from windextts.models.campplus import CAMPPlus
         from windextts.models.codec import EnhancedCodec
@@ -92,128 +69,89 @@ class WIndexTTS:
         from windextts.models.s2mel_dit import DiT
         from windextts.models.w2v2_bert import Wav2Vec2BertConformer
 
-        dev = self.device
-        w = self.weights
+        dev, w = self.device, self.weights
 
-        # w2v-bert conformer
         self.w2v_bert = Wav2Vec2BertConformer().to(dev)
-        self.w2v_bert.load_official(w.load_w2v_bert())
-        self.w2v_bert.eval()
+        self.w2v_bert.load_official(w.load_w2v_bert()); self.w2v_bert.eval()
         mean, var = w.load_w2v_stats()
-        # official (infer_v2_5.py:179): std = sqrt(var). The stats file stores
-        # VARIANCE — using it directly as std shrinks the normalization scale
-        # by ~3x, which scaled every w2v feature and shifted all downstream
-        # conds (spk_cond_emb, conds_latent) away from official.
-        self.w2v_mean = mean.to(dev)
-        self.w2v_std = torch.sqrt(var).to(dev)
+        # stats file stores VARIANCE — using it as std directly shrinks the
+        # normalization ~3x and shifts every downstream cond (official: sqrt)
+        self.w2v_mean, self.w2v_std = mean.to(dev), torch.sqrt(var).to(dev)
 
-        # CAMPPlus
         self.campplus = CAMPPlus(feat_dim=80, embedding_size=192).to(dev)
-        self.campplus.load_state_dict(w.load_campplus())
-        self.campplus.eval()
+        self.campplus.load_state_dict(w.load_campplus()); self.campplus.eval()
 
-        # EnhancedCodec
         sc = self.cfg.semantic_codec
         self.codec = EnhancedCodec(
             codebook_size=sc.codebook_size, hidden_size=sc.hidden_size,
             codebook_dim=sc.codebook_dim, vocos_dim=sc.vocos_dim,
             vocos_intermediate_dim=sc.vocos_intermediate_dim, vocos_num_layers=sc.vocos_num_layers,
         ).to(dev)
-        self.codec.load_state_dict(w.load_codec())
-        self.codec.eval()
+        self.codec.load_state_dict(w.load_codec()); self.codec.eval()
 
-        # GPT-AR (UnifiedVoice)
         self.gpt = UnifiedVoice().to(dev)
         # emo_conditioning (160M) is needed on EVERY path (even calm default
-        # mixes conformer emovec_audio), so it stays loaded. low_vram only skips
-        # the beam3 graph capture; emo_ref lazy-load is not possible.
+        # mixes conformer emovec_audio). low_vram only skips beam3 graph capture.
         self.gpt.build_emo_conditioning()
         self.gpt.emo_conditioning_encoder = self.gpt.emo_conditioning_encoder.to(dev)
         self.gpt.emo_perceiver_encoder = self.gpt.emo_perceiver_encoder.to(dev)
         self.gpt.load_official(w.load_gpt(), load_emo_conditioning=True)
         self.gpt.eval()
 
-        # emo matrices
         self.spk_matrix = w.load_spk_matrix().to(dev)   # feat1 [73,192]
         self.emo_matrix = w.load_emo_matrix().to(dev)   # feat2 [73,1280]
         self.emo_num = list(self.cfg._raw.get("emo_num", [3, 17, 2, 8, 4, 5, 10, 24]))
 
-        # S2Mel: length_regulator + DiT + CFM
         net = w.load_s2mel()
-        lr_cfg = self.cfg.s2mel.length_reg
+        lr = self.cfg.s2mel.length_reg
         self.length_regulator = InterpolateRegulator(
-            channels=lr_cfg.channels, sampling_ratios=lr_cfg.sampling_ratios,
-            is_discrete=lr_cfg.is_discrete, in_channels=lr_cfg.in_channels,
-            codebook_size=lr_cfg.content_codebook_size,
-        ).to(dev)
-        self.length_regulator.load_official(net["length_regulator"])
-        self.length_regulator.eval()
+            channels=lr.channels, sampling_ratios=lr.sampling_ratios, is_discrete=lr.is_discrete,
+            in_channels=lr.in_channels, codebook_size=lr.content_codebook_size).to(dev)
+        self.length_regulator.load_official(net["length_regulator"]); self.length_regulator.eval()
 
         self.dit = DiT().to(dev)
-        self.dit.load_official(net["cfm"])
-        self.dit.eval()
-
+        self.dit.load_official(net["cfm"]); self.dit.eval()
         cfm = S2MelCFM(self.dit, in_channels=self.cfg.s2mel.dit.in_channels).to(dev).eval()
         self.s2mel = S2Mel(self.length_regulator, cfm).to(dev).eval()
 
-        # BigVGAN
         bcfg = BigVGANConfig.from_json(Path(self.weights.dir) / "hf_cache" / "bigvgan" / "config.json")
         self.bigvgan = BigVGAN(bcfg).to(dev)
-        self.bigvgan.load_official(w.load_bigvgan())
-        self.bigvgan.eval()
-        # Flatten weight_norm -> plain weights (official path). Eliminates the
-        # _forward_pre_hook on every conv, removing ~149ms of host dispatch
-        # bubble (profiler: 91% of BigVGAN's large gaps were conv1d dispatch).
-        n = self.bigvgan.remove_weight_norm()
-        # weight_norm params are fp32 here; if BigVGAN later cast to fp16,
-        # the flattened weight goes along with the cast.
+        self.bigvgan.load_official(w.load_bigvgan()); self.bigvgan.eval()
+        # Flatten weight_norm -> plain weights: kills the _forward_pre_hook per
+        # conv (~149ms host dispatch bubble; profiler: 91% of BigVGAN's gaps)
+        self.bigvgan.remove_weight_norm()
 
         print(f">> WIndexTTS loaded all modules on {dev}")
-        # S2Mel CUDA Graph also for fp32: verified bit-identical to the eager
-        # full-step path (same seed/codes -> HF ratio equal to 6 decimals) and
-        # faster than eager.
+        # S2Mel CUDA Graph also for fp32 — verified bit-identical to eager
         self.s2mel_use_graph = True
 
-        # apply per-module precision overrides (mixed-precision fast paths)
-        # All three modules run fp16 — verified stable (0/30 brick in stress
-        # test across multiple texts/seeds) with CUDA Graph enabled.
-        #
-        # S2Mel CUDA Graph is ENABLED (s2mel_use_graph=True) after fixing the
-        # root-cause bug (dt_buf GC): the Euler timestep buffer `dt_buf` was a
-        # local variable not retained by the graph cache, so Python GC freed it
-        # and PyTorch's caching allocator reused its memory — the captured graph
-        # then read garbage dt values on replay, producing brick/clipped audio.
-        # Fix: store dt_buf in the cache dict to keep a Python reference alive.
-        # Additional defensive fix: keep_mask zeroes prompt+padding regions each
-        # Euler step to prevent WN conv reflect-pad leakage.
+        # fp16 fast path — verified stable (0/30 brick stress) with graphs on.
+        # (Historic root causes fixed & documented in s2mel_cfm.py: dt_buf GC,
+        # keep_mask reflect-pad leakage.)
         if self.dtype == torch.float16:
-            # w2v-bert: fp16 weights (cosine 0.99997 vs fp32, saves 1.16GB).
-            # It only runs once (prefill), so no AR error-cascading risk.
+            # w2v-bert fp16 (cosine 0.99997, saves 1.16GB; runs once, no AR
+            # error cascade)
             self.w2v_bert.to(torch.float16)
-            self.w2v_mean = self.w2v_mean.half()
-            self.w2v_std = self.w2v_std.half()
+            self.w2v_mean, self.w2v_std = self.w2v_mean.half(), self.w2v_std.half()
             self.gpt.to(torch.float16)
             self.bigvgan.to(torch.float16)
-            self.codec.to(torch.float16)  # codec.decode output feeds length_regulator
-            self.length_regulator.to(torch.float16)  # InterpolateRegulator
+            self.codec.to(torch.float16)          # decode feeds length_regulator
+            self.length_regulator.to(torch.float16)
             self.s2mel.cfm.estimator.to(torch.float16)
             self.s2mel.cfm.estimator_fp16_weights = True
-            self.s2mel_use_graph = True  # CUDA Graph enabled (dt_buf bug fixed)
+            self.s2mel_use_graph = True
             mode = "fp16"
             if self.enable_w4a16:
-                # W4A16: cast GPT to bf16 (torchao int4 tinygemm requires bf16)
-                # and quantize its nn.Linear weights to INT4. GPT-AR is numerically
-                # identical in bf16 vs fp16 (greedy codes 101/101 match), so this
-                # is safe. DiT/BigVGAN stay fp16 (their bf16 has dtype-mix issues).
+                # torchao int4 tinygemm requires bf16; GPT-AR greedy identical
+                # in bf16 vs fp16 (101/101). DiT/BigVGAN stay fp16 (bf16
+                # dtype-mix issues).
                 self.gpt.to(torch.bfloat16)
                 self._apply_w4a16()
                 mode = "W4A16 (GPT int4 bf16 + DiT/BigVGAN fp16)"
             print(f">> GPT-AR + BigVGAN + S2Mel-DiT {mode} (CUDA Graph enabled)")
 
-        # ref-audio feature cache: keyed by (path, mtime) → avoids recomputing
-        # w2v/campplus/mel when the same ref is reused across requests (stage 5).
-        self._ref_cache: dict = {}
-        # lazy-loaded text-processing modules (only built on first use)
+        # ref-audio feature cache: (path, mtime) → skips w2v/campplus/mel recompute
+        self._ref_cache = {}
         self._normalizer = None
         self._qwen_emo = None
 
@@ -279,19 +217,12 @@ class WIndexTTS:
                       if isinstance(m, nn_lin) and "Int4" in type(getattr(m.weight, "__class__", type(None))).__name__)
         print(f">> W4A16: quantized GPT body ({n_before} nn.Linear, int4 tinygemm, group={group_size})")
 
-    def warmup(self) -> None:
-        """Pre-capture CUDA Graphs + prime cuDNN autotune with dummy data.
-
-        Shifts the ~1s cold-start cost (graph capture + autotune) from the
-        first infer() call to model-load time. Call once after __init__ if
-        you care about first-request latency.
-        """
-        # NOTE: DiT bf16 autocast was tested profiler-free and is NET SLOWER
-        # for single-request inference (207ms vs 175ms fp32). bf16 kernels are
-        # faster but autocast's per-op dispatch overhead exceeds the kernel
-        # saving at batch=1 (the host becomes the bottleneck). Keep S2Mel fp32.
+    def warmup(self):
+        # Pre-capture CUDA Graphs + prime cuDNN autotune (shifts ~1s cold-start
+        # from the first infer() to load time).
+        # NOTE: DiT bf16 autocast is NET SLOWER at batch=1 (207ms vs 175ms fp32):
+        # autocast's per-op dispatch exceeds the kernel saving when host-bound.
         # (bf16+graph would recover it, but graph bucketing has numerics issues.)
-        # self.s2mel.cfm.estimator_autocast_dtype = torch.bfloat16
         import torchaudio
         dev = self.device
         # dummy ref audio (1s silence) to populate caches + capture graphs
@@ -313,11 +244,9 @@ class WIndexTTS:
         lang = torch.LongTensor([lang_to_token("ZH")]).to(dev)
         with torch.no_grad():
             use_cg = dev != "cpu"
-            # Production path is beam3 (official quality config) — always
-            # pre-capture its graph. low_vram: only the beam3 graph, at the
-            # small bucket the capped max_mel_tokens (390) will hit at runtime
-            # (max_seq 576: 390 + 124 text/cond tokens + 8 slack). Greedy graph
-            # skipped entirely (0.09GB saved).
+            # beam3 graph always (production quality config). low_vram: beam3
+            # only, at the bucket the capped 390 max_mel_tokens hits (max_seq
+            # 576 = 390 + 124 + 8); greedy graph skipped (0.09GB saved).
             warm_tokens = 390 if self.low_vram else 720
             codes = self.gpt.generate(
                 conds, tt_long if self.low_vram else tt, lang,
@@ -327,13 +256,10 @@ class WIndexTTS:
                 repetition_penalty=10.0, num_beams=3,
             )
             if not self.low_vram:
-                # also capture the greedy graph (used by do_sample=False callers).
-                # Bucket matters: max_seq = S + max_new_tokens rounded to 64, and
-                # every decode step's attention/mask kernels scan the FULL pool —
-                # an oversized warmup bucket (720 tokens -> 768 pool) makes every
-                # replay step ~4x slower than a right-sized one. Capture at the
-                # typical runtime bucket (~192) instead; longer requests simply
-                # capture their own bucket on first use.
+                # greedy graph too (do_sample=False callers), at the typical
+                # runtime bucket (~192): every decode step's attention/mask
+                # kernels scan the FULL KV pool, so an oversized bucket (768)
+                # makes each replay ~4x slower. Longer requests capture their own.
                 self.gpt.generate(
                     conds, tt, lang, max_new_tokens=150, do_sample=False,
                     stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
@@ -343,10 +269,6 @@ class WIndexTTS:
             bg_dtype = next(self.bigvgan.parameters()).dtype
             _ = self.bigvgan(mel.to(bg_dtype))
         torch.cuda.synchronize()
-
-    # ------------------------------------------------------------------
-    # frontend (lazy)
-    # ------------------------------------------------------------------
 
     @property
     def featurizer(self):
@@ -369,219 +291,95 @@ class WIndexTTS:
             self._tokenizer = build_tokenizer(model_dir=str(self.weights.dir))
         return self._tokenizer
 
-    # ------------------------------------------------------------------
-    # audio loading + feature extraction
-    # ------------------------------------------------------------------
-
-    def _load_audio(self, path: str, max_seconds: float = REF_MAX_SECONDS) -> tuple[torch.Tensor, int]:
-        """Load + truncate ref audio to max_seconds. Returns (audio[sr], sr)."""
+    def _load_audio(self, path, max_seconds=REF_MAX_SECONDS):
         audio, sr = torchaudio.load(path)
-        # truncate
-        max_samples = int(max_seconds * sr)
-        if audio.shape[1] > max_samples:
-            audio = audio[:, :max_samples]
-        return audio, sr
+        return (audio[:, : int(max_seconds * sr)], sr)  # truncate
 
     @torch.no_grad()
-    def extract_spk_cond(self, audio_16k: torch.Tensor) -> torch.Tensor:
-        """w2v-bert hidden_states[17] normalized → [B, T, 1024].
-
-        In low_vram mode the w2v-bert weights live on CPU between calls and are
-        streamed to GPU only while a reference audio needs encoding (~0.5s for
-        the 1.16GB fp16 copy over PCIe). Same-ref synthesis hits _ref_cache and
-        never touches w2v at all.
-        """
+    def extract_spk_cond(self, audio_16k):
+        # w2v-bert hidden_states[17] normalized -> [B,T,1024]. low_vram: weights
+        # streamed CPU->GPU only while encoding (~0.5s); same-ref hits _ref_cache.
         if self.low_vram and next(self.w2v_bert.parameters()).device.type == "cpu":
-            self.w2v_bert.to(self.device)  # stream back for this prefill
+            self.w2v_bert.to(self.device)
         inp, am = self.featurizer(audio_16k.to(self.device), return_mask=True)
-        # am: official semantics — stacked tail frame containing a padded row
-        # gets mask 0 (transformers indices % stride == 1 rule). Passing the
-        # correct mask matters: w2v-bert's masked positions alter the conformer
-        # attention and hence hidden_states[17] for EVERY frame (observed
-        # maxdiff ~11 with all-ones mask vs official).
-        # match w2v-bert weight dtype (fp16 on the fast path) to avoid mixed-dtype
-        # errors in the first feature_projection LayerNorm.
-        wb_dtype = self.w2v_bert.feature_projection.layer_norm.weight.dtype
-        feat = self.w2v_bert(inp.to(wb_dtype), am, return_layer=17)
-        out = (feat - self.w2v_mean) / self.w2v_std
+        # am: official semantics — a stacked tail frame over a padded row gets
+        # mask 0 (indices % stride == 1 rule). Matters: masked positions alter
+        # conformer attention and hidden_states[17] for EVERY frame (maxdiff ~11
+        # with an all-ones mask vs official).
+        wb = self.w2v_bert.feature_projection.layer_norm.weight.dtype
+        out = (self.w2v_bert(inp.to(wb), am, return_layer=17) - self.w2v_mean) / self.w2v_std
         if self.low_vram:
-            # free the 1.16GB w2v weights immediately; streamed back on the
-            # next different-reference synthesis (same-ref hits _ref_cache)
-            self.w2v_bert.to("cpu")
+            self.w2v_bert.to("cpu")  # free 1.16GB immediately
             torch.cuda.empty_cache()
         return out
 
     @torch.no_grad()
-    def extract_style(self, audio_16k: torch.Tensor) -> torch.Tensor:
-        """CAMPPlus speaker/style embedding → [1, 192]."""
-        feat = torchaudio.compliance.kaldi.fbank(
-            audio_16k.to(self.device), num_mel_bins=80, dither=0, sample_frequency=REF_SR_W2V
-        )
-        feat = feat - feat.mean(dim=0, keepdim=True)
-        return self.campplus(feat.unsqueeze(0))
+    def extract_style(self, audio_16k):
+        # CAMPPlus [1,192]; fbank mean-subtracted per column
+        f = torchaudio.compliance.kaldi.fbank(audio_16k.to(self.device), num_mel_bins=80, dither=0, sample_frequency=REF_SR_W2V)
+        return self.campplus((f - f.mean(0, keepdim=True)).unsqueeze(0))
 
-    # ------------------------------------------------------------------
-    # emo vector handling (infer_v2_5.py:672-678 + normalize_emo_vec)
-    # ------------------------------------------------------------------
-
-    def build_emo_vec(self, style: torch.Tensor, spk_cond: torch.Tensor, emo_vector: list[float] | None = None) -> torch.Tensor:
-        """Build the emo_vec [1,1280] for GPT conditioning.
-
-        Full official formula (infer_v2_5.py:757-764):
-            emovec_audio = merge_emovec(spk, spk, alpha=1.0)  # conformer path
-            emovec = emovec_mat + (1 - sum(normalize(w))) * emovec_audio
-
-        The (1-sum)*emovec_audio correction was previously omitted (caused
-        'brick' output when a single emotion weight was high — without the
-        spk-base emovec term, the conditioning lost the speaker's base
-        characteristics). Now restored via the conformer path.
-        """
+    def build_emo_vec(self, style, spk_cond, emo_vector=None):
+        # matrix+conformer blend (infer_v2_5.py:757-764):
+        #   emovec = emovec_mat(RAW w) + (1 - sum(RAW w)) * get_emovec(spk)
+        # The complement term is load-bearing: omitting it lost the speaker's
+        # base characteristics -> 'brick' audio at high single-emotion weights.
         if emo_vector is None:
             emo_vector = [0, 0, 0, 0, 0, 0, 0, 1.0]  # calm default
-        emo_vec_raw = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
-        spk_chunks = tuple(torch.split(self.spk_matrix, self.emo_num))
-        emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
-        emovec_mat_raw = self.gpt.emo_matrix_lookup(
-            style, emo_vec_raw, spk_chunks, emo_chunks
-        )  # [1,1280] (raw weights, no normalize; NOT through emo_layer)
-        # conformer path: emovec_audio from spk's own audio (alpha=1, pure spk)
-        gpt_dtype = self.gpt.emovec_layer.weight.dtype
-        emovec_audio = self.gpt.get_emovec(spk_cond.to(gpt_dtype))  # [1,1280] (through emo_layer)
-        # official line 769: complement = 1 - sum(RAW weight_vector), clamped >= 0
-        complement = float((1.0 - emo_vec_raw.sum()).clamp(min=0.0))
-        # emovec_mat is used RAW (no emo_layer) — matches official: the matrix
-        # (feat2.pt) is already in target space; only emovec_audio (conformer)
-        # passes through emovec_layer+emo_layer inside get_emovec.
-        return emovec_mat_raw.to(gpt_dtype) + complement * emovec_audio
+        w = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        dt = self.gpt.emovec_layer.weight.dtype
+        mat = self.gpt.emo_matrix_lookup(
+            style, w, torch.split(self.spk_matrix, self.emo_num), torch.split(self.emo_matrix, self.emo_num))
+        # matrix path stays RAW (feat2.pt is already in target space); only the
+        # conformer emovec passes through emovec_layer+emo_layer (in get_emovec)
+        return mat.to(dt) + float((1.0 - w.sum()).clamp(min=0.0)) * self.gpt.get_emovec(spk_cond.to(dt))
 
     @torch.no_grad()
-    def build_emo_vec_full(
-        self,
-        style: torch.Tensor,
-        spk_cond: torch.Tensor,
-        emo_vector: list[float] | None,
-        emo_ref_path: str | None,
-        emo_alpha: float,
-    ) -> torch.Tensor:
-        """Unified emo_vec [1,1280] assembly covering all three control modes.
-
-        Mirrors infer_v2_5.py:757-768: the conformer path ALWAYS runs first
-        (emovec = merge_emovec(spk_cond, emo_cond_emb, alpha), where emo_cond_emb
-        defaults to the spk reference's own w2v features); the matrix lookup is
-        only MIXED IN when the user explicitly passes emo_vector.
-
-        - emo_ref_path given: emo_cond from that audio's w2v features.
-        - else: emo_cond = spk_cond (official uses the spk reference as the
-          emotion reference by default — infer_v2_5.py:692 with
-          emo_audio_prompt=spk_audio_prompt).
-        - emo_vector given: emovec = emovec_mat + (1-sum(w)) * emovec_conformer.
-        - emo_vector None: emovec = emovec_conformer (pure conformer, official
-          default; previously we fell back to a calm matrix lookup, which
-          diverged from official conds_latent and shifted the whole GPT
-          trajectory).
-        """
-        # --- conformer path: ALWAYS runs (official default) ---
+    def build_emo_vec_full(self, style, spk_cond, emo_vector, emo_ref_path, emo_alpha):
+        # All three control modes (infer_v2_5.py:757-768). Conformer path ALWAYS
+        # runs; the matrix lookup only mixes in when emo_vector is explicit.
+        #   emo_ref_path: emo_cond from that audio; else emo_cond = spk_cond
+        #   (official doubles the spk ref as emo ref, infer_v2_5.py:692).
+        #   emo_vector given: mat(RAW w) + (1-sum) * conformer.
+        #   else: pure conformer (official default; a calm matrix fallback here
+        #   diverged conds_latent and shifted the whole GPT trajectory).
         if emo_ref_path is None:
-            emo_cond = spk_cond  # official: spk reference doubles as emo reference
+            emo_cond = spk_cond
         else:
-            import torchaudio as _ta
-            emo_audio, emo_sr = self._load_audio(emo_ref_path, REF_MAX_SECONDS)
-            emo_16k = _ta.transforms.Resample(emo_sr, REF_SR_W2V)(emo_audio)
-            emo_cond = self.extract_spk_cond(emo_16k)  # [1,T,1024]
-
-        # cast to GPT dtype (conformer runs in fp16 on the fast path)
-        gpt_dtype = self.gpt.emovec_layer.weight.dtype
-        emovec_audio = self.gpt.merge_emovec(
-            spk_cond.to(gpt_dtype), emo_cond.to(gpt_dtype), alpha=emo_alpha
-        )  # [1,1280] (already through emo_layer inside get_emovec)
-
+            ea, esr = self._load_audio(emo_ref_path, REF_MAX_SECONDS)
+            emo_cond = self.extract_spk_cond(torchaudio.transforms.Resample(esr, REF_SR_W2V)(ea))
+        dt = self.gpt.emovec_layer.weight.dtype
+        emovec_audio = self.gpt.merge_emovec(spk_cond.to(dt), emo_cond.to(dt), alpha=emo_alpha)
         if emo_vector is None:
             return emovec_audio
-
-        # matrix correction: emovec_mat + (1 - sum(weights)) * emovec_audio
-        emo_vec_raw = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
-        spk_chunks = tuple(torch.split(self.spk_matrix, self.emo_num))
-        emo_chunks = tuple(torch.split(self.emo_matrix, self.emo_num))
-        emovec_mat = self.gpt.emo_matrix_lookup(
-            style, emo_vec_raw, spk_chunks, emo_chunks
-        )  # [1,1280] (raw weights, no normalize)
-        # official line 769: complement = 1 - sum(RAW weight_vector), clamped >= 0
-        complement = float((1.0 - emo_vec_raw.sum()).clamp(min=0.0))
-        # emovec_mat used RAW (no emo_layer) — matches official.
-        return emovec_mat.to(gpt_dtype) + complement * emovec_audio
+        w = torch.tensor(emo_vector, device=self.device, dtype=torch.float32)
+        mat = self.gpt.emo_matrix_lookup(
+            style, w, torch.split(self.spk_matrix, self.emo_num), torch.split(self.emo_matrix, self.emo_num))
+        return mat.to(dt) + float((1.0 - w.sum()).clamp(min=0.0)) * emovec_audio
 
     # ------------------------------------------------------------------
     # main entry point
     # ------------------------------------------------------------------
 
+    # Zero-shot voice cloning. emo_vector: 8 weights [happy,angry,sad,afraid,
+    # disgusted,melancholic,surprised,calm]; emo_text overrides it (QwenEmotion);
+    # emo_ref_path: emotion reference audio. max_mel_tokens None = auto per
+    # segment (token count x language ratio x2 headroom +8 — keeps the GPT graph
+    # KV pool tight since per-step kernels scan the FULL pool). Long text is
+    # segmented (max_text_tokens_per_segment) and joined with interval silence.
+    # Returns (sr, audio [samples,]) @22050Hz.
     @torch.no_grad()
-    def infer(
-        self,
-        spk_audio_prompt: str,
-        text: str,
-        lang: str = "ZH",
-        emo_vector: list[float] | None = None,
-        emo_text: str | None = None,
-        emo_ref_path: str | None = None,
-        emo_alpha: float = 1.0,
-        duration_factor: float = 1.0,
-        do_sample: bool = True,
-        top_p: float = 0.8,
-        top_k: int = 30,
-        temperature: float = 0.8,
-        max_mel_tokens: int | None = None,
-        cfm_steps: int = 15,
-        cfg_rate: float = 0.7,
-        text_normalization: bool = True,
-        max_text_tokens_per_segment: int = 120,
-        interval_silence_ms: int = 200,
-        repetition_penalty: float = 10.0,
-        num_beams: int = 3,
-    ) -> tuple[int, torch.Tensor]:
-        """Zero-shot voice cloning.
-
-        Args:
-            spk_audio_prompt: path to reference audio (any sr).
-            text: text to synthesize (raw user text; normalized if
-                text_normalization=True).
-            lang: ZH / EN / JA / ...
-            emo_vector: 8-dim emotion weights [happy,angry,sad,afraid,
-                disgusted,melancholic,surprised,calm], or None for calm.
-            emo_text: free-text emotion description (e.g. "很开心的语气").
-                If given, overrides emo_vector via QwenEmotion prediction.
-            duration_factor: scales target length (1.72 * factor).
-            text_normalization: run G2P text normalization (digits→words,
-                punctuation, etc.) before tokenization.
-            max_text_tokens_per_segment: split long text into segments of at
-                most this many tokens; segments are synthesized separately and
-                concatenated with interval_silence_ms of silence between them.
-            max_mel_tokens: max mel codes GPT may emit per segment. If None
-                (recommended), auto-derived PER SEGMENT from the segment's
-                actual token count x language ratio (+2x safety headroom).
-                Sizing to actual demand keeps the GPT CUDA-Graph KV pool tight:
-                the graph's per-step attention/mask kernels scan the FULL pool
-                (max_seq = S + max_mel_tokens rounded to 64), so an oversized
-                cap (e.g. segment-limit-based 1560 for a 4s sentence) made
-                every decode step ~3x slower than needed. Set explicitly to
-                override.
-            repetition_penalty: HF repetition-penalty scale (official 10.0).
-            num_beams: GPT-AR beam width (official 3). Beam search now runs
-                through the CUDA-Graph decode path too (static batch K, fixed
-                KV buffers — no beam removal/reordering in the graph loop), so
-                the official quality configuration is no longer slow.
-        Returns:
-            (sample_rate, audio [samples,]) at 22050 Hz mono.
-        """
+    def infer(self, spk_audio_prompt, text, lang="ZH", emo_vector=None, emo_text=None,
+              emo_ref_path=None, emo_alpha=1.0, duration_factor=1.0, do_sample=True,
+              top_p=0.8, top_k=30, temperature=0.8, max_mel_tokens=None, cfm_steps=15,
+              cfg_rate=0.7, text_normalization=True, max_text_tokens_per_segment=120,
+              interval_silence_ms=200, repetition_penalty=10.0, num_beams=3):
         dev = self.device
 
-        # --- auto-couple max_mel_tokens to max_text_tokens_per_segment ---
-        # text→mel ratio is language-dependent. Coefficients below are MEASURED
-        # from Tatoeba (50 sentences × 99 languages, GPT-AR greedy). Each value
-        # = ceil(median_ratio × 2), capped at 14. See scripts/measure_lang_ratios.py
-        # and docs/PERFORMANCE.md for methodology. Grouping by script family is
-        # visible: complex South Asian scripts 4-6x; CJK/SE-Asian syllabic 6-12x;
-        # Cyrillic 8-10x; Latin/European 11-14x; en/es/fr/pt 14x. Unmeasured/rare
-        # languages fall back to 14 (highest measured value, safest).
+        # text→mel ratio per language, MEASURED (Tatoeba 50 sents × 99 langs,
+        # greedy): ceil(median×2) capped 14 — see scripts/measure_lang_ratios.py.
+        # Script-family grouping visible: South Asian 4-6x, CJK/syllabic 6-12x,
+        # Cyrillic 8-10x, Latin 11-14x. Unmeasured fall back to 14 (safest).
         _MEL_RATIO = {
             "AF": 13, "AM": 7, "AR": 14, "AS": 5, "AZ": 10, "BA": 6, "BE": 8,
             "BG": 9, "BN": 5, "BO": 4, "BR": 13, "BS": 13, "CA": 14, "CS": 11,
@@ -600,10 +398,9 @@ class WIndexTTS:
             "YUE": 13, "MINNAN": 13, "WUYU": 13,  # CJK family (inferred from ZH)
         }
         if self.low_vram:
-            # 390 mel tokens ≈ 7.8s audio per segment; segment budget shrinks to
-            # match (ZH ratio 13: 30 text tokens × 13 = 390) so segments stay
-            # un-truncated while the warmup-captured beam3 graph bucket (576)
-            # is reused at runtime.
+            # 390 mel tokens ≈ 7.8s/segment; budget shrinks to match (ZH 13:
+            # 30 text × 13 = 390) so the warmup-captured beam3 bucket (576) is
+            # reused at runtime without truncation.
             if max_mel_tokens is not None:
                 max_mel_tokens = min(max_mel_tokens, 390)
             max_text_tokens_per_segment = min(max_text_tokens_per_segment, 30)
