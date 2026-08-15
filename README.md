@@ -37,38 +37,48 @@ W4A16 极速档最快 0.43s——比官方快约 2 倍，最快延迟追平并�
 W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
 多语言、情感控制（向量/文本/参考音频）。
 
-### 性能（A10G 24GB，同协议实测：warmup + 4 段中文）
+### 性能（A10G 24GB，统一协议实测：4 段长中文（成音 5.3-8.7s）、beam3 采样、warmup 后每档 12 次计时）
 
-| 引擎 | 均值 | 最快 | RTF | 说明 |
-|---|---|---|---|---|
-| **WIndexTTS**（W4A16 greedy 极速） | **0.69s** | **0.43s** | **8.3x** | INT4 GPT + CUDA Graph（最快延迟） |
-| **WIndexTTS**（W4A16 beam3 默认） | **0.76s** | **0.51s** | **7.0x** | INT4 GPT（比 fp16 快 ~1.25x） |
-| **WIndexTTS**（fp16 greedy 极速） | **0.72s** | **0.48s** | **7.9x** | S2Mel CUDA Graph（fp16 DiT）+ 12 步 |
-| **WIndexTTS**（fp16 beam3 默认） | 0.96s | 0.64s | 6.0x | R14 CUDA-Graph beam search（官方质量档） |
-| vLLM-Omni fast（参照） | 0.51s | 0.47s | — | FlashInfer/Triton 全 graph（R14 记录） |
-| 官方 accel+bf16 | 1.13s | 1.09s | — | 官方 CUDA Graph 加速版（R14 记录） |
-| 官方 bf16 | 1.89s | 1.67s | — | transformers + HF generate |
-| 官方 fp32 | 1.74s | 1.65s | — | 默认精度 |
+| 引擎 | 精度 | CFM 步数 | 解码 | 均值 | 最快 | vs 官方 fp32 |
+|---|---|---|---|---|---|---|
+| 官方 fp32 | fp32 | 25 | beam3 采样 | 3.66s | 3.07s | 1.0x |
+| 官方 bf16 | bf16 | 25 | beam3 采样 | 4.03s | 3.39s | 0.91x（更慢） |
+| WIndexTTS 保真档 | fp32 | 25 | beam3 采样 | 3.12s | 2.68s | 1.17x |
+| WIndexTTS fp32 | fp32 | 15 | beam3 采样 | 2.77s | 2.40s | 1.32x |
+| WIndexTTS fp16 | fp16 | 25 | beam3 采样 | 1.73s | 1.34s | 2.12x |
+| **WIndexTTS 默认档** | **fp16** | **15** | beam3 采样 | **1.62s** | 1.23s | **2.26x** |
+| WIndexTTS W4A16 | fp16 | 12 | beam1 采样 | 1.30s | 0.93s | 2.82x |
+| WIndexTTS W4A16 极速 | fp16 | 12 | greedy | **1.01s** | **0.88s** | **3.62x** |
+| vLLM-Omni（默认 deploy） | bf16 | 25 | beam1 采样 | 1.15s | 0.90s | 3.18x |
 
-**零编译依赖下：默认档比官方 fp32 快 ~1.8x、比官方 bf16 快 ~2.0x；fp16 极速档最快 0.48s、W4A16 极速档最快 0.43s，最快延迟追平并超过 vLLM-Omni fast（0.47s）。**
+**零编译依赖下：默认档比官方 fp32 快 2.3x；W4A16 极速档最快 0.88s，全场最低延迟（vLLM-Omni 默认配置 0.90s）。**
 
-> WIndexTTS / 官方 fp32 / 官方 bf16 五行为同环境同协议实测（warmup + 4 段中文）；vLLM-Omni fast 与官方 accel
-> 为 docs/PERFORMANCE.md 的 R14 记录（该文档为仓库本地文件，未随远端发布）。
+> 协议说明：本轮为长文本统一协议（音频 5.3-8.7s），与早期短句协议（~4s 成音）数字不可直接比较。
+> vLLM-Omni 为其默认 `indextts2_5.yaml` deploy 配置（beam1 采样 25 步 bf16+compile，DiT graph 关）；
+> 早期记录的 0.51s 均值来自手动开启 graph 的调优配置，非默认。
+> fp32@25 档（1.17x）为与官方逐位对齐的保真档：fp32 GEMM 计算密度是瓶颈（GPT-AR 984ms 占 64%），
+> 加速手段只消调度开销；要速度请下台阶到 fp16（GEMM 2x）。
+>
+> ⚠️ **greedy（beam1+argmax）对效果影响较大**：无采样的确定性解码韵律机械拖沓、语速系统性偏慢（codes 显著多于
+> beam3 采样档），听感劣化程度远超 fp16/W4A16/12步等有损加速项。极速档若在意质量，建议用 `num_beams=1,
+> do_sample=True`（速度接近 greedy，保留采样自然度）；beam3+采样为官方质量档。
 >
 > **W4A16 为有损加速档**：INT4 舍入使 mel codes 与 fp16/官方从首个 token 起即不同（波形 cosine
 > ~0.02，不满足数值对齐标准），但人工试听正常、自然度可用；追求与官方逐位一致请用 fp16/fp32。
 
-### 各阶段拆解（R14 记录，beam3 默认档）
+### 各阶段拆解（fp16 beam3 @15步，短句协议；fp32 对照见括号）
 
 ```
-GPT-AR beam3 (CUDA Graph 静态 batch K=3)          ~490ms  ~62%  ← eager beam3 1464ms → 3.0x
-S2Mel-CFM (CUDA Graph, 15步；graph 与 TeaCache 互斥)  ~165ms  ~17%  ← fp16 DiT + graph（TeaCache 经校准+听感验证不可用，默认禁用）
-BigVGAN (fp16 + remove_weight_norm)                ~59ms   ~8%
+GPT-AR beam3 (CUDA Graph 静态 batch K=3)          ~526ms  ~51%  （fp32: 984ms，占 64%）
+S2Mel-CFM (CUDA Graph, 15步)                      ~154ms  ~15%  （fp32: 382ms）
+BigVGAN (fp16 + remove_weight_norm)                ~59ms   ~6%  （fp32: 80ms）
 codec + 前端 + Python 设置                          ~25ms   ~3%
 ─────────────────────────────────────────────────────────
-E2E beam3 默认档（今日实测）                       mean 0.96s / min 0.64s
-E2E greedy 极速档（今日实测）                      mean 0.72s / min 0.48s
+E2E（短句参考）                                    ~1.0s
+长文本统一协议见上表（默认档 1.62s / 极速档 1.01s）
 ```
+
+fp32 档瓶颈：GEMM 计算密度（GPT-AR 984ms 占 64%），graph 等手段只消调度开销；fp16 GEMM 2x 是最大单台阶。
 
 ### 加速轮次（R1-R14 精选）
 
@@ -107,7 +117,8 @@ tts = WIndexTTS(weights_dir=..., device="cuda", dtype=torch.float16,  # fp16 最
 
 tts.warmup()  # 预捕获 CUDA Graph，把 ~1s 冷启动成本移出首请求
 tts.infer(ref, text, 'ZH',
-    num_beams=3,          # 默认官方质量档；1 = greedy 极速（最快）
+    num_beams=3,          # 默认官方质量档；1+do_sample=True = 极速且自然；
+                          # 1+do_sample=False = 纯 greedy（最快但韵律机械拖沓，慎用）
     cfm_steps=15,         # CFM 欧拉步（15=听感无损下限；12=极速，音节末尾呼吸处轻微变差；25=最高）
     teacache_thresh=0.0,  # 0=禁用（默认，听感验证结论：任何有效跳步率均可感知劣化；graph 全量步已是最优）
     cfg_rate=0.7,         # CFG 强度（0.3=快10%，0.0=最快无引导）
