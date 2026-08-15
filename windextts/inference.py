@@ -34,7 +34,7 @@ import torchaudio
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Per-language text→mel ratio, MEASURED (Tatoeba 50 sents × 99 langs, greedy):
-# ceil(median×2) capped 14 — see scripts/measure_lang_ratios.py. MINNAN/WUYU
+# ceil(median×2) capped 14 (Tatoeba 50 sents × 99 langs). MINNAN/WUYU
 # inferred from ZH (CJK family); unmeasured languages fall back to 14.
 _MEL_RATIO_STR = "AF:13 AM:7 AR:14 AS:5 AZ:10 BA:6 BE:8 BG:9 BN:5 BO:4 BR:13 BS:13 CA:14 CS:11 CY:11 DA:13 DE:13 EL:7 EN:14 ES:14 ET:14 EU:13 FA:11 FI:11 FO:13 FR:14 GL:14 GU:4 HA:12 HAW:10 HE:9 HI:6 HR:12 HT:14 HU:12 HY:6 ID:13 IS:10 IT:13 JA:12 JW:10 KA:6 KK:6 KM:6 KN:6 KO:10 LA:14 LB:12 LN:11 LO:4 LT:12 LV:10 MG:14 MI:11 MK:8 ML:4 MN:6 MR:5 MS:13 MT:11 MY:6 NE:5 NL:14 NN:14 NO:14 OC:14 PA:4 PL:11 PS:9 PT:14 RO:11 RU:9 SA:6 SI:6 SK:12 SL:13 SN:13 SO:13 SQ:11 SR:10 SU:12 SV:13 SW:11 TA:6 TE:5 TG:7 TH:6 TK:11 TL:14 TR:12 TT:8 UK:9 UR:10 UZ:12 VI:10 YI:6 YO:10 ZH:13 YUE:13 MINNAN:13 WUYU:13"
 
