@@ -89,12 +89,12 @@ fp32 档瓶颈：GEMM 计算密度（GPT-AR 984ms 占 64%），graph 等手段�
 
 | 轮次 | 技术 | 效果 | 质量 |
 |---|---|---|---|
-| R1 | TeaCache（S2Mel DiT 步骤跳过） | S2Mel 465→247ms (1.88x) | mel cosine 0.98 |
+| R1 | ~~TeaCache（S2Mel DiT 步骤跳过）~~（已回退，见下） | S2Mel 465→247ms (1.88x) | mel cosine 0.98 |
 | R2 | fp16 GPT-AR（混合精度） | GPT 430→245ms (1.77x) | greedy 78/78 精确 |
 | R3 | fp16 BigVGAN | 89→58ms (1.53x) | cosine 0.9998 |
 | R4 | CFM 欧拉步 25→15 | S2Mel 251→177ms | cosine 0.998 |
 | R5 | 紧凑 KV buffer（max_mel_tokens 1000→300） | GPT 184→124ms (1.48x) | 无截断 |
-| R8 | TeaCache 阈值 0.15→0.25 | S2Mel 185→165ms | cosine 0.999 |
+| R8 | ~~TeaCache 阈值 0.15→0.25~~（已回退） | S2Mel 185→165ms | cosine 0.999 |
 | R9 | CFM 步数 15→12 | S2Mel 168→137ms | cosine 0.9995 |
 | R12 | **S2Mel CUDA Graph 修复并启用**（dt_buf GC + freqs_cis rebuild 两个根因 bug） | eager 488→graph 442ms | 0/75 板砖，21/21 对齐 |
 | R13 | **fp16-native DiT**（移除 .float() 精度守卫） | S2Mel 433→400ms | cosine 0.9997 |
@@ -103,7 +103,11 @@ fp32 档瓶颈：GEMM 计算密度（GPT-AR 984ms 占 64%），graph 等手段�
 ### 未采用/已回退的方案及原因
 
 - **bf16 GPT**：7-bit 尾数不够，greedy 仅 27% 匹配（fp16 的 10-bit 足够，100%）
-- **torch.compile GPT**：与混合精度不兼容（dtype 报错）；**torch.compile S2Mel**：TeaCache 动态状态触发持续重编译，慢 14x
+- **torch.compile GPT**：与混合精度不兼容（dtype 报错）；**torch.compile S2Mel**：慢 14x
+- **TeaCache（已回退）**：曾作为 R1/R8 加速项；根因排查（监测信号缺 timestep + 无校准系数，跳步率 80%）
+  后按 vLLM-Omni 语义重实现并校准多项式系数，但听感验证仍不达标（36% 跳步即 4.4dB LSD 可感知劣化），
+  任何有效跳步率均可听出，而收益仅 ~9%——默认禁用，CUDA Graph 全量步为最优路径（vLLM-Omni 对
+  IndexTTS2 也未启用 TeaCache）
 - **GPT INT8 量化**：torchao/bitsandbytes 未安装（零外部依赖原则）
 - **BigVGAN CUDA Graph**：纯 torch conv 实测 0.89x 反而变慢，且 fp16 引入数值偏差
 - **bf16 DiT autocast**：autocast dispatch 开销在 batch=1 下净变慢 32ms（profiler-free A/B）
@@ -125,7 +129,6 @@ tts.infer(ref, text, 'ZH',
     num_beams=3,          # 默认官方质量档；1+do_sample=True = 极速且自然；
                           # 1+do_sample=False = 纯 greedy（最快但韵律机械拖沓，慎用）
     cfm_steps=15,         # CFM 欧拉步（15=听感无损下限；12=极速，音节末尾呼吸处轻微变差；25=最高）
-    teacache_thresh=0.0,  # 0=禁用（默认，听感验证结论：任何有效跳步率均可感知劣化；graph 全量步已是最优）
     cfg_rate=0.7,         # CFG 强度（0.3=快10%，0.0=最快无引导）
 )
 ```
@@ -138,14 +141,12 @@ tts.infer(ref, text, 'ZH',
   - 前端：tiktoken tokenizer（6/6 精确）/ HiFiGAN mel（9.5e-7）/ SeamlessM4T featurizer
 - ✅ **阶段3**：GPT-AR decode 引擎（KV cache）替代 HF generate，greedy 49/49 精确
 - ✅ **阶段3b**：GPT-AR CUDA Graph，2.28x 加速，logits 逐位一致
-- ✅ **阶段4**：S2Mel CFM CUDA Graph（小序列验证）+ TeaCache 步骤跳过（生产路径）
-- ✅ **阶段5**：参考音频特征缓存 + 加速优化循环（fp16/减步/TeaCache，详见上方加速轮次表）
+- ✅ **阶段4**：S2Mel CFM CUDA Graph（小序列验证，现为生产路径）
+- ✅ **阶段5**：参考音频特征缓存 + 加速优化循环（fp16/减步，详见上方加速轮次表）
 
 ### 已知限制
 
 - **emo audio 项**：用 emovec_mat only（省略 merge_emovec conformer 的 (1-sum)*audio 校正项）
-- **S2Mel CUDA Graph 与 TeaCache 互斥**：graph 路径自动禁用 TeaCache（data-dependent 分支无法 capture）；
-  eager + TeaCache 作为备选路径保留
 
 ## 运行
 
