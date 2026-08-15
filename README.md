@@ -6,6 +6,8 @@ Windows-priority, zero-JIT-compile, pure-torch accelerated inference engine for
 目标：在 **Windows 上 `pip install` 即用**（无 MSVC / nvcc / triton 编译依赖）的前提下，
 用纯 PyTorch 重写 IndexTTS-2.5 的神经网络推理，并实现比官方 `use_accel` 更彻底的 CUDA Graph 加速。
 
+**vs 官方 index-tts：核心推理代码少 1w+ 行（19513 → 2315 纯代码），速度更快（最高 4.6x），功能更多（CUDA Graph 全覆盖 / W4A16 / 低显存）。**
+
 ## 快速开始（Windows）
 
 Windows 用户两种方式任选：
