@@ -30,8 +30,8 @@ pip install windextts
 
 **已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。
 核心推理纯 torch、零 JIT 编译依赖，端到端推理 + 多轮加速优化完成，
-A10G 上默认档（beam3 官方质量）约 0.96s、极速档约 0.72s（最快 0.48s）——
-比官方快约 2 倍，最快延迟追平 vLLM-Omni fast。
+A10G 上默认档（beam3 官方质量）约 0.96s、fp16 极速档约 0.72s（最快 0.48s）、
+W4A16 极速档最快 0.43s——比官方快约 2 倍，最快延迟追平并超过 vLLM-Omni fast。
 
 能力：CLI / OpenAI 兼容 HTTP API / Gradio WebUI / Python API 四入口；
 W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
@@ -41,6 +41,8 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 
 | 引擎 | 均值 | 最快 | RTF | 说明 |
 |---|---|---|---|---|
+| **WIndexTTS**（W4A16 greedy 极速） | **0.69s** | **0.43s** | **8.3x** | INT4 GPT + CUDA Graph（最快延迟） |
+| **WIndexTTS**（W4A16 beam3 默认） | **0.76s** | **0.51s** | **7.0x** | INT4 GPT（比 fp16 快 ~1.25x） |
 | **WIndexTTS**（fp16 greedy 极速） | **0.72s** | **0.48s** | **7.9x** | S2Mel CUDA Graph（fp16 DiT）+ 12 步 |
 | **WIndexTTS**（fp16 beam3 默认） | 0.96s | 0.64s | 6.0x | R14 CUDA-Graph beam search（官方质量档） |
 | vLLM-Omni fast（参照） | 0.51s | 0.47s | — | FlashInfer/Triton 全 graph（R14 记录） |
@@ -48,10 +50,13 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 | 官方 bf16 | 1.89s | 1.67s | — | transformers + HF generate |
 | 官方 fp32 | 1.74s | 1.65s | — | 默认精度 |
 
-**零编译依赖下：默认档比官方 fp32 快 ~1.8x、比官方 bf16 快 ~2.0x；极速档最快 0.48s（比官方快 ~3.4x），最快延迟追平 vLLM-Omni fast（0.47s）。**
+**零编译依赖下：默认档比官方 fp32 快 ~1.8x、比官方 bf16 快 ~2.0x；fp16 极速档最快 0.48s、W4A16 极速档最快 0.43s，最快延迟追平并超过 vLLM-Omni fast（0.47s）。**
 
-> WIndexTTS / 官方 fp32 / 官方 bf16 三行是今日同环境同协议实测；vLLM-Omni fast 与官方 accel
+> WIndexTTS / 官方 fp32 / 官方 bf16 五行为同环境同协议实测（warmup + 4 段中文）；vLLM-Omni fast 与官方 accel
 > 为 docs/PERFORMANCE.md 的 R14 记录（该文档为仓库本地文件，未随远端发布）。
+>
+> **W4A16 为有损加速档**：INT4 舍入使 mel codes 与 fp16/官方从首个 token 起即不同（波形 cosine
+> ~0.02，不满足数值对齐标准），但人工试听正常、自然度可用；追求与官方逐位一致请用 fp16/fp32。
 
 ### 各阶段拆解（R14 记录，beam3 默认档）
 
@@ -97,7 +102,8 @@ E2E greedy 极速档（今日实测）                      mean 0.72s / min 0.4
 ### 可调参数（质量/速度权衡）
 
 ```python
-tts = WIndexTTS(weights_dir=..., device="cuda", dtype=torch.float16)  # fp16 最快；默认 fp32 保对齐
+tts = WIndexTTS(weights_dir=..., device="cuda", dtype=torch.float16,  # fp16 最快保真；默认 fp32
+                enable_w4a16=True)  # INT4 GPT（更快，有损，听感可用；需 pip install 'windextts[quant]'）
 
 tts.warmup()  # 预捕获 CUDA Graph，把 ~1s 冷启动成本移出首请求
 tts.infer(ref, text, 'ZH',
