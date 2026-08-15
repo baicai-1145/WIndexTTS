@@ -37,13 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Usage:")[-1] if __doc__ else None,
     )
-    # required inputs
     p.add_argument("--ref", required=True, help="reference audio path (5-15s clean speech)")
     p.add_argument("--text", help="text to synthesize (or use --text-file)")
     p.add_argument("--text-file", help="read text from a file (UTF-8)")
     p.add_argument("-o", "--output", default="output.wav", help="output wav path")
 
-    # engine mode
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--fp32", action="store_true", help="fp32 weights (highest precision, ~7.6GB)")
     mode.add_argument("--w4a16", action="store_true",
@@ -53,13 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "beam3 kept, ~2.9GB steady)")
     p.add_argument("--model-dir", default=None, help="weights directory (gpt.pth, config.yaml, ...)")
 
-    # language / prosody
     p.add_argument("--lang", default="ZH",
                    help="language token (ZH/EN/JA/KO/YUE/..., default ZH)")
     p.add_argument("--duration", type=float, default=1.0,
                    help="duration factor (official 1.72 scale × factor, default 1.0)")
 
-    # emotion (mutually exclusive sources)
     emo = p.add_mutually_exclusive_group()
     emo.add_argument("--emo-vector",
                      help="8-dim emotion weights happy,angry,sad,afraid,disgusted,"
@@ -67,24 +63,20 @@ def build_parser() -> argparse.ArgumentParser:
     emo.add_argument("--emo-text", help="free-text emotion description (QwenEmotion)")
     emo.add_argument("--emo-ref", help="emotion reference audio path (conformer path)")
 
-    # sampling
     p.add_argument("--greedy", action="store_true", help="greedy decode (beam=1, deterministic)")
     p.add_argument("--top-p", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=30)
     p.add_argument("--temperature", type=float, default=0.8)
 
-    # perf knobs
     p.add_argument("--cfm-steps", type=int, default=12,
                    help="S2Mel CFM Euler steps (official 25, default 12)")
     p.add_argument("--no-normalize", action="store_true",
                    help="skip text normalization (G2P digits/punctuation)")
     p.add_argument("--segment-tokens", type=int, default=120,
                    help="max text tokens per segment (long texts auto-split)")
-
     p.add_argument("--verbose", action="store_true", help="print per-run timing + VRAM")
 
-    # model install (download weights without synthesizing) — ModelScope direct
-    # links, no SDK dependency, resumable
+    # ModelScope direct links, no SDK dependency, resumable
     p.add_argument("--install-model", action="store_true",
                    help="download model weights to --model-dir (or WINDEXTTS_WEIGHTS_DIR) "
                         "and exit; ~7.5GB from ModelScope direct links. Resumable. "
@@ -98,7 +90,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    # --- model install mode ---
     if args.install_model:
         from windextts.download import download_model
         target = args.model_dir or os.environ.get("WINDEXTTS_WEIGHTS_DIR")
@@ -109,7 +100,6 @@ def main(argv: list[str] | None = None) -> int:
         download_model(target, include_qwen=not args.skip_qwen)
         return 0
 
-    # --- text source ---
     if args.text_file:
         with open(args.text_file, encoding="utf-8") as f:
             text = f.read()
@@ -123,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
         print("error: empty text", file=sys.stderr)
         return 2
 
-    # --- emotion vector parsing ---
     emo_vector = None
     if args.emo_vector:
         try:
@@ -136,7 +125,6 @@ def main(argv: list[str] | None = None) -> int:
                   "(happy,angry,sad,afraid,disgusted,melancholic,surprised,calm)", file=sys.stderr)
             return 2
 
-    # --- engine ---
     import torch
     from windextts.inference import WIndexTTS
 
@@ -151,7 +139,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[load+warmup] {time.perf_counter() - t0:.1f}s  "
               f"VRAM alloc {torch.cuda.memory_allocated() / 1e9:.2f}GB", file=sys.stderr)
 
-    # --- synthesize ---
     t0 = time.perf_counter()
     sr, audio = tts.infer(
         spk_audio_prompt=args.ref,

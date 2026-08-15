@@ -1,15 +1,3 @@
-"""WIndexTTS WebUI — Gradio interface for zero-shot voice cloning.
-
-A self-contained reimplementation of the official IndexTTS webui interaction,
-wired directly to the pure-torch WIndexTTS engine (no indextts/transformers
-dependency). Replicates the core UX: reference audio + text → synthesized
-speech, with language selection, duration control, emotion (vector / text /
-reference-audio), and advanced sampling parameters.
-
-Run:
-    python webui.py --model_dir /root/IndexTTS-2.5
-    python webui.py --port 7860 --host 0.0.0.0
-"""
 
 from __future__ import annotations
 
@@ -108,7 +96,6 @@ def engine_status_text() -> str:
 
 
 def apply_engine_config(precision, low_vram, progress=gr.Progress()):
-    """Rebuild the engine with the requested precision / low_vram setting."""
     if _engine["building"]:
         gr.Warning("引擎正在重建中，请等待完成")
         return engine_status_text()
@@ -180,7 +167,6 @@ def synthesize(
     cfm_steps,
     progress=gr.Progress(),
 ):
-    """Run WIndexTTS.infer() from UI inputs; return output audio path."""
     progress(0, desc="准备中...")
     if prompt_audio is None and cmd_args.ref is None:
         gr.Warning("请上传参考音频")
@@ -492,7 +478,6 @@ with gr.Blocks(
 
 
 def main() -> None:
-    """Console entry point (windextts-webui / python -m windextts.webui)."""
     demo.launch(server_name=cmd_args.host, server_port=cmd_args.port, show_error=True)
 
 

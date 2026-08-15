@@ -1,23 +1,3 @@
-"""WIndexTTS professional trace analyzer — pure Python, no torch import.
-
-Evidence-driven GPU profiler analysis for the WIndexTTS pipeline. Built from
-the methodology in sglang's llm-torch-profiler-analysis skill and vllm-omni's
-diffusion-perf-opt skill (see docs/PROFILER_SPEC.md).
-
-Design principles:
-  - pure-Python over trace JSON: importable anywhere, unit-testable without
-    loading the model
-  - profiler latency is DIAGNOSTIC only — never the final latency claim
-  - the S2Mel micro-gap histogram is the differentiator: ~75% of its idle is
-    10-50us Python-dispatch gaps that vllm-omni's --min-gap-ms 5 would miss
-
-Public API:
-  - load_trace(path) -> list[event-dict]
-  - split_events(events) -> (gpu_events, cpu_events)
-  - classify_kernel(name) -> category
-  - analyze(label, events, wall_ms=None, min_gap_us=100, topn=15) -> dict
-  - CLI: python -m windextts.profiler <trace.json.gz> [--min-gap-us N] [--topn N]
-"""
 from __future__ import annotations
 
 import argparse
@@ -38,7 +18,6 @@ CPU_CATS = {"cpu_op", "user_annotation", "python_function",
 
 
 def load_trace(path: str | Path) -> list[dict]:
-    """Load a chrome-trace .json or .json.gz into a list of X-duration events."""
     p = Path(path)
     op = gzip.open if p.suffix == ".gz" else open
     with op(p, "rt") as f:
@@ -54,7 +33,6 @@ def load_trace(path: str | Path) -> list[dict]:
 
 
 def split_events(events: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Separate GPU (kernel/memcpy/memset) from CPU-side events."""
     gpu, cpu = [], []
     for e in events:
         cat = e.get("cat", "")
@@ -108,8 +86,6 @@ def _contains_any(low: str, kws: tuple[str, ...]) -> bool:
 
 
 def classify_kernel(name: str) -> str:
-    """sglang precedence: comm-strong > mem-strong > [mem-weak unless
-    compute-like] > CATEGORY_PATTERNS > comm-weak unless compute-like > other."""
     low = name.lower()
     if _contains_any(low, COMMUNICATION_STRONG):
         return "communication"
@@ -131,10 +107,6 @@ def classify_kernel(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def merged_intervals(gpu_events: list[dict]) -> list[list[Any]]:
-    """vllm-omni sweep-line union of GPU busy intervals.
-
-    Returns list of merged [start, end, [events...]] sorted by start.
-    """
     rows = sorted(
         (e["ts"], e["ts"] + e["dur"], e["dur"], e.get("name", "?"),
          e.get("cat", ""), e.get("pid"), e.get("tid"))
@@ -151,7 +123,6 @@ def merged_intervals(gpu_events: list[dict]) -> list[list[Any]]:
 
 
 def span_busy_idle(gpu_events: list[dict]) -> tuple[float, float, float]:
-    """(span_us, busy_union_us, idle_us) over GPU events."""
     if not gpu_events:
         return 0.0, 0.0, 0.0
     merged = merged_intervals(gpu_events)
@@ -161,7 +132,6 @@ def span_busy_idle(gpu_events: list[dict]) -> tuple[float, float, float]:
 
 
 def kernel_aggregates(gpu_events: list[dict]) -> dict[str, dict]:
-    """Aggregate per canonical kernel name: total_us, count, max_us, category."""
     agg: dict[str, dict] = {}
     for e in gpu_events:
         nm = e.get("name", "?")
@@ -177,7 +147,6 @@ def kernel_aggregates(gpu_events: list[dict]) -> dict[str, dict]:
 
 
 def category_rollup(gpu_events: list[dict]) -> tuple[Counter, Counter]:
-    """(cat_total_us, cat_launch_count)."""
     tot: Counter = Counter()
     cnt: Counter = Counter()
     for e in gpu_events:
@@ -201,8 +170,6 @@ INTERESTING_SYNC_NAMES = ("cudaStreamSynchronize", "cudaDeviceSynchronize",
 
 
 def gap_histogram(gpu_events: list[dict]) -> list[dict]:
-    """Distribution of inter-kernel gaps (us). Reveals the micro-gap ocean
-    (10-50us Python-dispatch) that a coarse --min-gap-ms filter would miss."""
     if len(gpu_events) < 2:
         return []
     starts = sorted(e["ts"] for e in gpu_events)
@@ -219,8 +186,6 @@ def gap_histogram(gpu_events: list[dict]) -> list[dict]:
 
 
 def _interesting_cpu(cpu_events: list[dict]) -> list[tuple]:
-    """vllm-omni filter: dur>=1000us AND (python/user_annotation OR name has
-    cudaSync/Launch/Memcpy). Returns (start, end, dur, name, cat)."""
     out = []
     for e in cpu_events:
         if e["dur"] < 1000:
@@ -236,15 +201,6 @@ def _interesting_cpu(cpu_events: list[dict]) -> list[tuple]:
 
 def big_gaps(gpu_events: list[dict], cpu_events: list[dict],
              min_gap_us: int = 100, topn: int = 15) -> list[dict]:
-    """vllm-omni GAP blocks: gaps between merged busy intervals >= min_gap_us,
-    attributed to CPU containers overlapping the gap midpoint.
-
-    Enhanced beyond vllm-omni: also reports the nearest interesting CPU event
-    (by time distance) when no container overlaps the midpoint — many launch
-    gaps are caused by a CPU event that *ends* right at gap start (CPU
-    prepared the kernel, GPU went idle waiting), which midpoint containment
-    misses.
-    """
     if not gpu_events:
         return []
     merged = merged_intervals(gpu_events)
@@ -283,12 +239,6 @@ def big_gaps(gpu_events: list[dict], cpu_events: list[dict],
 # ---------------------------------------------------------------------------
 
 def overlap_analysis(gpu_events: list[dict]) -> dict[str, dict]:
-    """Per-kernel-name exclusive/hidden accounting across streams.
-
-    exclusive_us: time NOT overlapped by a co-active kernel on another stream.
-    Single-stream traces (GPT decode under CUDA graph) show ~0 overlap — that
-    is expected and informative (no overlap headroom exists).
-    """
     if not gpu_events:
         return {}
     # per-stream timelines
@@ -375,15 +325,6 @@ def _frame_priority(fname: str) -> float:
 
 
 def source_attribution(gpu_events: list[dict], topn: int = 8) -> list[dict]:
-    """Aggregate python_frames (when present in event args) per kernel name.
-    Returns top sites ranked by weighted frame priority.
-
-    NOTE: torch profiler's chrome export (this torch version) does not embed
-    python_frames in kernel event args — the *working* source attribution path
-    is the gap analysis: python_function events overlapping a gap midpoint are
-    printed as ``in [python_function] file.py(line): func`` containers (see
-    big_gaps). This function is kept for trace formats that do embed frames.
-    """
     sites: dict[str, Counter] = defaultdict(Counter)  # kernel -> Counter(file:line)
     for e in gpu_events:
         frames = (e.get("args") or {}).get("python_frames")
@@ -410,7 +351,6 @@ def source_attribution(gpu_events: list[dict], topn: int = 8) -> list[dict]:
 
 def analyze(label: str, events: list[dict], wall_ms: Optional[float] = None,
             min_gap_us: int = 100, topn: int = 15) -> dict:
-    """Full per-stage report; prints a readable block and returns a summary dict."""
     gpu, cpu = split_events(events)
     if not gpu:
         print(f"\n[{label}] no GPU kernel events")

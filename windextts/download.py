@@ -1,23 +1,3 @@
-"""Download IndexTTS-2.5 model weights from ModelScope direct links.
-
-Zero SDK dependency (no modelscope / huggingface_hub packages) — plain HTTPS
-range-resumable downloads from the official IndexTeam release:
-
-    https://modelscope.cn/models/IndexTeam/IndexTTS-2.5/resolve/master/<path>
-
-Skips ~2.5GB of dead weight vs a full snapshot:
-  - hf_cache/w2v-bert-2.0/conformer_shaw.pt (2.2GB, fairseq leftover —
-    WIndexTTS uses model.safetensors, verified in Stage 1)
-  - hf_cache/semantic_codec* (169MB, config-only reference; not loaded)
-
-Usage (CLI):
-    windextts-download --out /path/to/IndexTTS-2.5
-    WINDEXTTS_WEIGHTS_DIR=/path windextts-download
-    windextts-download --check --out /path   # verify only
-
-API:
-    from windextts.download import download_model, check_install
-"""
 
 from __future__ import annotations
 
@@ -78,7 +58,6 @@ def _notify(msg: str) -> None:
 
 
 def check_install(model_dir: str | Path) -> tuple[bool, list[str], list[str]]:
-    """Return (complete, missing_core, missing_optional_qwen)."""
     d = Path(model_dir)
     missing = [f for f in CORE_FILES if not (d / f).exists()]
     missing_opt = [] if (d / QWEN_MARKER).exists() else ["qwen0.6bemo4-merge/"]
@@ -86,7 +65,6 @@ def check_install(model_dir: str | Path) -> tuple[bool, list[str], list[str]]:
 
 
 def _download_one(rel: str, out_dir: Path, retries: int = 3) -> None:
-    """Range-resumable single-file download with size verification."""
     url = f"{BASE_URL}/{rel}"
     dest = out_dir / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +112,6 @@ def download_model(
     include_qwen: bool = True,
     only_missing: bool = True,
 ) -> Path:
-    """Download the release into out_dir. Resumable; skips present files."""
     out_dir = Path(out_dir).expanduser().absolute()
     out_dir.mkdir(parents=True, exist_ok=True)
 

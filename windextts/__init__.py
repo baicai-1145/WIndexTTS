@@ -1,4 +1,3 @@
-"""WIndexTTS: pure-torch accelerated inference for IndexTTS-2.5."""
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 

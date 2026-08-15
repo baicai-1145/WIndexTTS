@@ -464,186 +464,81 @@ class WIndexTTS:
                 parts.append(silence)
         return OUTPUT_SR, torch.cat(parts)
 
-    def _infer_single(
-        self,
-        spk_audio_prompt: str,
-        text: str,
-        lang: str,
-        emo_vector: list[float] | None,
-        emo_ref_path: str | None,
-        emo_alpha: float,
-        duration_factor: float,
-        do_sample: bool,
-        top_p: float,
-        top_k: int,
-        temperature: float,
-        max_mel_tokens: int,
-        cfm_steps: int,
-        cfg_rate: float,
-        repetition_penalty: float = 10.0,
-        num_beams: int = 3,
-    ) -> tuple[int, torch.Tensor]:
-        """Synthesize a single (already normalized, short) text segment."""
+    def _ref_features(self, spk_audio_prompt):
+        # (spk_cond, style, ref_mel) from cache or fresh extraction
+        import os
+        try:
+            key = (spk_audio_prompt, os.path.getmtime(spk_audio_prompt))
+        except OSError:
+            key = None
+        if key and key in self._ref_cache:
+            return self._ref_cache[key]
+        audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
+        feats = (self.extract_spk_cond(torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)),
+                 self.extract_style(torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)),
+                 self.mel_fn(torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(self.device).float()))
+        if key is not None:
+            self._ref_cache[key] = feats
+        return feats
+
+    def _infer_single(self, spk_audio_prompt, text, lang, emo_vector, emo_ref_path,
+                      emo_alpha, duration_factor, do_sample, top_p, top_k, temperature,
+                      max_mel_tokens, cfm_steps, cfg_rate, repetition_penalty=10.0, num_beams=3):
         dev = self.device
         if self.low_vram and num_beams > 3:
-            # beam3 is the official quality config and still fits the budget;
-            # only wider beams (4+) would blow it.
-            num_beams = 3
-        # --- ref audio features (cached by path+mtime; stage 5 overlap/cache) ---
-        import os
-        cache_key = None
-        try:
-            cache_key = (spk_audio_prompt, os.path.getmtime(spk_audio_prompt))
-        except OSError:
-            pass
-        cached = self._ref_cache.get(cache_key) if cache_key else None
-        if cached is None:
-            audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
-            a16 = torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)
-            a22 = torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(dev).float()
-            spk_cond = self.extract_spk_cond(a16)
-            style = self.extract_style(a16)
-            ref_mel = self.mel_fn(a22)
-            if cache_key is not None:
-                self._ref_cache[cache_key] = (spk_cond, style, ref_mel)
-        else:
-            spk_cond, style, ref_mel = cached
+            num_beams = 3  # beam3 = official quality config, fits the budget
+        spk_cond, style, ref_mel = self._ref_features(spk_audio_prompt)
 
-        # --- text tokens ---
         lang_prefix = f"<|{lang.lower()}|> "
-        toks = self.tokenizer.encode(lang_prefix + text, allowed_special="all")
-        text_tokens = torch.IntTensor(toks).unsqueeze(0).to(dev)
+        text_tokens = torch.IntTensor(self.tokenizer.encode(lang_prefix + text, allowed_special="all")).unsqueeze(0).to(dev)
         text_tokens = F.pad(text_tokens, (0, 1), value=1)  # stop_text
         from windextts.frontend.tokenizer import lang_to_token
         lang_id = torch.LongTensor([lang_to_token(lang)]).to(dev)
 
-        # --- emo vec assembly ---
-        # Three paths (priority: emo_ref_path > emo_vector > calm default):
-        #  (1) emo_ref_path: conformer path — merge_emovec(spk, emo_ref) then
-        #      optionally add matrix correction if emo_vector also given.
-        #      Replicates infer_v2_5.py:757-764.
-        #  (2) emo_vector only: matrix path (build_emo_vec).
-        #  (3) neither: calm default vector.
-        emo_vec = self.build_emo_vec_full(
-            style, spk_cond, emo_vector, emo_ref_path, emo_alpha
-        )  # [1,1280]
-
-        # --- GPT conditioning + AR decode ---
+        emo_vec = self.build_emo_vec_full(style, spk_cond, emo_vector, emo_ref_path, emo_alpha)  # [1,1280]
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)  # [1,3,1280]
-        # CUDA Graph is now supported for beam search too (static batch K,
-        # fixed KV buffers — no beam removal/reordering in the graph loop).
-        use_cg = self.device != "cpu"
         codes = self.gpt.generate(
             conds_latent, text_tokens, lang_id,
             max_new_tokens=max_mel_tokens, do_sample=do_sample,
             top_k=top_k, top_p=top_p, temperature=temperature,
             stop_token=self.cfg.gpt.stop_mel_token,
-            use_cuda_graph=use_cg,
-            repetition_penalty=repetition_penalty,
-            num_beams=num_beams,
-        )  # [1, T_codes]
-
-        # strip stop token if present
+            use_cuda_graph=self.device != "cpu",
+            repetition_penalty=repetition_penalty, num_beams=num_beams)
         if codes[0, -1].item() == self.cfg.gpt.stop_mel_token:
             codes = codes[:, :-1]
-
-        # --- codec.decode → S_infer ---
         s_infer = self.codec.decode(codes)  # [1, 2*T, 1024]
-
-        # --- S2Mel-CFM → mel ---
         mel = self.s2mel.inference(
             spk_cond, s_infer, ref_mel, style,
             duration_factor=duration_factor, n_timesteps=cfm_steps,
-            inference_cfg_rate=cfg_rate,
-            use_graph=getattr(self, "s2mel_use_graph", False),
-        )  # [1, 80, T_target]
-
-        # --- BigVGAN → audio ---
-        # cast mel to BigVGAN's compute dtype (weight_norm makes .weight report
-        # fp32 even when params are fp16; use conv_pre.bias which reflects truth)
+            inference_cfg_rate=cfg_rate, use_graph=getattr(self, "s2mel_use_graph", False))
         bg_dtype = next(self.bigvgan.parameters()).dtype
-        audio_out = self.bigvgan(mel.to(bg_dtype))  # [1, 1, T_audio]
-        audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
-        return OUTPUT_SR, audio_out
+        return OUTPUT_SR, self.bigvgan(mel.to(bg_dtype)).squeeze(0).squeeze(0).clamp(-1, 1).cpu()
 
-    def infer_from_codes(
-        self,
-        spk_audio_prompt: str,
-        text: str,
-        lang: str,
-        codes: torch.Tensor,
-        cfm_steps: int = 15,
-        cfg_rate: float = 0.7,
-        duration_factor: float = 1.0,
-        use_graph: bool | None = None,
-    ) -> tuple[int, torch.Tensor]:
-        """Synthesize audio from externally supplied GPT mel codes.
-
-        Diagnostic seam: skips win GPT decode entirely (codes come from
-        outside — e.g. official IndexTTS), then runs the win downstream
-        (codec.decode → S2Mel-CFM → BigVGAN). Used for A/B isolation of the
-        GPT stage from the rest of the pipeline.
-
-        Args:
-            codes: [1, T] or [T] int tensor, WITHOUT the stop token
-                (stop token, if present at the end, is stripped).
-        Returns:
-            (sample_rate, audio [samples,])
-        """
+    def infer_from_codes(self, spk_audio_prompt, text, lang, codes, cfm_steps=15,
+                          cfg_rate=0.7, duration_factor=1.0, use_graph=None):
+        # Diagnostic seam: skip win GPT decode (codes supplied externally, e.g.
+        # official IndexTTS) and run the win downstream (codec→S2Mel→BigVGAN).
+        # Used for A/B isolation of the GPT stage. codes [1,T]/[T] int, no stop.
         dev = self.device
         if codes.dim() == 1:
             codes = codes.unsqueeze(0)
         codes = codes.to(dev).long()
         if codes[0, -1].item() == self.cfg.gpt.stop_mel_token:
             codes = codes[:, :-1]
-
         with torch.no_grad():
-            # --- ref audio features (same path as _infer_single) ---
-            import os
-        cache_key = None
-        try:
-            cache_key = (spk_audio_prompt, os.path.getmtime(spk_audio_prompt))
-        except OSError:
-            pass
-        with torch.no_grad():
-            cached = self._ref_cache.get(cache_key) if cache_key else None
-            if cached is None:
-                audio, sr = self._load_audio(spk_audio_prompt, REF_MAX_SECONDS)
-                a16 = torchaudio.transforms.Resample(sr, REF_SR_W2V)(audio)
-                a22 = torchaudio.transforms.Resample(sr, REF_SR_MEL)(audio).to(dev).float()
-                spk_cond = self.extract_spk_cond(a16)
-                style = self.extract_style(a16)
-                ref_mel = self.mel_fn(a22)
-                if cache_key is not None:
-                    self._ref_cache[cache_key] = (spk_cond, style, ref_mel)
-            else:
-                spk_cond, style, ref_mel = cached
-
-            # --- text tokens (needed for spk conditioning path consistency) ---
+            spk_cond, style, ref_mel = self._ref_features(spk_audio_prompt)
             lang_prefix = f"<|{lang.lower()}|> "
-            toks = self.tokenizer.encode(lang_prefix + text, allowed_special="all")
-            text_tokens = torch.IntTensor(toks).unsqueeze(0).to(dev)
-            text_tokens = F.pad(text_tokens, (0, 1), value=1)  # stop_text
             emo_vec = self.build_emo_vec_full(style, spk_cond, None, None, 1.0)
             conds_latent = self.gpt.build_conds_latent(style, emo_vec)
-
-            # --- codec.decode → S_infer ---
-            s_infer = self.codec.decode(codes)  # [1, 2*T, 256]
-
-            # --- S2Mel-CFM → mel ---
+            s_infer = self.codec.decode(codes)  # [1, 2*T, 1024]
             mel = self.s2mel.inference(
                 spk_cond, s_infer, ref_mel, style,
                 duration_factor=duration_factor, n_timesteps=cfm_steps,
                 inference_cfg_rate=cfg_rate,
-                use_graph=(getattr(self, "s2mel_use_graph", False)
-                           if use_graph is None else use_graph),
-            )
-
-            # --- BigVGAN → audio ---
+                use_graph=(getattr(self, "s2mel_use_graph", False) if use_graph is None else use_graph))
             bg_dtype = next(self.bigvgan.parameters()).dtype
             audio_out = self.bigvgan(mel.to(bg_dtype))
-            audio_out = audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
-            return OUTPUT_SR, audio_out
+            return OUTPUT_SR, audio_out.squeeze(0).squeeze(0).clamp(-1, 1).cpu()
 
 if __name__ == "__main__":
     # smoke: end-to-end inference (requires GPT AR generate to be implemented)

@@ -1,37 +1,14 @@
-"""WIndexTTS HTTP API server — OpenAI-compatible /v1/audio/speech endpoint.
+"""WIndexTTS HTTP API — OpenAI-compatible /v1/audio/speech.
 
-Mirrors the vLLM-Omni (audex) serving surface:
-
-    POST /v1/audio/speech
-        {"model": "windextts", "input": "text to speak",
-         "response_format": "wav" | "mp3" (wav only for now),
-         "voice": <voice-name registered via --voice>, or omit and use
-                  extra_params.reference_audio (base64 wav),
-         "extra_params": {
-             "reference_audio": "<base64 wav/any torchaudio-readable>",
-             "language": "ZH", "duration_factor": 1.0,
-             "emo_vector": [8 floats] | "emo_text": "..." | "emo_ref_audio": b64,
-             "do_sample": true, "top_p": 0.8, "top_k": 30, "temperature": 0.8,
-             "cfm_steps": 12, "num_beams": 3,
-             "max_text_tokens_per_segment": 120, "text_normalization": true
-         }}
-
-    GET  /v1/models        — model list (OpenAI style)
-    GET  /health           — liveness
-    Response: audio bytes (Content-Type: audio/wav).
-
-Run:
-    python -m windextts.server --model-dir /root/IndexTTS-2.5 --port 8000
-    # W4A16 + low VRAM:
-    python -m windextts.server --model-dir ... --w4a16 --low-vram
-
-Client:
-    curl -s http://localhost:8000/v1/audio/speech \\
-        -H 'Content-Type: application/json' \\
-        -d '{"model":"windextts","input":"你好世界","extra_params":{"reference_audio":"<b64>"}}' \\
-        -o out.wav
+POST /v1/audio/speech   {"model","input","response_format":"wav","voice",
+                         "speed", "extra_params":{reference_audio(b64),
+                         language, duration_factor, emo_vector[8]|emo_text|
+                         emo_ref_audio(b64), do_sample, top_p, top_k,
+                         temperature, cfm_steps, num_beams,
+                         max_text_tokens_per_segment, text_normalization}}
+GET  /v1/models / /health
+Run: python -m windextts.server --model-dir <dir> [--w4a16] [--low-vram] [--port]
 """
-
 from __future__ import annotations
 
 import argparse
@@ -61,9 +38,7 @@ except ImportError as e:  # pragma: no cover
 
 from windextts.inference import WIndexTTS
 
-# ---------------------------------------------------------------------------
-# engine (single instance; requests serialised — CUDA Graphs are single-session)
-# ---------------------------------------------------------------------------
+# single engine instance; requests serialised — CUDA Graphs are single-session
 _engine: dict = {"tts": None}
 _infer_lock = threading.Lock()
 _voices: dict[str, str] = {}  # voice name -> ref audio path
@@ -74,7 +49,7 @@ class SpeechRequest(BaseModel):
     input: str
     voice: str | None = None
     response_format: str = "wav"
-    speed: float = 1.0  # OpenAI uses `speed`; mapped to 1/duration_factor
+    speed: float = 1.0  # OpenAI `speed`; mapped to 1/duration_factor
     extra_params: dict = Field(default_factory=dict)
 
 
@@ -92,7 +67,6 @@ def _b64_to_tempfile(b64: str, suffix: str = ".wav") -> str:
 def build_app(args: argparse.Namespace) -> FastAPI:
     app = FastAPI(title="WIndexTTS Server", version="0.1.0")
 
-    # load engine at startup
     dtype = torch.float32 if args.fp32 else torch.float16
     print(f">> Loading WIndexTTS (dtype={dtype}, w4a16={args.w4a16}, low_vram={args.low_vram}) ...")
     t0 = time.perf_counter()
@@ -135,7 +109,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         ep = req.extra_params or {}
         t0 = time.perf_counter()
 
-        # --- resolve reference audio (voice name > extra_params b64) ---
+        # resolve reference audio: voice name > extra_params b64
         ref_b64 = ep.get("reference_audio")
         ref_path: str | None = _voices.get(req.voice) if req.voice else None
         tmp_ref = None
@@ -148,7 +122,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         if req.response_format not in ("wav",):
             raise HTTPException(400, f"unsupported response_format '{req.response_format}' (wav only)")
 
-        # --- map extra params onto infer() kwargs ---
         emo_ref_b64 = ep.get("emo_ref_audio")
         tmp_emo = _b64_to_tempfile(emo_ref_b64) if emo_ref_b64 else None
         emo_vector = ep.get("emo_vector")
