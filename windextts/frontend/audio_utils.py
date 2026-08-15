@@ -13,8 +13,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-__all__ = ["SeamlessM4TFeaturizer"]
-
 _FRAME_LENGTH, _HOP_LENGTH, _FFT_LENGTH = 400, 160, 512  # 25ms / 10ms @16k
 _PREEMPHASIS, _N_MELS, _STRIDE = 0.97, 80, 2
 _MEL_FLOOR, _NORM_EPS = 1.192092955078125e-07, 1e-7

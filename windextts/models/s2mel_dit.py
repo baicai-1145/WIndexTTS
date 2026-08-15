@@ -15,8 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
-__all__ = ["DiT", "sequence_mask"]
-
 
 def sequence_mask(length, max_length=None):  # commons.py:155 — True where arange < length
     if max_length is None:

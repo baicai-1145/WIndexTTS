@@ -5,8 +5,6 @@
 # Seam: hidden_states[17] (index 0 = feature_projection out) — infer_v2_5.py:288.
 import torch, torch.nn as nn, torch.nn.functional as F
 
-__all__ = ["Wav2Vec2BertConformer"]
-
 
 class Wav2Vec2BertFeedForward(nn.Module):
     def __init__(self, hs=1024, is_=4096):

@@ -12,8 +12,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-__all__ = ["MelSpectrogram", "build_mel_basis_cache"]
-
 _DATA = Path(__file__).resolve().parent.parent / "data" / "mel_basis_hifigan.pt"
 
 

@@ -11,8 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["InterpolateRegulator"]
-
 
 def sequence_mask(length, max_length=None):  # commons.py:155 — True where i < length
     if max_length is None:

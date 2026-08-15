@@ -12,8 +12,6 @@ import tempfile
 import traceback
 from functools import lru_cache
 
-__all__ = ["TextNormalizer"]
-
 class TextNormalizer:
     PINYIN_TONE_PATTERN = r"(?<![a-z])((?:[bpmfdtnlgkhjqxzcsryw]|[zcs]h)?(?:[aeiouüv]|[ae]i|u[aio]|ao|ou|i[aue]|[uüv]e|[uvü]ang?|uai|[aeiuv]n|[aeio]ng|ia[no]|i[ao]ng)|ng|er)([1-5])"
     # 拼音+数字声调(1-5,5=轻声): xuan4,jve2,ying1… 不匹配 beta1,voice2
