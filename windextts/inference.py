@@ -327,9 +327,15 @@ class WIndexTTS:
                 repetition_penalty=10.0, num_beams=3,
             )
             if not self.low_vram:
-                # also capture the greedy graph (used by do_sample=False callers)
+                # also capture the greedy graph (used by do_sample=False callers).
+                # Bucket matters: max_seq = S + max_new_tokens rounded to 64, and
+                # every decode step's attention/mask kernels scan the FULL pool —
+                # an oversized warmup bucket (720 tokens -> 768 pool) makes every
+                # replay step ~4x slower than a right-sized one. Capture at the
+                # typical runtime bucket (~192) instead; longer requests simply
+                # capture their own bucket on first use.
                 self.gpt.generate(
-                    conds, tt, lang, max_new_tokens=720, do_sample=False,
+                    conds, tt, lang, max_new_tokens=150, do_sample=False,
                     stop_token=self.cfg.gpt.stop_mel_token, use_cuda_graph=use_cg,
                 )
             s = self.codec.decode(codes[:, :-1] if codes[0, -1] == self.cfg.gpt.stop_mel_token else codes)
@@ -552,9 +558,14 @@ class WIndexTTS:
                 most this many tokens; segments are synthesized separately and
                 concatenated with interval_silence_ms of silence between them.
             max_mel_tokens: max mel codes GPT may emit per segment. If None
-                (recommended), auto-derived as max_text_tokens_per_segment * 6
-                (text→mel ratio ~5.5x measured) so the limits stay coupled and a
-                segment is never truncated. Set explicitly to override.
+                (recommended), auto-derived PER SEGMENT from the segment's
+                actual token count x language ratio (+2x safety headroom).
+                Sizing to actual demand keeps the GPT CUDA-Graph KV pool tight:
+                the graph's per-step attention/mask kernels scan the FULL pool
+                (max_seq = S + max_mel_tokens rounded to 64), so an oversized
+                cap (e.g. segment-limit-based 1560 for a 4s sentence) made
+                every decode step ~3x slower than needed. Set explicitly to
+                override.
             repetition_penalty: HF repetition-penalty scale (official 10.0).
             num_beams: GPT-AR beam width (official 3). Beam search now runs
                 through the CUDA-Graph decode path too (static batch K, fixed
@@ -590,16 +601,13 @@ class WIndexTTS:
             "UK": 9, "UR": 10, "UZ": 12, "VI": 10, "YI": 6, "YO": 10, "ZH": 13,
             "YUE": 13, "MINNAN": 13, "WUYU": 13,  # CJK family (inferred from ZH)
         }
-        if max_mel_tokens is None:
-            max_mel_tokens = max_text_tokens_per_segment * _MEL_RATIO.get(lang.upper(), 14)
         if self.low_vram:
-            # keep the runtime beam3 KV bucket small (448/576): cap mel tokens so
-            # the graph captured at warmup is reused instead of triggering a
-            # bigger capture. 390 mel tokens ≈ 7.8s audio per segment; long
-            # texts are split into more, shorter segments (ratio-coupled below).
-            max_mel_tokens = min(max_mel_tokens, 390)
-            # segment length must shrink with the mel cap (ZH ratio 13):
-            # 30 text tokens × 13 = 390 — keeps segments un-truncated.
+            # 390 mel tokens ≈ 7.8s audio per segment; segment budget shrinks to
+            # match (ZH ratio 13: 30 text tokens × 13 = 390) so segments stay
+            # un-truncated while the warmup-captured beam3 graph bucket (576)
+            # is reused at runtime.
+            if max_mel_tokens is not None:
+                max_mel_tokens = min(max_mel_tokens, 390)
             max_text_tokens_per_segment = min(max_text_tokens_per_segment, 30)
 
         # --- text normalization (G2P: digits→words, punctuation, names) ---
@@ -618,12 +626,27 @@ class WIndexTTS:
         enc = lambda s: self.tokenizer.encode(s, allowed_special="all")
         segments = split_text_by_tokens(text, enc, max_tokens=max_text_tokens_per_segment, lang_prefix=lang_prefix)
 
+        def _seg_mel_cap(seg: str) -> int:
+            # Per-segment mel-token cap from the segment's ACTUAL token count:
+            # ratio * n_tokens * 2 (headroom for prosody/emotion drift keeps a
+            # segment un-truncated) + 8. Keeps the GPT graph KV pool tight
+            # (the graph's per-step attention/mask kernels scan the FULL pool,
+            # so an oversized cap slows every decode step).
+            if max_mel_tokens is not None:
+                return max_mel_tokens
+            ratio = _MEL_RATIO.get(lang.upper(), 14)
+            n_tok = len(enc(lang_prefix + seg))
+            cap = max(int(n_tok * ratio * 2) + 8, 64)
+            if self.low_vram:
+                cap = min(cap, 390)
+            return cap
+
         if len(segments) == 1:
             return self._infer_single(
                 spk_audio_prompt, segments[0], lang, emo_vector,
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
-                max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+                _seg_mel_cap(segments[0]), cfm_steps, cfg_rate, teacache_thresh,
                 repetition_penalty, num_beams,
             )
 
@@ -634,7 +657,7 @@ class WIndexTTS:
                 spk_audio_prompt, seg, lang, emo_vector,
                 emo_ref_path, emo_alpha,
                 duration_factor, do_sample, top_p, top_k, temperature,
-                max_mel_tokens, cfm_steps, cfg_rate, teacache_thresh,
+                _seg_mel_cap(seg), cfm_steps, cfg_rate, teacache_thresh,
                 repetition_penalty, num_beams,
             )
             wavs.append(wav)

@@ -43,11 +43,11 @@ W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文�
 | WIndexTTS 保真档 | fp32 | 25 | beam3 采样 | 0.55 | 8.9G | 1.13x |
 | WIndexTTS fp32 | fp32 | 15 | beam3 采样 | 0.49 | 8.9G | 1.28x |
 | WIndexTTS fp16 | fp16 | 25 | beam3 采样 | 0.30 | 4.7G | 2.04x |
-| **WIndexTTS 默认档** | **fp16** | **15** | beam3 采样 | **0.28** | **4.7G** | **2.18x** |
-| WIndexTTS W4A16 | fp16 | 12 | beam1 采样 | 0.23 | 3.8G | 2.70x |
-| WIndexTTS W4A16 极速 | fp16 | 12 | greedy | **0.18** | **3.8G** | **3.52x** |
-| WIndexTTS fp16 低显存 | fp16 | 15 | beam3 采样 | 0.22 | **3.0G** | 2.8x |
-| WIndexTTS W4A16 低显存极速 | fp16 | 12 | greedy | **0.12** | **2.4G** | **5.3x** |
+| **WIndexTTS 默认档** | **fp16** | **15** | beam3 采样 | **0.24** | **5.5G** | **2.6x** |
+| WIndexTTS W4A16 | fp16 | 12 | beam1 采样 | 0.17 | 4.5G | 3.6x |
+| WIndexTTS W4A16 极速 | fp16 | 12 | greedy | **0.14** | **4.2G** | **4.6x** |
+| WIndexTTS fp16 低显存 | fp16 | 15 | beam3 采样 | 0.19 | **3.6G** | 3.2x |
+| WIndexTTS W4A16 低显存极速 | fp16 | 12 | greedy | **0.12** | **2.9G** | **5.3x** |
 | vLLM-Omni（默认 deploy） | bf16 | 25 | beam1 采样 | 0.20 | ~18G* | 3.10x |
 
 RTF = 合成耗时 / 音频时长（越小越好；<1 即快于实时）。vs 列按 RTF 均值计算。
@@ -58,7 +58,10 @@ RTF = 合成耗时 / 音频时长（越小越好；<1 即快于实时）。vs �
 w2v-bert 权重按需上下卡——fp16 档 3.0G、W4A16 档 2.4G（3GB 卡可用）。低显存极速档 RTF 反而更低
 （更紧凑的 KV/graph 池 + greedy）；代价是 emo 参考音频功能需懒加载、首请求略慢。
 
-**零编译依赖下：默认档 RTF 0.28（比官方 fp32 快 2.2x）；W4A16 极速档 RTF 0.18，优于 vLLM-Omni 默认配置的 0.20。**
+**零编译依赖下：默认档 RTF 0.24（比官方 fp32 快 2.6x）；W4A16 极速档 RTF 0.14、低显存极速档 0.12，均优于 vLLM-Omni 默认配置的 0.20。**
+
+> 显存注：win 各档显存较上一版略升（+0.4-0.7G）——GPT graph KV 池现按每段实际 token 数推导
+>（池超配修复后每步 attention 扫描变短，速度提升）；graph 池按最大请求桶常驻。
 
 > 协议说明：本轮为长文本统一协议（音频 5.3-8.7s），与早期短句协议（~4s 成音）数字不可直接比较。
 > vLLM-Omni 为其默认 `indextts2_5.yaml` deploy 配置（beam1 采样 25 步 bf16+compile，DiT graph 关）；
