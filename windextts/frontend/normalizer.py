@@ -51,8 +51,27 @@ class TextNormalizer:
         """Lazily build zh/en TN normalizers (NeMo ``tn`` grammar)."""
         if self.zh_normalizer is not None and self.en_normalizer is not None:
             return
-        from tn.chinese.normalizer import Normalizer as NormalizerZh
-        from tn.english.normalizer import Normalizer as NormalizerEn
+        try:
+            from tn.chinese.normalizer import Normalizer as NormalizerZh
+            from tn.english.normalizer import Normalizer as NormalizerEn
+        except ImportError:
+            # macOS: pynini has no arm64 wheels -> wetext runtime (same API)
+            from wetext import Normalizer as _W
+
+            class NormalizerZh:
+                def __init__(self, cache_dir=None, remove_interjections=False, remove_erhua=False, overwrite_cache=False):
+                    self._n = _W(lang="zh", operator="tn", remove_interjections=remove_interjections,
+                                 remove_erhua=remove_erhua)
+
+                def normalize(self, text):
+                    return self._n.normalize(text)
+
+            class NormalizerEn:
+                def __init__(self, overwrite_cache=False):
+                    self._n = _W(lang="en", operator="tn")
+
+                def normalize(self, text):
+                    return self._n.normalize(text)
 
         cache_dir = os.path.join(tempfile.gettempdir(), "windextts_tn_cache")
         os.makedirs(cache_dir, exist_ok=True)
