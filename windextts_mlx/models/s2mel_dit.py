@@ -127,6 +127,7 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers._order):
             s = skips.pop() if i in self.layers_receive_skip else None
             x = getattr(self.layers, layer)(x, c, freqs_cis, mask, s)
+            mx.eval(x)  # per-layer eval: first-time kernel compile < watchdog
             if i in self.layers_emit_skip:
                 skips.append(x)
         return self.norm(x, c)
@@ -183,6 +184,7 @@ class WN(nn.Module):  # gated residual stack (tanh*sigmoid), conditioned on t2
                 out = out + rs[..., hc:]
             else:
                 out = out + rs
+            mx.eval(out)  # per-layer eval: first-time kernel compile < watchdog
         return out * x_mask
 
 
@@ -241,13 +243,19 @@ class DiT(nn.Module):
         B, _, T = x.shape
         t1 = self.t_embedder(t)  # [B,D]
         x, prompt_x, cond = x.transpose(0, 2, 1), prompt_x.transpose(0, 2, 1), self.cond_projection(cond)
+        mx.eval(x)
         x_in = mx.concatenate([x, prompt_x, cond, mx.broadcast_to(style[:, None], (B, T, 192))], -1)
         x_in = self.cond_x_merge_linear(x_in)  # [B,T,D]
+        mx.eval(x_in)
         x_mask = ops.sequence_mask(x_lens, x_in.shape[1])[:, None]  # [B,1,T]
         mask = mx.where(mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
         x_res = self.transformer(x_in, t1[:, None], self.input_pos[:x_in.shape[1]], mask)
+        mx.eval(x_res)
         x_res = self.skip_linear(mx.concatenate([x_res, x], -1))
+        mx.eval(x_res)
         x = self.conv1(x_res)  # [B,T,512]
+        mx.eval(x)
         t2 = self.t_embedder2(t)
         x = self.wavenet(x, x_mask.transpose(0, 2, 1).astype(mx.float32), g=t2[:, None, :]) + self.res_projection(x_res)
+        mx.eval(x)
         return self.conv2(self.final_layer(x, t1)).transpose(0, 2, 1)  # [B,80,T]

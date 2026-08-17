@@ -49,6 +49,7 @@ class S2MelCFM:
                 dphi = self.estimator(x, prompt_x, x_lens, t[None], style, mu)
             x = (x + dt * dphi) * keep
             t = t + dt
+            mx.eval(x)
         return x
 
 

@@ -253,6 +253,7 @@ class WIndexTTSMLX:
         feats = (self.extract_spk_cond(self._resample(sr, REF_SR_W2V)(a16)),
                  self.extract_style(self._resample(sr, REF_SR_W2V)(a16)),
                  self._mel()(self._resample(sr, REF_SR_MEL)(a16).astype(mx.float32)))
+        mx.eval(feats)  # split frontend graph: first-time Metal compile < watchdog
         if key is not None:
             self._ref_cache[key] = feats
         return feats
@@ -305,7 +306,9 @@ class WIndexTTSMLX:
 
         lang_id = mx.array([lang_to_token(lang)], dtype=mx.int32)
         emo_vec = self.build_emo_vec_full(style, spk_cond, emo_vector, emo_ref_path, emo_alpha)
+        mx.eval(emo_vec)
         conds_latent = self.gpt.build_conds_latent(style, emo_vec)
+        mx.eval(conds_latent)
         codes = self.gpt.generate(conds_latent, text_tokens, lang_id, max_new_tokens=max_mel_tokens,
                                   do_sample=do_sample, top_k=top_k, top_p=top_p, temperature=temperature,
                                   stop_token=self.cfg.gpt.stop_mel_token,

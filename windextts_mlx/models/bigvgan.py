@@ -116,10 +116,13 @@ class BigVGAN(nn.Module):
 
     def __call__(self, x):  # [B,80,T] -> [B,1,T*256]
         x = self.conv_pre(x.transpose(0, 2, 1))  # [B,T,80] NLC internally
+        mx.eval(x)
         for i in range(self.num_upsamples):
             x = getattr(self.ups, str(i))(x)
             x = sum(getattr(self.resblocks, str(i * self.num_kernels + j))(x)
                     for j in range(self.num_kernels)) / self.num_kernels
+            mx.eval(x)  # per-stage eval: first-time kernel compile < watchdog
         x = self.conv_post(self.activation_post(x))
+        mx.eval(x)
         x = mx.tanh(x) if self.use_tanh_at_final else mx.clip(x, -1.0, 1.0)
         return x.transpose(0, 2, 1)  # [B,1,T']

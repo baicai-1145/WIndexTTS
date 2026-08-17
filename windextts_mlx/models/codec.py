@@ -33,8 +33,10 @@ class VocosBackbone(nn.Module):
 
     def __call__(self, x):  # [B,T,C] -> [B,T,dim]
         x = self.norm(self.embed(x))
+        mx.eval(x)
         for i in self.convnext._order:
             x = getattr(self.convnext, i)(x)
+            mx.eval(x)
         return self.final_layer_norm(x)
 
 
@@ -96,5 +98,7 @@ class EnhancedCodec(nn.Module):
         if codes.ndim == 2:
             codes = codes[None]  # [1,B,T]
         x = self.decoder(self.quantizer.vq2emb(codes))  # [B,T,1024]
+        mx.eval(x)
         x = mx.repeat(x, 2, axis=1)  # F.interpolate nearest x2
+        mx.eval(x)
         return self.up(x)

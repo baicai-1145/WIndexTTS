@@ -97,6 +97,7 @@ class Wav2Vec2BertConformer(nn.Module):
             conv_mask = attention_mask
         for i, layer in enumerate(self.encoder_layers):
             h = layer(h, attention_mask=attn_mask, conv_attention_mask=conv_mask)
+            mx.eval(h)  # per-layer eval: first-time kernel compile < watchdog
             if return_layer == i + 1:
                 return h
         return h

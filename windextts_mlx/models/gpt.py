@@ -72,17 +72,22 @@ class GPT2Transformer(nn.Module):
 
     def __call__(self, inputs_embeds, attention_mask=None, past_key_values=None):
         # prefill: mask=[B,T] int (0=pad) -> 4D causal; decode: additive [B,1,1,t]
+        # Layer-by-layer mx.eval: a first-time command buffer that compiles all
+        # 24 layers takes ~30s and trips the Metal 2s watchdog on M-series GPUs;
+        # per-layer eval keeps every submission tiny (compile cache then applies).
         h, kvs = inputs_embeds, []
         if past_key_values is None:
             m = self._build_4d_causal_mask(inputs_embeds, attention_mask)
             for i in self.h._order:
                 h, kv = getattr(self.h, i)(h, m)
                 kvs.append(kv)
+                mx.eval(h)
         else:
             assert len(past_key_values) == len(self.h)
             for i, (pk, pv) in zip(self.h._order, past_key_values):
                 h, kv = getattr(self.h, i)(h, attention_mask, (pk, pv))
                 kvs.append(kv)
+                mx.eval(h)
         return self.ln_f(h), kvs
 
     @staticmethod
@@ -177,9 +182,16 @@ class UnifiedVoice(nn.Module):
             t = mx.array([ti[j] for j in range(ti.shape[0]) if keep[j]], dtype=mx.int32)
             t = mx.concatenate([mx.array([self.start_text_token], dtype=mx.int32), t,
                                 mx.array([self.stop_text_token], dtype=mx.int32)])
-            te = self.text_embedding(t) + self.text_pos_embedding.emb(mx.arange(t.shape[0], dtype=mx.int32))
+            # per-op eval: first-time Metal kernel compilation for the whole
+            # embedding stack exceeds the GPU watchdog on M-series; each op
+            # compiles in <1s so every submission stays safe (no-op on CPU).
+            te = self.text_embedding(t)
+            mx.eval(te)
+            te = te + self.text_pos_embedding.emb(mx.arange(t.shape[0], dtype=mx.int32))
+            mx.eval(te)
             if langs is not None:
                 te = te + self.lang_embedding(langs[i])
+                mx.eval(te)
             am = mx.ones(target_len + 1, dtype=mx.int32)
             parts = [conditional_latents[0] if single else conditional_latents[i], te]
             pad = L + 2 - t.shape[0]
@@ -198,18 +210,29 @@ class UnifiedVoice(nn.Module):
         ids, embeds, attention_mask = self.prepare_gpt_inputs(conditional_latents, text_inputs, langs)
         S = embeds.shape[1]
         last = self.mel_embedding(ids[:, S:])
-        emb = mx.concatenate([embeds, last + self.mel_pos_embedding(last)], 1)
+        mx.eval(last)
+        last = last + self.mel_pos_embedding(ids[:, S:])
+        mx.eval(last)
+        emb = mx.concatenate([embeds, last], 1)
+        mx.eval(emb)
         hidden, kvs = self.gpt(inputs_embeds=emb, attention_mask=attention_mask)
-        return S, attention_mask, kvs, self.mel_head(self.final_norm(hidden))
+        out = self.mel_head(self.final_norm(hidden))
+        mx.eval(out)
+        return S, attention_mask, kvs, out
 
     def _eager_step(self, next_id, step, attention_mask, kvs, mdtype, K_sel=None):
         nid = next_id if K_sel is None else next_id[K_sel]
         nid = mx.reshape(nid, (-1, 1)) if nid.ndim == 1 else nid  # always [B,1]
-        e = self.mel_embedding(nid) + self.mel_pos_embedding.get_fixed_embedding(step + 2)  # nid [B,1] -> emb [B,1,dim]
+        e = self.mel_embedding(nid)
+        mx.eval(e)
+        e = e + self.mel_pos_embedding.get_fixed_embedding(step + 2)  # nid [B,1] -> emb [B,1,dim]
+        mx.eval(e)
         attention_mask = mx.concatenate([attention_mask, mx.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype)], -1)
         m = mx.where(attention_mask[:, None, None, :] != 0, 0.0, mx.finfo(mdtype).min).astype(mdtype)
         hidden, kvs = self.gpt(inputs_embeds=e.astype(mdtype), attention_mask=m, past_key_values=kvs)
-        return attention_mask, kvs, self.mel_head(self.final_norm(hidden))[:, -1]
+        out = self.mel_head(self.final_norm(hidden))[:, -1]
+        mx.eval(out)
+        return attention_mask, kvs, out
 
     def _sample(self, logits, do_sample, top_k, top_p, temperature, generated_ids=None, repetition_penalty=1.0):
         # HF warper order: repetition_penalty -> temperature -> top_k -> top_p

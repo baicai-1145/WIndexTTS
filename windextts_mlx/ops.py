@@ -19,6 +19,7 @@ class Seq(nn.Module):
     def __call__(self, x):
         for n in self._order:
             x = getattr(self, n)(x)
+            mx.eval(x)  # per-module eval: first-time Metal compile < watchdog
         return x
 
     def __len__(self):

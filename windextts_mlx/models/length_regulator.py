@@ -41,7 +41,10 @@ class InterpolateRegulator(nn.Module):
 
     def __call__(self, x, ylens=None, n_quantizers=None, f0=None):  # x [B,T,1024]
         x = self.content_in_proj(x)
+        mx.eval(x)
         mask = ops.sequence_mask(ylens, int(ylens.max())).astype(mx.float32)[..., None]  # [B,T,1]
         if self.interpolate:
             x = ops.interpolate_nearest(x, int(ylens.max()))
-        return self.model(x) * mask, ylens, None, None, None
+        x = self.model(x)
+        mx.eval(x)
+        return x * mask, ylens, None, None, None
