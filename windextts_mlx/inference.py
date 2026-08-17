@@ -122,11 +122,13 @@ class WIndexTTSMLX:
     def _apply_w4a16(self, group_size=128):
         import mlx.nn as nn
 
-        # W4A16 on GPT body + mel_head only (torch parity scope); predicate keeps
-        # spk_emb_proj/emovec_layer/heads-in-1280 untouched.
+        # W4A16 on GPT transformer body only: mel_head (lm_head [1280,2048])
+        # must stay fp32 — 4bit there destroys the argmax directly (prefill
+        # logits cos 0.9957 -> 0.999993, forced-decode 13 -> 0 non-tie misses).
+        # spk_emb_proj/emovec_layer stay fp32 too (they feed conds, not logits).
         nn.quantize(self.gpt, group_size=group_size, bits=4,
-                    predicate=lambda m, n: n.startswith("gpt.gpt.h.") or n == "mel_head")
-        print(f">> W4A16: quantized GPT body + mel_head (int4, group={group_size})")
+                    class_predicate=lambda path, m: path.startswith("gpt.gpt.h."))
+        print(f">> W4A16: quantized GPT body only (int4, group={group_size})")
 
     def _resample(self, sr, target):
         key = (sr, target)

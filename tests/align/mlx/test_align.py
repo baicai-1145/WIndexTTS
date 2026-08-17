@@ -18,12 +18,13 @@ CACHE = Path(__file__).parent / "cache"
 _mlx = {}
 
 
-def mlx(dtype="fp32"):
-    if dtype not in _mlx:
+def mlx(dtype="fp32", quantize=False):
+    key = (dtype, quantize)
+    if key not in _mlx:
         from windextts_mlx.inference import WIndexTTSMLX
 
-        _mlx[dtype] = WIndexTTSMLX(weights_dir=MLX, dtype=dtype)
-    return _mlx[dtype]
+        _mlx[key] = WIndexTTSMLX(weights_dir=MLX, dtype=dtype, quantize=quantize)
+    return _mlx[key]
 
 
 def load(name):
@@ -188,31 +189,31 @@ def test_gpt_beam3():
 
 # ---------------- end-to-end (test.wav) ----------------
 
-def test_e2e(dtype="fp32"):
+def test_e2e(dtype="fp32", quantize=False):
     z = load("e2e")
     import soundfile as sf
 
     data, sr = sf.read("/Volumes/2T/WIndexTTS/test.wav", dtype="float32")
     data = data.mean(1) if data.ndim > 1 else data
     # match gen_ref ordering: resample FIRST, then truncate to 6s
-    a16 = mlx(dtype)._resample(sr, 16000)(mx.array(data)[None])[:, : 16000 * 6]
-    a22 = mlx(dtype)._resample(sr, 22050)(mx.array(data)[None])[:, : 22050 * 6]
+    a16 = mlx(dtype, quantize)._resample(sr, 16000)(mx.array(data)[None])[:, : 16000 * 6]
+    a22 = mlx(dtype, quantize)._resample(sr, 22050)(mx.array(data)[None])[:, : 22050 * 6]
 
-    spk = mlx(dtype).extract_spk_cond(a16)
-    style = mlx(dtype).extract_style(a16)
-    refmel = mlx(dtype)._mel()(a22.astype(mx.float32))
+    spk = mlx(dtype, quantize).extract_spk_cond(a16)
+    style = mlx(dtype, quantize).extract_style(a16)
+    refmel = mlx(dtype, quantize)._mel()(a22.astype(mx.float32))
     check("e2e spk_cond", z["spk_cond"], spk, cth=0.999)
     check("e2e style", z["style"], style, cth=0.999)
     check("e2e ref_mel", z["refmel"], refmel, cth=0.999)
 
-    ev = mlx(dtype).build_emo_vec(style, spk)
+    ev = mlx(dtype, quantize).build_emo_vec(style, spk)
     check("e2e emo_vec", z["emo_vec"], ev, cth=0.999)
 
-    conds = mlx(dtype).gpt.build_conds_latent(style, ev)
+    conds = mlx(dtype, quantize).gpt.build_conds_latent(style, ev)
     check("e2e conds", z["conds"], conds, cth=0.999)
 
-    codes = mlx(dtype).gpt.generate(conds, arr(z, "tt", mx.int32), arr(z, "lang", mx.int32),
-                               max_new_tokens=96, do_sample=False, stop_token=mlx(dtype).cfg.gpt.stop_mel_token)
+    codes = mlx(dtype, quantize).gpt.generate(conds, arr(z, "tt", mx.int32), arr(z, "lang", mx.int32),
+                               max_new_tokens=96, do_sample=False, stop_token=mlx(dtype, quantize).cfg.gpt.stop_mel_token)
     nt, nm = z["codes"][0], to_np(codes)[0]
     n = min(len(nt), len(nm))
     # tie-exempt comparison: a flip is only acceptable where the REFERENCE logits
@@ -234,27 +235,31 @@ def test_e2e(dtype="fp32"):
     # forced decode with the REFERENCE tokens: identical inputs => every non-tie
     # position must match exactly for the WHOLE sequence (the free-run tail is
     # driven by divergent inputs, so it cannot be compared position-by-position).
-    S, am, kvs, cl = mlx(dtype).gpt._prefill(conds, arr(z, "tt", mx.int32), arr(z, "lang", mx.int32))
+    S, am, kvs, cl = mlx(dtype, quantize).gpt._prefill(conds, arr(z, "tt", mx.int32), arr(z, "lang", mx.int32))
     fd = [int(np.asarray(cl)[0, -1].argmax())]
     for step in range(n - 1):
-        am, kvs, cl = mlx(dtype).gpt._eager_step(mx.array([[int(nt[step])]], dtype=mx.int32), step, am, kvs, mx.float16 if dtype == "fp16" else mx.float32)
+        am, kvs, cl = mlx(dtype, quantize).gpt._eager_step(mx.array([[int(nt[step])]], dtype=mx.int32), step, am, kvs, mx.float16 if dtype == "fp16" else mx.float32)
         fd.append(int(np.asarray(cl)[0].argmax()))
     fd = np.array(fd)
     fd_bad = [i for i in range(n) if fd[i] != nt[i] and not tie[i]]
-    print(f"  e2e forced-decode: {int((fd == nt).sum())}/{n} identical "
+    print(f"  e2e forced-decode: {int((fd == nt[:n]).sum())}/{n} identical "
           f"(non-tie mismatches {fd_bad})")
     assert not fd_bad, f"forced-decode non-tie mismatch at {fd_bad}"
 
     # decode-chain alignment must use the REFERENCE codes (generation ties may
     # diverge, but codec->mel->vocoder parity is judged on identical input)
-    s = mlx(dtype).codec.decode(arr(z, "codes", mx.int32))
+    s = mlx(dtype, quantize).codec.decode(arr(z, "codes", mx.int32))
     check("e2e s_infer", z["s"], s, cth=0.999)
-    mel = mlx(dtype).s2mel.inference(spk, s, refmel, style, n_timesteps=8, inference_cfg_rate=0.7,
+    mel = mlx(dtype, quantize).s2mel.inference(spk, s, refmel, style, n_timesteps=8, inference_cfg_rate=0.7,
                                 z=arr(z, "z") if "z" in z else None)
     check("e2e mel", z["mel"], mel, cth=0.999)
-    aud = np.asarray(mx.clip(mlx(dtype).bigvgan(mel), -1.0, 1.0)[0, 0])
+    aud = np.asarray(mx.clip(mlx(dtype, quantize).bigvgan(mel), -1.0, 1.0)[0, 0])
     check("e2e audio", z["audio"], aud, cth=0.99, label="audio")
 
 
 def test_e2e_fp16():
     test_e2e(dtype="fp16")
+
+
+def test_e2e_w4a16():
+    test_e2e(dtype="fp32", quantize=True)

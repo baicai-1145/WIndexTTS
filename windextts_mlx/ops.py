@@ -25,7 +25,9 @@ class Seq(nn.Module):
         return len(self._order)
 
     def __getitem__(self, i):
-        return getattr(self, self._order[i])
+        # int index -> name-preserving lookup; str key must stay dict-native
+        # (mlx Module is a dict subclass: update/quantize assign dst["0"])
+        return dict.__getitem__(self, self._order[i] if isinstance(i, int) else i)
 
 
 def reflect_pad(x, pl, pr):
