@@ -6,7 +6,7 @@ from pathlib import Path
 
 TESTS = ["mel", "featurizer", "fbank", "resample", "normalizer", "campplus", "codec",
          "length_regulator", "w2v_bert", "emo_conditioning", "dit", "s2mel_inference",
-         "bigvgan", "gpt_prefill", "gpt_greedy", "gpt_beam3", "e2e"]
+         "bigvgan", "gpt_prefill", "gpt_greedy", "gpt_beam3", "e2e", "e2e_fp16"]
 
 sel = sys.argv[1:] or TESTS
 mlx_dir = Path(__file__).resolve().parent

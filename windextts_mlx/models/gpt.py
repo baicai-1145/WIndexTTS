@@ -27,11 +27,18 @@ class GPT2Attention(nn.Module):
             pk, pv = past_kv
             k = mx.concatenate([pk, k], 2)
             v = mx.concatenate([pv, v], 2)
+        # attention math in fp32: fp16 qk accumulates overflow (scores -> inf)
+        # even at moderate activations (~96), which nans softmax on long decode
+        f32 = q.dtype == mx.float16
+        if f32:
+            q, k, v = q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32)
         s = q @ k.transpose(0, 1, 3, 2) / (self.head_dim ** 0.5)
         if mask is not None:
-            s = s + mask
+            s = s + mask.astype(mx.float32) if f32 else s + mask
         o = mx.softmax(s, -1) @ v
-        return self.c_proj(o.transpose(0, 2, 1, 3).reshape(B, T, self.embed_dim)), (k, v)
+        if f32:
+            o = o.astype(mx.float16)
+        return self.c_proj(o.transpose(0, 2, 1, 3).reshape(B, T, self.embed_dim)), (k.astype(mx.float16) if f32 else k, v.astype(mx.float16) if f32 else v)
 
 
 class GPT2MLP(nn.Module):

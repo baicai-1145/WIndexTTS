@@ -57,11 +57,14 @@ class WIndexTTSMLX:
 
         w = self.weights_dir
         dt = {"fp16": mx.float16, "fp64": mx.float64}.get(self.dtype, mx.float32)
+        # feature frontends stay fp32 in fp16 mode: their rounding propagates into
+        # the GPT conditions and flips early (non-tie) argmaxes (spk_cond fp16
+        # cos 0.999986 -> conds drift -> step-2 flip). GPT/codec run fp16.
         self.w2v_bert = Wav2Vec2BertConformer()
-        load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), dt)
+        load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), None)
         s = np.load(w / "stats.npz")
-        self.w2v_mean = mx.array(s["mean"], dtype=dt)
-        self.w2v_std = mx.sqrt(mx.array(s["var"], dtype=dt))
+        self.w2v_mean = mx.array(s["mean"], dtype=mx.float32)
+        self.w2v_std = mx.sqrt(mx.array(s["var"], dtype=mx.float32))
 
         self.campplus = CAMPPlus(feat_dim=80, embedding_size=192)
         load_into(self.campplus, load_mlx(w, "campplus"))  # stays fp32 (torch parity)
@@ -91,14 +94,17 @@ class WIndexTTSMLX:
             in_channels=lr.in_channels, codebook_size=lr.content_codebook_size)
         st = load_mlx(w, "s2mel")
         lr_st = {k[len("length_regulator."):]: v for k, v in st.items() if k.startswith("length_regulator.")}
-        load_into(self.length_regulator, lr_st, dt)
+        # s2mel/bigvgan stay fp32 in fp16 mode: the mel->vocoder chain is highly
+        # sensitivity to mel rounding (audio cos drops 0.99 -> 0.34 on fp16 mel),
+        # while GPT/codec run fp16 for speed.
+        load_into(self.length_regulator, lr_st, None)
         self.dit = DiT()
-        load_into(self.dit, st, dt if self.dtype == "fp16" else None)
+        load_into(self.dit, st, None)
         self.s2mel = S2Mel(self.length_regulator, S2MelCFM(self.dit, in_channels=self.cfg.s2mel.dit.in_channels))
 
         bcfg = BigVGANConfig.from_json(w / "bigvgan_config.json")
         self.bigvgan = BigVGAN(bcfg)
-        load_into(self.bigvgan, load_mlx(w, "bigvgan"), dt)
+        load_into(self.bigvgan, load_mlx(w, "bigvgan"), None)
 
         self.mel_fn = None
         self.featurizer = None
