@@ -30,17 +30,18 @@ def _load_audio(path, max_seconds=REF_MAX_SECONDS):
 
 class WIndexTTSMLX:
     def __init__(self, cfg=None, weights_dir=DEFAULT_MLX_DIR, dtype="fp32", quantize=False,
-                 enable_emo_ref=True, qwen_tokenizer_dir=None, w2v_fp16=False,
+                 enable_emo_ref=True, qwen_tokenizer_dir=None, w2v_fp16=True,
                  cache_limit_gb=1.0):
         from windextts.config import load_default_config
 
         self.cfg = cfg or load_default_config()
         self.dtype = dtype  # "fp32" | "fp16" | "fp64" (weights+compute)
         self.quantize = quantize  # W4A16 on GPT body + mel_head
-        # fp16 mode: keep w2v_bert fp32 by default — its ~5e-4 weight rounding
-        # flips an early (non-tie) GPT-AR argmax, so the codes diverge from the
-        # fp32 reference (listening tests: no audible difference). w2v_fp16=True
-        # trades reference alignment for -1.16GB (listening-equivalent output).
+        # fp16 mode: w2v_bert runs fp16 by default — its ~5e-4 weight rounding
+        # flips an early (non-tie) GPT-AR argmax, so codes diverge from the fp32
+        # reference (audio cos 0.077 vs reference) but blind listening found
+        # zero audible difference. w2v_fp16=False restores strict reference
+        # alignment at +1.16GB.
         self.w2v_fp16 = w2v_fp16
         self.enable_emo_ref = enable_emo_ref
         self.weights_dir = Path(weights_dir)
@@ -69,10 +70,10 @@ class WIndexTTSMLX:
 
         w = self.weights_dir
         dt = {"fp16": mx.float16, "fp64": mx.float64}.get(self.dtype, mx.float32)
-        # feature frontends stay fp32 in fp16 mode: their rounding propagates into
-        # the GPT conditions and flips early (non-tie) argmaxes (spk_cond fp16
-        # cos 0.999986 -> conds drift -> step-2 flip). w2v_fp16=True opts into
-        # the listening-equivalent fast path (see __init__).
+        # feature frontends stay fp32 ONLY in strict-alignment mode: their
+        # rounding propagates into the GPT conditions and flips early (non-tie)
+        # argmaxes vs the fp32 reference (spk_cond fp16 cos 0.999986 -> conds
+        # drift -> step-2 flip; listening-equivalent, verified by ear).
         w2v_dt = dt if (self.dtype == "fp16" and self.w2v_fp16) else None
         self.w2v_bert = Wav2Vec2BertConformer()
         load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), w2v_dt)
