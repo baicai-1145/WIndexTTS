@@ -30,7 +30,8 @@ def _load_audio(path, max_seconds=REF_MAX_SECONDS):
 
 class WIndexTTSMLX:
     def __init__(self, cfg=None, weights_dir=DEFAULT_MLX_DIR, dtype="fp32", quantize=False,
-                 enable_emo_ref=True, qwen_tokenizer_dir=None, w2v_fp16=False):
+                 enable_emo_ref=True, qwen_tokenizer_dir=None, w2v_fp16=False,
+                 cache_limit_gb=1.0):
         from windextts.config import load_default_config
 
         self.cfg = cfg or load_default_config()
@@ -44,6 +45,12 @@ class WIndexTTSMLX:
         self.enable_emo_ref = enable_emo_ref
         self.weights_dir = Path(weights_dir)
         self.qwen_tokenizer_dir = qwen_tokenizer_dir
+        # mlx's buffer cache pool is unbounded by default: released intermediates
+        # stay resident (measured 7.6GB after one infer on a 16GB machine),
+        # inflating system memory + swap pressure. Cap it so the process holds
+        # ~active + cache_limit only. None = leave mlx default.
+        if cache_limit_gb is not None:
+            mx.set_cache_limit(int(cache_limit_gb * 1024**3))
         self._load_modules()
         self._ref_cache = {}
         self._normalizer = None

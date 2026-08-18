@@ -46,6 +46,9 @@ def bench(cfg, greedy_only=False):
     name = cfg["dtype"] + ("+w4a16" if cfg.get("quantize") else "") + ("+w2v16" if cfg.get("w2v_fp16") else "")
     for mode, w, d, p in rows:
         print(f"[{name:7s}] {mode:6s} wall {w:6.2f}s audio {d:4.2f}s RTF {w / d:5.2f}x  peak {p:5.2f} GB")
+    # release the model so a second config in the same process does not double
+    # count this config's resident weights in its peak.
+    del m
 
 
 if __name__ == "__main__":
