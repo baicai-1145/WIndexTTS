@@ -12,7 +12,13 @@ DEFAULT_MLX_DIR = Path("/Volumes/2T/IndexTTS-2.5-mlx")
 
 
 def load_mlx(weights_dir, name):
-    return mx.load(str(Path(weights_dir) / f"{name}.safetensors"), format="safetensors")
+    st = mx.load(str(Path(weights_dir) / f"{name}.safetensors"), format="safetensors")
+    # safetensors is mmap-backed: without this, the first GPU kernel that
+    # touches a weight page pulls it from disk mid-kernel (mechanical HDD =
+    # 10ms+/page), blowing the Metal 2s watchdog. Force the whole file into
+    # memory once at load time.
+    mx.eval(*st.values())
+    return st
 
 
 def load_into(model, st, dtype=None):
