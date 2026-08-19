@@ -11,6 +11,41 @@ class S2MelCFM:
         self.estimator = estimator
         self.in_channels = in_channels
         self.sigma_min = sigma_min
+        self._step_c = None
+        self._step_seqs = None
+        self._step_T = None
+
+    def _ensure_compiled(self, T):
+        # O1: compiled DiT forward (no per-layer evals). Static shapes: rebuild
+        # only when T changes (B=2 cfg is constant). WINDEXTTS_NO_O1_COMPILE=1
+        # forces eager for A/B / diagnostics.
+        import os
+
+        if os.environ.get("WINDEXTTS_NO_O1_COMPILE"):
+            self._step_c = None
+            return
+        if self._step_c is not None and self._step_T == T:
+            return
+        try:
+            fn, seqs = self.estimator._compiled_forward()
+            self._step_c, self._step_seqs, self._step_T = fn, seqs, T
+        except Exception as e:
+            print(f"[O1] compiled DiT disabled: {type(e).__name__}: {e}")
+            self._step_c, self._step_seqs, self._step_T = None, None, None
+
+    def _estim(self, x, prompt_x, x_lens, t, style, mu, T):
+        if self._step_c is not None:
+            freqs = mx.take(self.estimator.transformer._ensure_freqs(T),
+                            self.estimator.input_pos[:T], 0)
+            for s in self._step_seqs:
+                s._no_sync = True  # needed only during lazy trace of first call
+            try:
+                d = self._step_c(x, prompt_x, x_lens, t, style, mu, freqs)
+            finally:
+                for s in self._step_seqs:
+                    s._no_sync = False
+            return d
+        return self.estimator(x, prompt_x, x_lens, t, style, mu)
 
     def inference(self, mu, x_lens, prompt, style, f0, n_timesteps=25,
                   temperature=1.0, inference_cfg_rate=0.7, z=None):
@@ -37,16 +72,17 @@ class S2MelCFM:
             s_lens = mx.concatenate([x_lens, x_lens], 0)
         t = t_span[0]
         x = x * keep  # zero the prompt region of z BEFORE the first step (torch parity)
+        self._ensure_compiled(T)
         for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
             if cfg > 0:
                 s_x = mx.concatenate([x, x], 0)
                 s_t = mx.concatenate([t[None], t[None]], 0)
-                d = self.estimator(s_x, s_prompt_x, s_lens, s_t, s_style, s_mu)
+                d = self._estim(s_x, s_prompt_x, s_lens, s_t, s_style, s_mu, T)
                 dphi, cfg_dphi = mx.split(d, 2, axis=0)
                 dphi = (1.0 + cfg) * dphi - cfg * cfg_dphi
             else:
-                dphi = self.estimator(x, prompt_x, x_lens, t[None], style, mu)
+                dphi = self._estim(x, prompt_x, x_lens, t[None], style, mu, T)
             x = (x + dt * dphi) * keep
             t = t + dt
             mx.eval(x)

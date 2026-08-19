@@ -13,13 +13,15 @@ class Seq(nn.Module):
     def __init__(self, items):
         super().__init__()
         self._order = list(items)
+        self._no_sync = False  # set by mx.compile callers during tracing only
         for n, m in items.items():
             setattr(self, n, m)
 
     def __call__(self, x):
         for n in self._order:
             x = getattr(self, n)(x)
-            mx.eval(x)  # per-module eval: first-time Metal compile < watchdog
+            if not self._no_sync:
+                mx.eval(x)  # per-module eval: first-time Metal compile < watchdog
         return x
 
     def __len__(self):

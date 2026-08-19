@@ -238,6 +238,80 @@ class DiT(nn.Module):
         self.skip_linear = nn.Linear(D + 80, D)
         self.cond_x_merge_linear = nn.Linear(80 + 80 + 512 + 192, D)  # x|prompt_x|cond|style = 864
 
+    def _compiled_forward(self):
+        # O1: mx.compile of the full DiT forward (no internal mx.eval; freqs
+        # passed in). Static shapes — the CFM loop calls it 2*n_timesteps times
+        # with identical shapes, so it traces once. Seq modules must run with
+        # _no_sync=True during tracing (mx.eval is illegal inside mx.compile).
+        D, A = 512, 8  # hidden_dim, num_heads (config.yaml s2mel.DiT)
+        HD = D // A
+        order = self.transformer.layers._order
+        emit = set(self.transformer.layers_emit_skip)
+        recv = set(self.transformer.layers_receive_skip)
+        wn_order = self.wavenet.in_layers._order
+        hc = self.wavenet.hidden_channels
+
+        def _transformer(x, c, freqs, mask):
+            skips = []
+            for pos, i in enumerate(order):
+                lay = getattr(self.transformer.layers, i)
+                s = skips.pop() if pos in recv else None
+                if s is not None:
+                    x = lay.skip_in_linear(mx.concatenate([x, s], -1))
+                h = x + lay.attention(lay.attention_norm(x, c), freqs, mask)
+                x = h + lay.feed_forward(lay.ffn_norm(h, c))
+                if pos in emit:
+                    skips.append(x)
+            return self.transformer.norm(x, c)
+
+        def _wavenet(x, x_mask, g):
+            gc = self.wavenet.cond_layer(g) if self.wavenet.cond_layer is not None else None
+            out = mx.zeros_like(x)
+            for pos, i in enumerate(wn_order):
+                inl = getattr(self.wavenet.in_layers, i)
+                rsl = getattr(self.wavenet.res_skip_layers, str(i))
+                a = inl(x)
+                if gc is not None:
+                    a = a + gc[:, :, pos * 2 * hc: (pos + 1) * 2 * hc]
+                a = mx.tanh(a[..., :hc]) * mx.sigmoid(a[..., hc:])
+                rs = rsl(a)
+                if pos < len(wn_order) - 1:
+                    x = (x + rs[..., :hc]) * x_mask
+                    out = out + rs[..., hc:]
+                else:
+                    out = out + rs
+            return out * x_mask
+
+        def forward(x, prompt_x, x_lens, t, style, cond, freqs):
+            B, _, T = x.shape
+            t1 = self.t_embedder(t)
+            x, prompt_x, cond = x.transpose(0, 2, 1), prompt_x.transpose(0, 2, 1), self.cond_projection(cond)
+            x_in = mx.concatenate([x, prompt_x, cond, mx.broadcast_to(style[:, None], (B, T, 192))], -1)
+            x_in = self.cond_x_merge_linear(x_in)
+            x_mask = ops.sequence_mask(x_lens, x_in.shape[1])[:, None]
+            mask = mx.where(mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
+            x_res = _transformer(x_in, t1[:, None], freqs, mask)
+            x_res = self.skip_linear(mx.concatenate([x_res, x], -1))
+            x = self.conv1(x_res)
+            t2 = self.t_embedder2(t)
+            x = _wavenet(x, x_mask.transpose(0, 2, 1).astype(mx.float32), g=t2[:, None, :]) + self.res_projection(x_res)
+            return self.conv2(self.final_layer(x, t1)).transpose(0, 2, 1)
+
+        def _all_modules(m):
+            yield m
+            for v in m.values():
+                if isinstance(v, nn.Module):
+                    yield from _all_modules(v)
+
+        for sub in _all_modules(self):
+            if isinstance(sub, ops.Seq):
+                sub._no_sync = True
+        fn = mx.compile(forward)
+        # NOTE: mx.compile traces lazily on FIRST call — caller must keep the
+        # Seq _no_sync flags set during that call (S2MelCFM does set/reset per
+        # call); compiled executions afterwards never re-enter Python code.
+        return fn, [sub for sub in _all_modules(self) if isinstance(sub, ops.Seq)]
+
     def __call__(self, x, prompt_x, x_lens, t, style, cond):
         # x/prompt_x [B,80,T] -> [B,T,80]; cond [B,T,512]
         B, _, T = x.shape
