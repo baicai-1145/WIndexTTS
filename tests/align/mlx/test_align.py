@@ -191,8 +191,8 @@ def test_gpt_beam3():
 # ---------------- end-to-end (test.wav) ----------------
 
 def test_e2e(dtype="fp32", quantize=False, w2v_fp16=True):
-    # w2v_fp16 only affects fp16 mode; fp32/w4a16 always run w2v_bert fp32.
-    align_codes = not (dtype == "fp16" and w2v_fp16)
+    # w2v_fp16 affects fp16 and w4a16 modes; plain fp32 always runs it fp32.
+    align_codes = not (w2v_fp16 and (dtype == "fp16" or quantize))
     z = load("e2e")
     import soundfile as sf
 
@@ -281,4 +281,11 @@ def test_e2e_fp16_align():
 
 
 def test_e2e_w4a16():
-    test_e2e(dtype="fp32", quantize=True)
+    # default w4a16 path: w2v_bert fp16 (listening-equivalent; codes expected
+    # to diverge early — decode chain still verified)
+    test_e2e(dtype="fp32", quantize=True, w2v_fp16=True)
+
+
+def test_e2e_w4a16_align():
+    # strict reference-alignment w4a16: w2v_bert stays fp32
+    test_e2e(dtype="fp32", quantize=True, w2v_fp16=False)

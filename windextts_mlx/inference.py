@@ -74,7 +74,8 @@ class WIndexTTSMLX:
         # rounding propagates into the GPT conditions and flips early (non-tie)
         # argmaxes vs the fp32 reference (spk_cond fp16 cos 0.999986 -> conds
         # drift -> step-2 flip; listening-equivalent, verified by ear).
-        w2v_dt = dt if (self.dtype == "fp16" and self.w2v_fp16) else None
+        # Applies to fp16 mode and to w4a16 (dtype fp32 + quantize).
+        w2v_dt = mx.float16 if (self.w2v_fp16 and (self.dtype == "fp16" or self.quantize)) else None
         self.w2v_bert = Wav2Vec2BertConformer()
         load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), w2v_dt)
         s = np.load(w / "stats.npz")
