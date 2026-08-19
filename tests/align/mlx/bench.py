@@ -54,7 +54,13 @@ def bench(cfg, greedy_only=False):
 if __name__ == "__main__":
     cfgs = []
     for arg in sys.argv[1:] or ["fp32", "fp16", "w4a16", "fp16-fast"]:
-        cfgs.append({"dtype": arg, "quantize": arg == "w4a16",
-                    "w2v_fp16": arg == "fp16-fast"})
+        if arg == "w4a16":
+            # fp16 base + int4 GPT body (lowest memory; codes are NOT fp32-
+            # aligned by design — 4-bit body rounding, listening-equivalent)
+            cfgs.append({"dtype": "fp16", "quantize": True})
+        elif arg == "fp16-align":
+            cfgs.append({"dtype": "fp16", "w2v_fp16": False})
+        else:
+            cfgs.append({"dtype": arg, "quantize": False})
     for cfg in cfgs:
         bench(cfg)
