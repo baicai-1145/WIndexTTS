@@ -1,5 +1,8 @@
 # GPU (Metal) end-to-end benchmark: RTF (greedy + beam3) and peak memory per
 # dtype configuration (fp32 / fp16 / w4a16). Uses test.wav ref + Chinese text.
+# RTF = wall/audio: >1 means slower than realtime (same convention as the
+# official README's 0.24; git-log messages using "5.56x" are audio/wall —
+# i.e. speedup vs realtime — and are NOT comparable to this RTF).
 # Run: .venv/bin/python tests/align/mlx/bench.py
 import os
 import sys
@@ -53,13 +56,18 @@ def bench(cfg, greedy_only=False):
 
 if __name__ == "__main__":
     cfgs = []
-    for arg in sys.argv[1:] or ["fp32", "fp16", "w4a16", "fp16-fast"]:
+    for arg in sys.argv[1:] or ["fp32", "fp16", "w4a16"]:
         if arg == "w4a16":
             # fp16 base + int4 GPT body (lowest memory; codes are NOT fp32-
             # aligned by design — 4-bit body rounding, listening-equivalent)
             cfgs.append({"dtype": "fp16", "quantize": True})
         elif arg == "fp16-align":
             cfgs.append({"dtype": "fp16", "w2v_fp16": False})
+        elif arg == "fp16-fast":
+            # legacy name for the current fp16 default (w2v + vocoder fp16,
+            # which are constructor defaults) — previously fell through to
+            # dtype="fp16-fast" and silently loaded the WHOLE model as fp32.
+            cfgs.append({"dtype": "fp16"})
         else:
             cfgs.append({"dtype": arg, "quantize": False})
     for cfg in cfgs:
