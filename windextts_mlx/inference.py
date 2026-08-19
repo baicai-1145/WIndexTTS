@@ -31,18 +31,19 @@ def _load_audio(path, max_seconds=REF_MAX_SECONDS):
 class WIndexTTSMLX:
     def __init__(self, cfg=None, weights_dir=DEFAULT_MLX_DIR, dtype="fp32", quantize=False,
                  enable_emo_ref=True, qwen_tokenizer_dir=None, w2v_fp16=True,
-                 cache_limit_gb=1.0):
+                 voc_fp16=True, cache_limit_gb=1.0):
         from windextts.config import load_default_config
 
         self.cfg = cfg or load_default_config()
         self.dtype = dtype  # "fp32" | "fp16" | "fp64" (weights+compute)
         self.quantize = quantize  # W4A16 on GPT body + mel_head
-        # fp16 mode: w2v_bert runs fp16 by default — its ~5e-4 weight rounding
-        # flips an early (non-tie) GPT-AR argmax, so codes diverge from the fp32
-        # reference (audio cos 0.077 vs reference) but blind listening found
-        # zero audible difference. w2v_fp16=False restores strict reference
-        # alignment at +1.16GB.
+        # fp16 mode: w2v_bert/vocoder (dit+bigvgan) weights run fp16 by default.
+        # Rounding is ~5e-4 so codes/mel/audio diverge from the fp32 reference
+        # (AR early flip; waveform cos ~0) but blind listening found zero
+        # audible difference. w2v_fp16=False / voc_fp16=False restore strict
+        # reference alignment at +1.16GB / +0.42GB.
         self.w2v_fp16 = w2v_fp16
+        self.voc_fp16 = voc_fp16
         self.enable_emo_ref = enable_emo_ref
         self.weights_dir = Path(weights_dir)
         self.qwen_tokenizer_dir = qwen_tokenizer_dir
@@ -110,25 +111,24 @@ class WIndexTTSMLX:
             in_channels=lr.in_channels, codebook_size=lr.content_codebook_size)
         st = load_mlx(w, "s2mel")
         lr_st = {k[len("length_regulator."):]: v for k, v in st.items() if k.startswith("length_regulator.")}
-        # s2mel/bigvgan stay fp32 in fp16 mode: the mel->vocoder chain is highly
-        # sensitivity to mel rounding (audio cos drops 0.99 -> 0.34 on fp16 mel),
-        # while GPT/codec run fp16 for speed.
+        # vocoder chain (dit+bigvgan) weights fp16 by default in fp16 mode
+        # (mixed precision: activations stay fp32 via promotion; validated by
+        # ear — waveform cos vs fp32 reference ~0 but no audible difference).
+        # length_regulator stays fp32 (untested).
+        dt_voc = mx.float16 if (self.dtype == "fp16" and self.voc_fp16) else None
         load_into(self.length_regulator, lr_st, None)
         self.dit = DiT()
-        load_into(self.dit, st, None)
+        load_into(self.dit, st, dt_voc)
         self.s2mel = S2Mel(self.length_regulator, S2MelCFM(self.dit, in_channels=self.cfg.s2mel.dit.in_channels))
 
         bcfg = BigVGANConfig.from_json(w / "bigvgan_config.json")
         self.bigvgan = BigVGAN(bcfg)
-        load_into(self.bigvgan, load_mlx(w, "bigvgan"), None)
+        load_into(self.bigvgan, load_mlx(w, "bigvgan"), dt_voc)
 
         self.mel_fn = None
         self.featurizer = None
         self.fbank = None
         self._resample_cache = {}
-
-        if self.dtype == "fp16":
-            self.s2mel.cfm.estimator_fp16 = True  # inputs cast per call, output fp32
 
         print(f">> WIndexTTS-MLX loaded on {mx.default_device()} [{self.dtype}"
               f"{' + W4A16' if self.quantize else ''}]")
