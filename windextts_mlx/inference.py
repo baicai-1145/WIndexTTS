@@ -142,9 +142,20 @@ class WIndexTTSMLX:
         # must stay fp32 — 4bit there destroys the argmax directly (prefill
         # logits cos 0.9957 -> 0.999993, forced-decode 13 -> 0 non-tie misses).
         # spk_emb_proj/emovec_layer stay fp32 too (they feed conds, not logits).
-        nn.quantize(self.gpt, group_size=group_size, bits=4,
-                    class_predicate=lambda path, m: path.startswith("gpt.gpt.h."))
-        print(f">> W4A16: quantized GPT body only (int4, group={group_size})")
+        # NOTE: leaf paths are `gpt.h.*` (UnifiedVoice.gpt is the GPT2
+        # container); an earlier predicate `gpt.gpt.h.` matched NOTHING, so the
+        # model silently stayed fp32. Restrict to Linear leaves (LayerNorm and
+        # other leaves have no to_quantized() and would raise).
+        n = [0]
+
+        def pred(path, mod):
+            if path.startswith("gpt.h.") and isinstance(mod, nn.Linear):
+                n[0] += 1
+                return True
+            return False
+
+        nn.quantize(self.gpt, group_size=group_size, bits=4, class_predicate=pred)
+        print(f">> W4A16: quantized {n[0]} GPT-body Linear leaves (int4, group={group_size})")
 
     def _resample(self, sr, target):
         key = (sr, target)
