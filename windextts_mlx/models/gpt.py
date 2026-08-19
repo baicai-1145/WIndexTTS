@@ -1,6 +1,7 @@
 # GPT-AR (24-layer GPT2-style, model_dim 1280, mel-code AR decoder) — MLX port of
 # windextts/models/gpt.py. CUDA-graph paths deleted; sampling is pure; beam
 # search mirrors the eager torch semantics (cumulative log-prob winner).
+import os
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -128,6 +129,7 @@ class UnifiedVoice(nn.Module):
         self.spk_emb_proj = nn.Linear(192, model_dim)
         self.emo_layer = nn.Linear(model_dim, model_dim)
         self.emovec_layer = nn.Linear(1024, model_dim)
+        self._compiled_steps = 0  # O6 engagement counter (diagnostics)
         self.emo_conditioning_encoder = None
         self.emo_perceiver_encoder = None
         self.lang_embedding = nn.Embedding(107, model_dim)
@@ -220,6 +222,64 @@ class UnifiedVoice(nn.Module):
         mx.eval(out)
         return S, attention_mask, kvs, out
 
+    def _build_decode_step(self, max_len):
+        # O6: fused single-trace decode step over STATIC-LENGTH kv buffers.
+        # Math is identical to _eager_step (incl. fp32 attention rounding):
+        # positions > t are never attended (mask), unwritten kv slots are zero
+        # and contribute exactly 0 to softmax @ v. mx.compile bakes the shapes
+        # once (kv length max_len); positional/KV indices arrive as scalars so
+        # the graph traces a single time per max_len. Beam search still uses
+        # the dynamic _eager_step (its batch shrinks on EOS); this path is
+        # greedy-only. Raises on any unsupported op (e.g. w4a16 quantized
+        # matmul) — caller falls back to _eager_step.
+        H, HD = self.heads, self.model_dim // self.heads
+        D = self.model_dim
+        from mlx.utils import tree_flatten
+
+        mdtype = next(v for _, v in tree_flatten(self.parameters())).dtype
+        min_dt = mx.finfo(mdtype).min
+        pos3 = mx.arange(max_len, dtype=mx.int32)
+        pos4 = pos3[None, None, :, None]
+
+        def _attn(blk, h, m, pk, pv, t):
+            qkv = blk.attn.c_attn(h)
+            q, k, v = mx.split(qkv, 3, axis=-1)
+            B, T, _ = q.shape
+            q = q.reshape(B, T, H, HD).transpose(0, 2, 1, 3)
+            k = k.reshape(B, T, H, HD).transpose(0, 2, 1, 3)
+            v = v.reshape(B, T, H, HD).transpose(0, 2, 1, 3)
+            k = mx.where(pos4 == t, k, pk)  # write new token at position t
+            v = mx.where(pos4 == t, v, pv)
+            f32 = q.dtype == mx.float16
+            if f32:
+                q, k, v = q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32)
+            s = q @ k.transpose(0, 1, 3, 2) / (HD ** 0.5)
+            if m is not None:
+                s = s + (m.astype(mx.float32) if f32 else m)
+            o = mx.softmax(s, -1) @ v
+            if f32:
+                o = o.astype(mx.float16)
+            return blk.attn.c_proj(o.transpose(0, 2, 1, 3).reshape(B, T, D)), (k, v)
+
+        def step(nid, t_kv, t_pos, kvs, am):
+            if nid.ndim == 1:
+                nid = nid.reshape(-1, 1)
+            e = self.mel_embedding(nid) + mx.take(self.mel_pos_embedding.emb.weight, t_pos, 0)
+            # attended = pos<=t AND non-pad (am==1); identical set to _eager_step
+            m = mx.where((pos3[None, None, None, :] <= t_kv) & (am[:, None, None, :] != 0),
+                         0.0, min_dt).astype(mdtype)
+            h, outs = e.astype(mdtype), []
+            for pos, i in enumerate(self.gpt.h._order):
+                blk = getattr(self.gpt.h, i)
+                a, (nk, nv) = _attn(blk, blk.ln_1(h), m, kvs[pos][0], kvs[pos][1], t_kv)
+                h = h + a
+                h = h + blk.mlp(blk.ln_2(h))
+                outs.append((nk, nv))
+            o = self.mel_head(self.final_norm(self.gpt.ln_f(h)))[:, -1]
+            return o, outs
+
+        return mx.compile(step)
+
     def _eager_step(self, next_id, step, attention_mask, kvs, mdtype, K_sel=None):
         nid = next_id if K_sel is None else next_id[K_sel]
         nid = mx.reshape(nid, (-1, 1)) if nid.ndim == 1 else nid  # always [B,1]
@@ -271,6 +331,27 @@ class UnifiedVoice(nn.Module):
             return self._generate_beam_search(*a, num_beams, repetition_penalty)
         S, attention_mask, kvs, cur_logits = self._prefill(conditional_latents, text_inputs, langs)
         cur_logits = cur_logits[:, -1]
+        # O6: compiled static-KV decode step (single trace per max_len); falls
+        # back to the eager per-layer-eval path on any build/run failure
+        # (e.g. w4a16 quantized matmul unsupported under mx.compile).
+        max_len = S + 1 + max_new_tokens + 4
+        padn = max_len - (S + 1)
+        kvs_s = [(mx.pad(k, [(0, 0), (0, 0), (0, padn), (0, 0)]),
+                  mx.pad(v, [(0, 0), (0, 0), (0, padn), (0, 0)])) for k, v in kvs]
+        am_s = mx.pad(attention_mask, [(0, 0), (0, padn)], constant_values=1)
+        t_kv = S + 1
+        compiled_ok = False
+        if os.environ.get("WINDEXTTS_NO_O6_COMPILE"):
+            step_c = None  # explicit A/B / diagnostics switch (forces eager)
+        else:
+            try:
+                step_c = self._build_decode_step(max_len)
+            except Exception as e:
+                # expose why the compiled path is unavailable (w4a16 quantized matmul
+                # etc.) instead of silently falling back
+                print(f"[O6] compiled decode step disabled: {type(e).__name__}: {e}")
+                step_c = None
+        self._compiled_steps = 0
         codes, gen_ids = [], mx.zeros((1, 0), dtype=mx.int32)
         for step in range(max_new_tokens):
             cur_logits, next_id = self._sample(cur_logits, do_sample, top_k, top_p, temperature, gen_ids, repetition_penalty)
@@ -278,6 +359,22 @@ class UnifiedVoice(nn.Module):
             gen_ids = mx.concatenate([gen_ids, next_id[:, None]], 1)
             if stop_token is not None and next_id.item() == stop_token:
                 break  # stop token IS appended (torch ref parity)
+            if step_c is not None:
+                try:
+                    cur_logits, kvs_s = step_c(next_id, mx.array([t_kv], mx.int32),
+                                               mx.array([step + 2], mx.int32), kvs_s, am_s)
+                    mx.eval(cur_logits)
+                    t_kv += 1
+                    compiled_ok = True
+                    self._compiled_steps += 1
+                    continue
+                except Exception:
+                    if compiled_ok:
+                        # eager attention_mask/kvs were never advanced past the
+                        # prefill state — mid-sequence fallback would silently
+                        # misalign; fail loud instead.
+                        raise
+                    step_c = None  # first call failed: eager fallback, state intact
             attention_mask, kvs, cur_logits = self._eager_step(next_id, step, attention_mask, kvs, mdtype)
         return mx.stack(codes, 1)
 
