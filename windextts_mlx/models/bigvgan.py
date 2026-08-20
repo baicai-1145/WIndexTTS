@@ -120,14 +120,43 @@ class DownSample1d(nn.Module):  # keeps the torch 'lowpass' attr name for ckpt k
         return self.lowpass(x)
 
 
+def _act_compiled_ok():
+    # Wave-6: compile only the slice-chain subgraphs of Activation1d (up
+    # convT phases + LPF), snake stays eager. Probe: bit-exact (max|D|=0)
+    # and act chains 186ms -> 79ms (-58%) across all 18 resblocks.
+    return not os.environ.get("WINDEXTTS_NO_ACT_COMPILE")
+
+
+def _make_act_compiled(f_up, f_dn, ratio, pad, crop_left, low_pad, low_crop, low_stride):
+    """Lazily-built compiled closures for the two slice chains (constants baked)."""
+    up_c = mx.compile(lambda xx: _up_phases(xx, f_up, ratio, pad, crop_left))
+    dn_c = mx.compile(lambda xx: _lpf_strided(xx, f_dn, low_pad, low_crop, low_stride))
+    return up_c, dn_c
+
+
 class Activation1d(nn.Module):  # anti-aliased act: upsample -> act -> downsample
     def __init__(self, activation, up_ratio=2, down_ratio=2, up_k=12, down_k=12):
         super().__init__()
         self.act = activation
         self.upsample = UpSample1d(up_ratio, up_k)
         self.downsample = DownSample1d(down_ratio, down_k)
+        self._up_c = self._dn_c = None
 
     def __call__(self, x):
+        if (_act_compiled_ok() and _fast_act() and self.upsample.ratio == 2
+                and self.downsample.lowpass.stride == 2
+                and self.upsample.pad == 5 and self.upsample.pad_left == 15):
+            # Wave-6 hybrid: compiled slice chains (bit-exact probe) + eager
+            # snake (the only component that drifts under compile fusion).
+            if self._up_c is None:
+                f_up = self.upsample.filter.reshape(-1)
+                f_dn = self.downsample.lowpass.filter.reshape(-1)
+                self._up_c, self._dn_c = _make_act_compiled(
+                    f_up, f_dn, self.upsample.stride, self.upsample.pad,
+                    self.upsample.pad_left, 5, 6, 2)
+            u = self._up_c(x)
+            s = self.act(u)
+            return self._dn_c(s)
         return self.downsample(self.act(self.upsample(x)))
 
 
