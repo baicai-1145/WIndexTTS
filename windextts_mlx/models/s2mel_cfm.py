@@ -15,20 +15,20 @@ class S2MelCFM:
         self._step_seqs = None
         self._step_T = None
 
-    def _ensure_compiled(self, T):
+    def _ensure_compiled(self, T, no_mask=False):
         # O1: compiled DiT forward (no per-layer evals). Static shapes: rebuild
-        # only when T changes (B=2 cfg is constant). WINDEXTTS_NO_O1_COMPILE=1
-        # forces eager for A/B / diagnostics.
+        # only when (T, no_mask) changes (B=2 cfg is constant).
+        # WINDEXTTS_NO_O1_COMPILE=1 forces eager for A/B / diagnostics.
         import os
 
         if os.environ.get("WINDEXTTS_NO_O1_COMPILE"):
             self._step_c = None
             return
-        if self._step_c is not None and self._step_T == T:
+        if self._step_c is not None and self._step_T == (T, no_mask):
             return
         try:
-            fn, seqs = self.estimator._compiled_forward()
-            self._step_c, self._step_seqs, self._step_T = fn, seqs, T
+            fn, seqs = self.estimator._compiled_forward(no_mask)
+            self._step_c, self._step_seqs, self._step_T = fn, seqs, (T, no_mask)
         except Exception as e:
             print(f"[O1] compiled DiT disabled: {type(e).__name__}: {e}")
             self._step_c, self._step_seqs, self._step_T = None, None, None
@@ -72,7 +72,13 @@ class S2MelCFM:
             s_lens = mx.concatenate([x_lens, x_lens], 0)
         t = t_span[0]
         x = x * keep  # zero the prompt region of z BEFORE the first step (torch parity)
-        self._ensure_compiled(T)
+        # O5: x_lens == T always holds here (S2Mel sets it to the padded length),
+        # so the additive attention mask is exactly zero — skip it (bit-identical;
+        # env WINDEXTTS_NO_O5_NOMASK=1 restores the legacy always-mask path).
+        import os
+
+        no_mask = (not os.environ.get("WINDEXTTS_NO_O5_NOMASK")) and bool(mx.min(x_lens).item() >= T)
+        self._ensure_compiled(T, no_mask)
         for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
             if cfg > 0:

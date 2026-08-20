@@ -238,11 +238,14 @@ class DiT(nn.Module):
         self.skip_linear = nn.Linear(D + 80, D)
         self.cond_x_merge_linear = nn.Linear(80 + 80 + 512 + 192, D)  # x|prompt_x|cond|style = 864
 
-    def _compiled_forward(self):
+    def _compiled_forward(self, no_mask=False):
         # O1: mx.compile of the full DiT forward (no internal mx.eval; freqs
         # passed in). Static shapes — the CFM loop calls it 2*n_timesteps times
         # with identical shapes, so it traces once. Seq modules must run with
         # _no_sync=True during tracing (mx.eval is illegal inside mx.compile).
+        # O5 no-mask: x_lens == T at inference makes the [B,1,T,T] additive
+        # attention mask exactly zero — adding 0.0 is a no-op, so skip it
+        # (bit-identical, verified) and save the fp32 score materialization.
         D, A = 512, 8  # hidden_dim, num_heads (config.yaml s2mel.DiT)
         HD = D // A
         order = self.transformer.layers._order
@@ -289,7 +292,8 @@ class DiT(nn.Module):
             x_in = mx.concatenate([x, prompt_x, cond, mx.broadcast_to(style[:, None], (B, T, 192))], -1)
             x_in = self.cond_x_merge_linear(x_in)
             x_mask = ops.sequence_mask(x_lens, x_in.shape[1])[:, None]
-            mask = mx.where(mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
+            mask = None if no_mask else mx.where(
+                mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
             x_res = _transformer(x_in, t1[:, None], freqs, mask)
             x_res = self.skip_linear(mx.concatenate([x_res, x], -1))
             x = self.conv1(x_res)
@@ -314,6 +318,8 @@ class DiT(nn.Module):
 
     def __call__(self, x, prompt_x, x_lens, t, style, cond):
         # x/prompt_x [B,80,T] -> [B,T,80]; cond [B,T,512]
+        import os
+
         B, _, T = x.shape
         t1 = self.t_embedder(t)  # [B,D]
         x, prompt_x, cond = x.transpose(0, 2, 1), prompt_x.transpose(0, 2, 1), self.cond_projection(cond)
@@ -322,7 +328,9 @@ class DiT(nn.Module):
         x_in = self.cond_x_merge_linear(x_in)  # [B,T,D]
         mx.eval(x_in)
         x_mask = ops.sequence_mask(x_lens, x_in.shape[1])[:, None]  # [B,1,T]
-        mask = mx.where(mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
+        no_mask = (not os.environ.get("WINDEXTTS_NO_O5_NOMASK")) and bool(mx.min(x_lens).item() >= T)
+        mask = None if no_mask else mx.where(
+            mx.broadcast_to(x_mask[:, None], (B, 1, T, T)), 0.0, float("-inf"))
         x_res = self.transformer(x_in, t1[:, None], self.input_pos[:x_in.shape[1]], mask)
         mx.eval(x_res)
         x_res = self.skip_linear(mx.concatenate([x_res, x], -1))
