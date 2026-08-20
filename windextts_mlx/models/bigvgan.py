@@ -1,11 +1,25 @@
 # BigVGAN vocoder — MLX port of windextts/models/bigvgan.py (mel [B,80,T] -> audio).
 # weight_norm already flattened at conversion; kaiser-sinc filters come from the
 # checkpoint buffers ([1,1,k] torch layout, transposed here). All convs NLC-layout.
+#
+# O2.5 fast-act path (default on; WINDEXTTS_NO_O25_ACT=1 restores plain convs):
+# the Activation1d-internal depthwise convT/conv1d (k=12, s=2, groups=C) run 108x
+# per forward and are pure bandwidth ops — mx's generic depthwise conv kernels
+# are ~2-3x slower than explicit slice-mult-add decompositions at these shapes:
+#   upsample convT(k12,s2,edge-pad5,crop15/16) == 12 half-length strided slice
+#   mult-adds with parity-interleaved outputs (conv phases, verified 9.5e-07);
+#   lowpass conv1d(k12,s2,edge-pad5/6) == 12 strided slice mult-adds (4.8e-07).
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from windextts_mlx import ops
 from windextts_mlx.ops import Seq
+
+
+def _fast_act():
+    return not os.environ.get("WINDEXTTS_NO_O25_ACT")
 
 
 def _pad_same(k, d=1):  # HiFi-GAN/BigVGAN 'same'-pad for odd k
@@ -27,6 +41,40 @@ class SnakeBeta(nn.Module):
         return x + (1.0 / (b + 1e-9)) * mx.sin(x * a) ** 2
 
 
+def _up_phases(x, f, ratio, pad, crop_left):
+    """Depthwise convT(k=12, s=ratio=2, edge-pad) as 12 half-length slice mult-adds.
+
+    Full convT: y[n] = sum_j f[j] * xpad[(n-j)/2] (integer (n-j)/2 only); the crop
+    keeps n in [crop_left, crop_left+2L). Output offset t parity picks tap parity:
+    phase with tap parity `par` sums f[par+2u]*xpad[c-u : c-u+L] with c = (crop-par)/2.
+    """
+    L = x.shape[1]
+    xp = mx.pad(x, [(0, 0), (pad, pad), (0, 0)], mode="edge")
+    par = crop_left % 2
+
+    def phase(jpar, c):
+        acc = None
+        for u in range(f.shape[0] // 2):
+            s = f[jpar + 2 * u] * xp[:, c - u: c - u + L, :]
+            acc = s if acc is None else acc + s
+        return acc
+
+    ya, yb = phase(par, (crop_left - par) // 2), phase(1 - par, (crop_left + par) // 2)
+    return ratio * mx.stack([ya, yb], axis=2).reshape(x.shape[0], 2 * L, x.shape[2])
+
+
+def _lpf_strided(x, f, pad_left, pad_right, stride):
+    """Depthwise conv1d(k=12, s=2, edge-pad) as 12 strided slice mult-adds."""
+    k = f.shape[0]
+    Lout = (x.shape[1] + pad_left + pad_right - k) // stride + 1
+    xp = mx.pad(x, [(0, 0), (pad_left, pad_right), (0, 0)], mode="edge")
+    acc = None
+    for j in range(k):
+        s = f[j] * xp[:, j: j + stride * (Lout - 1) + 1: stride, :]
+        acc = s if acc is None else acc + s
+    return acc
+
+
 class _LPF1d(nn.Module):  # per-channel low-pass (groups=C); filter buffer from ckpt
     def __init__(self, k=12, stride=1):
         super().__init__()
@@ -35,6 +83,9 @@ class _LPF1d(nn.Module):  # per-channel low-pass (groups=C); filter buffer from 
         self.filter = mx.zeros((1, 1, k))  # torch buffer layout [1,1,k]
 
     def __call__(self, x):  # [B,L,C]
+        if _fast_act() and self.stride == 2 and self.filter.shape[-1] % 2 == 0:
+            return _lpf_strided(x, self.filter.reshape(-1), self.pad_left,
+                                self.pad_right, self.stride)
         C = x.shape[-1]
         f = mx.broadcast_to(self.filter.transpose(0, 2, 1), (C, self.filter.shape[-1], 1))  # [C,k,1] mlx [o,k,i/g]
         x = mx.pad(x, [(0, 0), (self.pad_left, self.pad_right), (0, 0)], mode="edge")
@@ -51,6 +102,8 @@ class UpSample1d(nn.Module):  # convT upsample with kaiser-sinc filter (ratio 2)
         self.filter = mx.zeros((1, 1, k))
 
     def __call__(self, x):  # [B,L,C]
+        if _fast_act() and self.ratio == 2 and self.stride == 2:
+            return _up_phases(x, self.filter.reshape(-1), self.ratio, self.pad, self.pad_left)
         C = x.shape[-1]
         f = mx.broadcast_to(self.filter.transpose(0, 2, 1), (C, self.filter.shape[-1], 1))  # mlx convT [o,k,i/g]
         x = mx.pad(x, [(0, 0), (self.pad, self.pad), (0, 0)], mode="edge")
