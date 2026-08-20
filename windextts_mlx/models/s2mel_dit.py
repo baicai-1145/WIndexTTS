@@ -63,6 +63,15 @@ class Attention(nn.Module):
         if r > 1:
             k = mx.repeat(k, r, axis=1)
             v = mx.repeat(v, r, axis=1)
+        if not os.environ.get("WINDEXTTS_NO_ATTN_SDPA"):
+            # Wave-6: one fused kernel in place of the qk/softmax/av chain. Its
+            # internal accumulate is fp32, so it is safe at the real activations
+            # (|q|~116, |k|~133, |s|~48k) where a plain fp16 matmul chain
+            # overflows to inf (D-chain inf; SDPA mel max|D|<=1e-5).
+            # Per-step -44ms/-14% same-window; WINDEXTTS_NO_ATTN_SDPA=1 legacy.
+            o = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=1.0 / math.sqrt(self.head_dim), mask=mask)
+            return self.wo(o.transpose(0, 2, 1, 3).reshape(bsz, seqlen, -1))
         s = q @ k.transpose(0, 1, 3, 2) / math.sqrt(self.head_dim)
         if mask is not None:
             s = s + mask
