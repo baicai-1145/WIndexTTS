@@ -24,11 +24,11 @@ class S2MelCFM:
         if os.environ.get("WINDEXTTS_NO_O1_COMPILE"):
             self._step_c = None
             return
-        if self._step_c is not None and self._step_T == (T, no_mask):
+        if self._step_c is not None and self._step_T == (T, no_mask, not os.environ.get("WINDEXTTS_NO_WN_DECOUPLE")):
             return
         try:
             fn, seqs = self.estimator._compiled_forward(no_mask)
-            self._step_c, self._step_seqs, self._step_T = fn, seqs, (T, no_mask)
+            self._step_c, self._step_seqs, self._step_T = fn, seqs, (T, no_mask, not os.environ.get("WINDEXTTS_NO_WN_DECOUPLE"))
         except Exception as e:
             print(f"[O1] compiled DiT disabled: {type(e).__name__}: {e}")
             self._step_c, self._step_seqs, self._step_T = None, None, None
@@ -40,6 +40,14 @@ class S2MelCFM:
             for s in self._step_seqs:
                 s._no_sync = True  # needed only during lazy trace of first call
             try:
+                if isinstance(self._step_c, tuple):  # Wave-5 decoupled WaveNet
+                    fn, fn_head = self._step_c
+                    xc, xr, xm, t1, t2 = fn(x, prompt_x, x_lens, t, style, mu, freqs)
+                    mx.eval(xc, xr, xm, t1, t2)
+                    g = self.estimator.wavenet(xc, xm, g=t2[:, None, :])
+                    e = fn_head(g, xr, t1)
+                    mx.eval(g, e)
+                    return e
                 d = self._step_c(x, prompt_x, x_lens, t, style, mu, freqs)
             finally:
                 for s in self._step_seqs:

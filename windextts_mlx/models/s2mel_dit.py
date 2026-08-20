@@ -1,6 +1,7 @@
 # S2Mel-DiT velocity estimator (13-layer, dim 512, 8 heads, RoPE/adaLN/uvit) +
 # gated WaveNet tail — MLX port of windextts/models/s2mel_dit.py. Eval-only.
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -298,8 +299,17 @@ class DiT(nn.Module):
             x_res = self.skip_linear(mx.concatenate([x_res, x], -1))
             x = self.conv1(x_res)
             t2 = self.t_embedder2(t)
-            x = _wavenet(x, x_mask.transpose(0, 2, 1).astype(mx.float32), g=t2[:, None, :]) + self.res_projection(x_res)
-            return self.conv2(self.final_layer(x, t1)).transpose(0, 2, 1)
+            if os.environ.get("WINDEXTTS_NO_WN_DECOUPLE"):
+                # legacy: WaveNet fused inside the compiled graph
+                if os.environ.get("WINDEXTTS_SKIP_WN"):
+                    x = mx.zeros_like(x) + self.res_projection(x_res)
+                else:
+                    x = _wavenet(x, x_mask.transpose(0, 2, 1).astype(mx.float32), g=t2[:, None, :]) + self.res_projection(x_res)
+                return self.conv2(self.final_layer(x, t1)).transpose(0, 2, 1)
+            # Wave-5: WaveNet runs eager OUTSIDE this graph (bit-exact; the
+            # in-graph conv chain measured 44x slower than standalone — same
+            # window A/B: FULL 4.21s vs decouple 3.62s per 8-step solve).
+            return x, x_res, x_mask.transpose(0, 2, 1).astype(mx.float32), t1, t2
 
         def _all_modules(m):
             yield m
@@ -314,6 +324,11 @@ class DiT(nn.Module):
         # NOTE: mx.compile traces lazily on FIRST call — caller must keep the
         # Seq _no_sync flags set during that call (S2MelCFM does set/reset per
         # call); compiled executions afterwards never re-enter Python code.
+        if not os.environ.get("WINDEXTTS_NO_WN_DECOUPLE"):
+            # Wave-5 decoupled head (eager WaveNet between fn and fn_head)
+            def forward_head(x, x_res, t1):
+                return self.conv2(self.final_layer(x + self.res_projection(x_res), t1)).transpose(0, 2, 1)
+            return (fn, mx.compile(forward_head)), [sub for sub in _all_modules(self) if isinstance(sub, ops.Seq)]
         return fn, [sub for sub in _all_modules(self) if isinstance(sub, ops.Seq)]
 
     def __call__(self, x, prompt_x, x_lens, t, style, cond):
