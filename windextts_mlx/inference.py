@@ -3,6 +3,7 @@
 # path). dtype: "fp32" | "fp16"; quantize=True -> W4A16 on GPT body + mel_head.
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import mlx.core as mx
@@ -76,9 +77,8 @@ class WIndexTTSMLX:
         # argmaxes vs the fp32 reference (spk_cond fp16 cos 0.999986 -> conds
         # drift -> step-2 flip; listening-equivalent, verified by ear).
         # Applies to fp16 mode and to w4a16 (dtype fp32 + quantize).
-        w2v_dt = mx.float16 if (self.w2v_fp16 and (self.dtype == "fp16" or self.quantize)) else None
         self.w2v_bert = Wav2Vec2BertConformer()
-        load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), w2v_dt)
+        load_into(self.w2v_bert, load_mlx(w, "w2v_bert"), self._w2v_dtype())
         s = np.load(w / "stats.npz")
         self.w2v_mean = mx.array(s["mean"], dtype=mx.float32)
         self.w2v_std = mx.sqrt(mx.array(s["var"], dtype=mx.float32))
@@ -135,6 +135,35 @@ class WIndexTTSMLX:
         if self.quantize:
             self._apply_w4a16()
 
+    def _w2v_dtype(self):
+        w2v_dt = mx.float16 if (self.w2v_fp16 and (self.dtype == "fp16" or self.quantize)) else None
+        return w2v_dt
+
+    def _load_w2v_bert(self):  # reload path after _release_frontend()
+        from windextts_mlx.models.w2v2_bert import Wav2Vec2BertConformer
+
+        self.w2v_bert = Wav2Vec2BertConformer()
+        load_into(self.w2v_bert, load_mlx(self.weights_dir, "w2v_bert"), self._w2v_dtype())
+
+    def _load_campplus(self):  # reload path after _release_frontend()
+        from windextts_mlx.models.campplus import CAMPPlus
+
+        self.campplus = CAMPPlus(feat_dim=80, embedding_size=192)
+        load_into(self.campplus, load_mlx(self.weights_dir, "campplus"))  # stays fp32 (torch parity)
+
+    def _release_frontend(self):
+        # One-shot frontends (w2v_bert ~1.1GB fp16 + campplus + featurizer /
+        # fbank / mel_fn) are used once per uncached reference; drop them so
+        # the GPT/CFM/vocoder stages run with a ~1.1GB lower resident set.
+        # Next uncached reference (or emo_ref) reloads lazily via the
+        # None-check in extract_spk_cond/extract_style. WINDEXTTS_KEEP_FRONTEND=1
+        # keeps everything resident (previous behavior).
+        if os.environ.get("WINDEXTTS_KEEP_FRONTEND"):
+            return
+        self.w2v_bert = self.campplus = None
+        self.featurizer = self.fbank = self.mel_fn = None
+        mx.clear_cache()
+
     def _apply_w4a16(self, group_size=128):
         import mlx.nn as nn
 
@@ -187,12 +216,16 @@ class WIndexTTSMLX:
         return self.fbank
 
     def extract_spk_cond(self, audio_16k):  # [B,N] 16k -> [B,T,1024] normalized
+        if self.w2v_bert is None:
+            self._load_w2v_bert()
         inp, am = self._feat()(audio_16k, return_mask=True)
         wb = self.w2v_bert.feature_projection.projection.weight.dtype
         out = (self.w2v_bert(inp.astype(wb), am, return_layer=17) - self.w2v_mean) / self.w2v_std
         return out
 
     def extract_style(self, audio_16k):  # [B,N] 16k -> [B,192]
+        if self.campplus is None:
+            self._load_campplus()
         f = self._fbank()(audio_16k)
         return self.campplus(f - f.mean(1, keepdims=True))  # per-column mean-subtract
 
@@ -216,6 +249,7 @@ class WIndexTTSMLX:
             ea, esr = _load_audio(emo_ref_path, REF_MAX_SECONDS)
             ea16 = self._resample(esr, REF_SR_W2V)(mx.array(ea)[None])
             emo_cond = self.extract_spk_cond(ea16)
+            self._release_frontend()  # emo_ref is one-shot too (reloads on next use)
         dt = self.gpt.emovec_layer.weight.dtype
         emovec_audio = self.gpt.merge_emovec(spk_cond.astype(dt), emo_cond.astype(dt), alpha=emo_alpha)
         if emo_vector is None:
@@ -283,6 +317,7 @@ class WIndexTTSMLX:
         mx.eval(feats)  # split frontend graph: first-time Metal compile < watchdog
         if key is not None:
             self._ref_cache[key] = feats
+        self._release_frontend()  # uncached ref: frontends are one-shot; reload on next new ref
         return feats
 
     def infer(self, spk_audio_prompt, text, lang="ZH", emo_vector=None, emo_text=None,
