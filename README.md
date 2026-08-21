@@ -33,7 +33,9 @@ pip install windextts
 
 ## 状态
 
-**已发布**：PyPI `windextts` v0.1.1 + Windows 整合包（解压即用、内置权重）。最快延迟追平并超过 vLLM-Omni fast。
+**已发布**：PyPI `windextts` v0.4.0 + Windows 整合包（解压即用、内置权重）。最快延迟追平并超过 vLLM-Omni fast。
+
+本版亮点：**统一 CLI 后端自动选择**（NVIDIA GPU → CUDA torch，Apple Silicon → 纯 MLX/Metal，`WINDEXTTS_BACKEND` 可强制）；**MLX 后端**随包分发（W4A16 INT4 + kernel 融合 + 前端用后释放，实测推理峰值 ~3.2GB）；性能持续优化（SDPA 注意力融合 / BigVGAN 子图编译，累计提速 ~31%）。
 
 能力：CLI / OpenAI 兼容 HTTP API / Gradio WebUI / Python API 四入口；
 W4A16 INT4 量化（可选）、低显存模式（3GB 显卡可用）、中文文本归一化（jieba/cn2an/tn）、
@@ -157,8 +159,8 @@ pip install 'windextts[webui]'          # Gradio WebUI
 pip install 'windextts[quant]'          # W4A16 INT4 加速（可选）
 
 # Apple Silicon（MLX 后端，Metal 加速）：核心包同样包含 windextts_mlx 子包，
-# 另需 MLX 运行时（当前 pyproject 依赖暂未声明 mlx，需手动补装）
-pip install windextts mlx
+# 用 [mlx] extra 一条命令装好 MLX 运行时
+pip install 'windextts[mlx]'
 ```
 
 ### CLI

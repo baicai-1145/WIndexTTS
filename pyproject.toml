@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "windextts"
-version = "0.3.0"
+version = "0.4.0"
 description = "Windows-priority, zero-JIT-compile, pure-torch accelerated inference for IndexTTS-2.5"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -53,6 +53,7 @@ dev = ["pytest>=8.0", "pytest-xdist"]
 webui = ["gradio>=4.0"]
 quant = ["torchao>=0.5"]  # W4A16 INT4 GPT quantization (optional accelerator)
 server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2"]  # HTTP API (/v1/audio/speech)
+mlx = ["mlx"]  # Apple Silicon 纯 MLX 推理后端 (pip install 'windextts[mlx]')
 
 [project.scripts]
 windextts = "windextts.cli:dispatch_main"
