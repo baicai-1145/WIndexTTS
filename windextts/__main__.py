@@ -1,4 +1,4 @@
-from windextts.cli import main
+from windextts.cli import dispatch_main
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(dispatch_main())

@@ -1,30 +1,35 @@
 """WIndexTTS CLI — synthesize speech from the command line.
 
 Usage:
+    # one command, auto backend: NVIDIA GPU -> CUDA torch, Apple Silicon -> MLX
+    # (override with WINDEXTTS_BACKEND=mlx|torch|cuda)
+
     # install model weights first (~7.5GB, one time, resumable)
     windextts --install-model --model-dir /path/to/IndexTTS-2.5
 
     # basic (fp16, GPU)
     windextts --ref ref.wav --text "你好世界" -o out.wav
 
-    # W4A16 quantized GPT (fastest)
-    windextts --ref ref.wav --text "你好世界" -o out.wav --w4a16
+    # W4A16 quantized GPT (fastest) — --quantize is the new alias of --w4a16
+    windextts --ref ref.wav --text "你好世界" -o out.wav --quantize
 
-    # low VRAM (3-4GB GPUs; keeps beam3, ~2.9GB steady)
-    windextts --ref ref.wav --text "你好世界" -o out.wav --w4a16 --low-vram
+    # low VRAM (3-4GB GPUs; keeps beam3, ~2.9GB steady; CUDA only)
+    windextts --ref ref.wav --text "你好世界" -o out.wav --quantize --low-vram
 
     # from a text file, with emotion vector + duration control
     windextts --ref ref.wav --text-file story.txt -o out.wav \
         --emo-vector 0.8,0,0,0,0,0,0.2,0 --duration 1.1
 
-    # fp32 reference precision, verbose timing
-    windextts --ref ref.wav --text "hello" -o out.wav --fp32 --verbose
+    # fp32 reference precision (--fp32 = alias of --dtype fp32), greedy (--beams 1)
+    windextts --ref ref.wav --text "hello" -o out.wav --fp32 --beams 1 --verbose
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+import platform
 import sys
 import time
 
@@ -43,9 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", default="output.wav", help="output wav path")
 
     mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--fp32", action="store_true", help="fp32 weights (highest precision, ~7.6GB)")
+    mode.add_argument("--fp32", action="store_true", help="fp32 weights (highest precision, ~7.6GB); alias of --dtype fp32")
     mode.add_argument("--w4a16", action="store_true",
                       help="W4A16 INT4 GPT quantization (fastest; needs torchao)")
+    mode.add_argument("--quantize", action="store_true",
+                      help="alias of --w4a16 (W4A16 INT4 GPT quantization)")
+    p.add_argument("--dtype", default="fp16", choices=["fp16", "fp32"],
+                   help="compute precision (default fp16)")
     p.add_argument("--low-vram", action="store_true",
                    help="low-VRAM mode for 3-4GB GPUs (w2v streamed to CPU, "
                         "beam3 kept, ~2.9GB steady)")
@@ -63,7 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     emo.add_argument("--emo-text", help="free-text emotion description (QwenEmotion)")
     emo.add_argument("--emo-ref", help="emotion reference audio path (conformer path)")
 
-    p.add_argument("--greedy", action="store_true", help="greedy decode (beam=1, deterministic)")
+    p.add_argument("--greedy", action="store_true", help="greedy decode (beam=1, deterministic; overrides --beams)")
+    p.add_argument("--beams", type=int, default=3,
+                   help="GPT-AR beam count (default 3; 1 = greedy)")
     p.add_argument("--top-p", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=30)
     p.add_argument("--temperature", type=float, default=0.8)
@@ -85,6 +96,29 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --install-model: skip qwen0.6bemo4-merge (1.2GB, only "
                         "needed for emo_text)")
     return p
+
+
+def _pick_backend() -> str:
+    """Choose 'mlx' or 'torch' without importing either runtime (cheap + safe)."""
+    env = os.environ.get("WINDEXTTS_BACKEND", "").strip().lower()
+    if env:
+        if env == "mlx":
+            return "mlx"
+        if env in ("torch", "cuda"):
+            return "torch"
+        print(f"warning: unknown WINDEXTTS_BACKEND={env!r} (expected mlx|torch|cuda); "
+              "auto-detecting", file=sys.stderr)
+    if platform.machine().lower() in ("arm64", "aarch64") and importlib.util.find_spec("mlx"):
+        return "mlx"
+    return "torch"
+
+
+def dispatch_main(argv: list[str] | None = None) -> int:
+    """Unified entry: route to the MLX or torch CLI by backend autodetect."""
+    if _pick_backend() == "mlx":
+        from windextts_mlx.cli import main as mlx_main
+        return mlx_main(argv)
+    return main(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -126,13 +160,27 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     import torch
+
+    if not torch.cuda.is_available():
+        print("error: CUDA is not available; the torch backend requires an NVIDIA GPU.\n"
+              "       On Apple Silicon the `windextts` entry auto-selects the MLX backend\n"
+              "       (or force it with WINDEXTTS_BACKEND=mlx).", file=sys.stderr)
+        return 1
+
     from windextts.inference import WIndexTTS
 
-    dtype = torch.float32 if args.fp32 else torch.float16
+    use_w4a16 = args.w4a16 or args.quantize
+    use_fp32 = args.fp32 or args.dtype == "fp32"
+    if use_fp32 and use_w4a16:
+        print("error: --fp32/--dtype fp32 conflicts with --w4a16/--quantize", file=sys.stderr)
+        return 2
+    num_beams = 1 if args.greedy else max(1, args.beams)
+
+    dtype = torch.float32 if use_fp32 else torch.float16
     t0 = time.perf_counter()
     tts = WIndexTTS(
         weights_dir=args.model_dir, device="cuda", dtype=dtype,
-        enable_w4a16=args.w4a16, low_vram=args.low_vram,
+        enable_w4a16=use_w4a16, low_vram=args.low_vram,
     )
     tts.warmup()
     if args.verbose:
@@ -155,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         cfm_steps=args.cfm_steps,
         text_normalization=not args.no_normalize,
         max_text_tokens_per_segment=args.segment_tokens,
-        num_beams=1 if args.greedy else 3,
+        num_beams=num_beams,
     )
     dt = time.perf_counter() - t0
     dur = audio.numel() / sr
@@ -169,4 +217,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(dispatch_main())
