@@ -14,7 +14,6 @@ import os
 import mlx.core as mx
 import mlx.nn as nn
 
-from windextts_mlx import ops
 from windextts_mlx.ops import Seq
 
 
